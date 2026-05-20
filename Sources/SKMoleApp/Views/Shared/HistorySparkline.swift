@@ -10,7 +10,7 @@ struct HistorySparkline: View {
             let normalizedPoints = plotPoints(in: frame.size)
 
             ZStack {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(AppPalette.secondaryCard.opacity(0.35))
 
                 if normalizedPoints.count > 1 {
@@ -24,24 +24,24 @@ struct HistorySparkline: View {
                         )
 
                     linePath(for: normalizedPoints)
-                        .stroke(tint, style: StrokeStyle(lineWidth: 2.6, lineCap: .round, lineJoin: .round))
+                        .stroke(tint, style: StrokeStyle(lineWidth: 1.8, lineCap: .round, lineJoin: .round))
 
                     if let last = normalizedPoints.last {
                         Circle()
                             .fill(tint)
-                            .frame(width: 8, height: 8)
+                            .frame(width: 5, height: 5)
                             .position(last)
                     }
                 } else {
                     Text("History builds up as SK Mole samples your Mac.")
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
-                        .padding(.horizontal, 16)
+                        .padding(.horizontal, 10)
                 }
             }
         }
-        .frame(height: 120)
+        .frame(height: 70)
         .allowsHitTesting(false)
     }
 

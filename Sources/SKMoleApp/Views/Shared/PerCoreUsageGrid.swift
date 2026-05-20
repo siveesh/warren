@@ -4,16 +4,16 @@ struct PerCoreUsageGrid: View {
     let usage: [Double]
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 12)], spacing: 12) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 76), spacing: 6)], spacing: 6) {
             ForEach(Array(usage.enumerated()), id: \.offset) { index, value in
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 5) {
                     HStack {
                         Text("Core \(index + 1)")
-                            .font(.caption.weight(.semibold))
+                            .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                         Text("\(Int((value * 100).rounded()))%")
-                            .font(.caption.weight(.bold))
+                            .font(.caption2.weight(.bold))
                     }
 
                     GeometryReader { proxy in
@@ -26,11 +26,11 @@ struct PerCoreUsageGrid: View {
                                 .frame(width: max(10, proxy.size.width * value))
                         }
                     }
-                    .frame(height: 10)
+                    .frame(height: 6)
                 }
-                .padding(12)
+                .padding(7)
                 .background(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .fill(AppPalette.secondaryCard.opacity(0.55))
                 )
             }

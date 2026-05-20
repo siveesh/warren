@@ -4,6 +4,13 @@ SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppC
 
 ## Recent release highlights
 
+### v1.1.4
+
+- Dashboard cards are significantly denser, with smaller metric tiles, tighter panel spacing, reduced typography, slimmer sparklines, compact per-core CPU rows, and smaller top-process cards
+- The menu bar companion popover is more compact, with reduced card padding, narrower width, smaller system chips, tighter telemetry cards, and a shorter screen-aware maximum height
+- Dashboard grids now fit more cards per row on medium and large windows so monitoring content starts higher and requires less scrolling
+- The compact layout keeps the same telemetry, update, Smart Care, and quick-action data while reducing visual footprint for everyday use
+
 ### v1.1.3
 
 - The menu bar companion now uses a smaller status-card design with system configuration chips, compact telemetry tiles, update status, and a concise top-process table

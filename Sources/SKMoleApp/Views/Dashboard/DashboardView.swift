@@ -12,38 +12,38 @@ struct DashboardView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let contentWidth = max(proxy.size.width - 40, 320)
+            let contentWidth = max(proxy.size.width - 28, 320)
 
             ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 9) {
                     hero
                     metricsGrid(for: contentWidth)
                     insightBoards(for: contentWidth)
                     operationsBoards(for: contentWidth)
                     topProcessesSection
                 }
-                .padding(20)
-                .padding(.bottom, 28)
+                .padding(14)
+                .padding(.bottom, 18)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
 
     private var hero: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .top, spacing: 18) {
-                VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
                     Text("System status at a glance")
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .font(.system(size: 22, weight: .bold, design: .rounded))
 
                     Text("Live health, update awareness, cleanup pressure, and quick paths into the heavier tools.")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                Spacer(minLength: 18)
+                Spacer(minLength: 12)
 
-                HStack(spacing: 10) {
+                HStack(spacing: 6) {
                     heroStat(
                         title: "Smart Care",
                         value: "\(model.smartCareScore)",
@@ -69,14 +69,14 @@ struct DashboardView: View {
                 }
             }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 6) {
                 chip("Companion optional", tint: AppPalette.accent)
                 chip("Scans are lazy and reusable", tint: AppPalette.sky)
                 chip("Ignored / deferred updates supported", tint: AppPalette.amber)
                 chip("Full Disk Access guidance built in", tint: AppPalette.rose)
             }
 
-            HStack(spacing: 10) {
+            HStack(spacing: 6) {
                 dashboardAction("Refresh Current", symbol: "arrow.clockwise") {
                     Task { await model.refreshCurrentSelection() }
                 }
@@ -102,19 +102,19 @@ struct DashboardView: View {
                 }
             }
         }
-        .padding(20)
+        .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 28, style: .continuous)
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .fill(AppPalette.heroGradient)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.08))
                 )
         )
     }
 
     private func metricsGrid(for width: CGFloat) -> some View {
-        LazyVGrid(columns: metricColumns(for: width), alignment: .leading, spacing: 16) {
+        LazyVGrid(columns: metricColumns(for: width), alignment: .leading, spacing: 8) {
             MetricCard(
                 title: "CPU",
                 value: "\(Int((monitor.metrics.cpuUsage * 100).rounded()))%",
@@ -190,7 +190,7 @@ struct DashboardView: View {
     }
 
     private func insightBoards(for width: CGFloat) -> some View {
-        LazyVGrid(columns: boardColumns(for: width), alignment: .leading, spacing: 16) {
+        LazyVGrid(columns: boardColumns(for: width), alignment: .leading, spacing: 8) {
             historyPanel(
                 title: "CPU History",
                 subtitle: "Recent total CPU load across all cores.",
@@ -212,13 +212,13 @@ struct DashboardView: View {
                 subtitle: "Live throughput with a quick path into the on-demand connection inspector.",
                 symbol: "arrow.left.and.right.circle"
             ) {
-                VStack(alignment: .leading, spacing: 14) {
-                    VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 5) {
                         statHeader("Down", ByteFormatting.formatRate(monitor.metrics.networkDownloadRate), AppPalette.sky)
                         HistorySparkline(points: monitor.downloadHistory, tint: AppPalette.sky)
                     }
 
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 5) {
                         statHeader("Up", ByteFormatting.formatRate(monitor.metrics.networkUploadRate), AppPalette.accent)
                         HistorySparkline(points: monitor.uploadHistory, tint: AppPalette.accent)
                     }
@@ -265,17 +265,17 @@ struct DashboardView: View {
     }
 
     private func operationsBoards(for width: CGFloat) -> some View {
-        LazyVGrid(columns: boardColumns(for: width), alignment: .leading, spacing: 16) {
+        LazyVGrid(columns: boardColumns(for: width), alignment: .leading, spacing: 8) {
             DashboardPanel(
                 title: "Smart Care",
                 subtitle: "The guided recommendation layer that ties cleanup, updates, storage, and system pressure together.",
                 symbol: "sparkles.rectangle.stack.fill"
             ) {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
                     statHeader("Score", "\(model.smartCareScore)", AppPalette.accent)
 
                     Text(model.recommendedActions.first?.detail ?? "No recommendations yet. Open Smart Care after the first few scans to get a fuller maintenance picture.")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -291,10 +291,10 @@ struct DashboardView: View {
                 subtitle: "What SK Mole can reclaim from safe cache, download, and leftover targets right now.",
                 symbol: "trash.slash"
             ) {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
                     statHeader("Reclaimable", ByteFormatting.format(model.cleanupBytes), AppPalette.amber)
                     Text("\(model.cleanupCategories.filter { !$0.candidates.isEmpty }.count) sections currently contain reviewable items.")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
 
                     if let cleanupProgress = model.cleanupProgress {
@@ -308,12 +308,12 @@ struct DashboardView: View {
                 subtitle: "Top tracked categories plus the current inspection mode for the startup and external volumes.",
                 symbol: "chart.pie"
             ) {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
                     statHeader("Tracked", ByteFormatting.format(model.storageReport?.totalTrackedBytes ?? 0), AppPalette.rose)
                     Text(model.storageReport == nil
                         ? "Run Storage to build the volume browser and space map."
                         : "\(model.storageReport?.sections.count ?? 0) tracked sections • \(model.storageInspectionMode.title)")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
 
                     if let storageProgress = model.storageProgress {
@@ -327,12 +327,12 @@ struct DashboardView: View {
                 subtitle: "Processes, connections, and remote hosts stay lazy until you open them, which keeps the app lighter during everyday use.",
                 symbol: "network"
             ) {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
                     statHeader("Processes", "\(model.networkReport?.processes.count ?? 0)", AppPalette.sky)
                     Text(model.networkReport == nil
                         ? "No network snapshot yet."
                         : "\(model.networkReport?.activeConnectionCount ?? 0) active connections across \(model.networkReport?.remoteHosts.count ?? 0) remote hosts.")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
 
                     Button("Open Network Inspector") {
@@ -347,12 +347,12 @@ struct DashboardView: View {
                 subtitle: "Review active work by CPU or memory, then safely terminate only user-owned processes that SK Mole allows.",
                 symbol: "list.bullet.rectangle.portrait"
             ) {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
                     statHeader("Snapshot", "\(model.processInspectorItems.count)", AppPalette.accent)
                     Text(model.processInspectorItems.isEmpty
                         ? "No process snapshot yet."
                         : "\(model.processInspectorItems.filter(SystemGuard.canTerminateSnapshot).count) processes are safe to terminate from SK Mole.")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
 
                     Button("Open Process Inspector") {
@@ -367,10 +367,10 @@ struct DashboardView: View {
                 subtitle: "The menu bar companion stays icon-only in the bar, but now opens a denser popover with update awareness and live status.",
                 symbol: "menubar.rectangle"
             ) {
-                VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 8) {
                     statHeader("State", model.menuBarCompanionState.isRunning ? "Running" : "Stopped", AppPalette.mint)
                     Text(model.menuBarCompanionState.detail)
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
 
@@ -389,10 +389,10 @@ struct DashboardView: View {
             subtitle: "Actionable updates stay separate from ignored and deferred versions, with release-note previews handled in the Updates tab.",
             symbol: "arrow.triangle.2.circlepath.circle"
         ) {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 8) {
                 statHeader("Actionable", "\(model.activeAvailableUpdateItems.count)", AppPalette.sky)
 
-                HStack(spacing: 10) {
+                HStack(spacing: 6) {
                     monitoringFact(
                         title: "Automatic",
                         value: "\(model.activeAvailableUpdateItems.filter(\.canAutoInstall).count)",
@@ -412,7 +412,7 @@ struct DashboardView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-                HStack(spacing: 10) {
+                HStack(spacing: 6) {
                     Button("Open Updates") {
                         model.open(section: .updates)
                     }
@@ -454,7 +454,7 @@ struct DashboardView: View {
         points: [MetricHistoryPoint]
     ) -> some View {
         DashboardPanel(title: title, subtitle: subtitle, symbol: "chart.line.uptrend.xyaxis") {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 6) {
                 statHeader(title, value, tint)
                 HistorySparkline(points: points, tint: tint)
             }
@@ -467,24 +467,24 @@ struct DashboardView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(value)
-                .font(.headline.weight(.bold))
+                .font(.subheadline.weight(.bold))
             Text(subtitle)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(tint.opacity(0.14))
         )
     }
 
     private func chip(_ title: String, tint: Color) -> some View {
         Text(title)
-            .font(.caption.weight(.semibold))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
             .background(
                 Capsule(style: .continuous)
                     .fill(tint.opacity(0.14))
@@ -495,9 +495,9 @@ struct DashboardView: View {
     private func dashboardAction(_ title: String, symbol: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label(title, systemImage: symbol)
-                .font(.subheadline.weight(.semibold))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 10)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
         }
         .buttonStyle(.bordered)
     }
@@ -505,35 +505,35 @@ struct DashboardView: View {
     private func statHeader(_ title: String, _ value: String, _ tint: Color) -> some View {
         HStack {
             Text(title.uppercased())
-                .font(.caption.weight(.semibold))
+                .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
 
             Spacer()
 
             Text(value)
-                .font(.headline.weight(.bold))
+                .font(.subheadline.weight(.bold))
                 .foregroundStyle(tint)
         }
     }
 
     private func monitoringFact(title: String, value: String, detail: String, tint: Color) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             Text(title.uppercased())
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.secondary)
             Text(value)
-                .font(.subheadline.weight(.bold))
+                .font(.caption.weight(.bold))
                 .foregroundStyle(tint)
                 .lineLimit(1)
             Text(detail)
-                .font(.caption)
+                .font(.caption2)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .padding(8)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(AppPalette.secondaryCard.opacity(0.55))
         )
     }
@@ -607,30 +607,34 @@ struct DashboardView: View {
         let count: Int
 
         switch width {
-        case ..<860:
+        case ..<700:
             count = 2
-        case ..<1240:
+        case ..<980:
             count = 3
-        default:
+        case ..<1320:
             count = 4
+        default:
+            count = 5
         }
 
-        return Array(repeating: GridItem(.flexible(), spacing: 16), count: count)
+        return Array(repeating: GridItem(.flexible(), spacing: 8), count: count)
     }
 
     private func boardColumns(for width: CGFloat) -> [GridItem] {
         let count: Int
 
         switch width {
-        case ..<930:
+        case ..<760:
             count = 1
-        case ..<1480:
+        case ..<1180:
             count = 2
-        default:
+        case ..<1560:
             count = 3
+        default:
+            count = 4
         }
 
-        return Array(repeating: GridItem(.flexible(), spacing: 16), count: count)
+        return Array(repeating: GridItem(.flexible(), spacing: 8), count: count)
     }
 }
 
@@ -648,19 +652,19 @@ private struct DashboardPanel<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
                 Image(systemName: symbol)
-                    .font(.headline.weight(.semibold))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(AppPalette.accent)
-                    .frame(width: 34, height: 34)
+                    .frame(width: 22, height: 22)
                     .background(Circle().fill(AppPalette.accent.opacity(0.12)))
 
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text(title)
-                        .font(.headline.weight(.semibold))
+                        .font(.subheadline.weight(.semibold))
                     Text(subtitle)
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -670,15 +674,15 @@ private struct DashboardPanel<Content: View>: View {
 
             content
         }
-        .padding(16)
+        .padding(10)
         .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .fill(.ultraThinMaterial)
                 .overlay(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .strokeBorder(Color.primary.opacity(0.06))
                 )
         )
-        .shadow(color: Color.black.opacity(0.05), radius: 14, y: 8)
+        .shadow(color: Color.black.opacity(0.04), radius: 7, y: 4)
     }
 }

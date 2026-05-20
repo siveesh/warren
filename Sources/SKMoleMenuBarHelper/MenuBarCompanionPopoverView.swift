@@ -19,13 +19,13 @@ struct MenuBarCompanionPopoverView: View {
     let quitCompanion: () -> Void
 
     private let columns = [
-        GridItem(.flexible(), spacing: 8),
-        GridItem(.flexible(), spacing: 8)
+        GridItem(.flexible(), spacing: 6),
+        GridItem(.flexible(), spacing: 6)
     ]
 
     var body: some View {
         ScrollView(.vertical) {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 8) {
                 if let snapshot = model.snapshot {
                     hero(snapshot)
 
@@ -41,42 +41,42 @@ struct MenuBarCompanionPopoverView: View {
                     loadingCard
                 }
             }
-            .padding(12)
+            .padding(9)
         }
-        .frame(width: 336)
+        .frame(width: 312)
         .background(CompanionPalette.canvas)
     }
 
     private var loadingCard: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 9) {
             ProgressView()
             Text("Sampling your Mac...")
-                .font(.headline)
+                .font(.subheadline.weight(.semibold))
             Text("SK Mole Companion keeps the menu bar light and fills in richer details when opened.")
-                .font(.caption)
+                .font(.caption2)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
-        .frame(maxWidth: .infinity, minHeight: 300)
-        .padding(16)
-        .background(panelFill(cornerRadius: 24))
+        .frame(maxWidth: .infinity, minHeight: 225)
+        .padding(12)
+        .background(panelFill(cornerRadius: 18))
     }
 
     private func hero(_ snapshot: MenuBarSnapshot) -> some View {
         let score = healthScore(for: snapshot)
 
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .firstTextBaseline, spacing: 10) {
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: healthSymbol(for: score))
-                    .font(.title2.weight(.bold))
+                    .font(.title3.weight(.bold))
                     .foregroundStyle(healthTint(for: score))
 
                 Text("\(score)")
-                    .font(.system(size: 42, weight: .bold, design: .rounded))
+                    .font(.system(size: 32, weight: .bold, design: .rounded))
                     .monospacedDigit()
 
                 Text(healthTitle(for: score))
-                    .font(.headline.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
 
                 Spacer(minLength: 4)
@@ -85,7 +85,7 @@ struct MenuBarCompanionPopoverView: View {
                     openMainApp()
                 } label: {
                     Image(systemName: "arrow.up.forward.app")
-                        .font(.headline)
+                        .font(.subheadline.weight(.semibold))
                 }
                 .buttonStyle(.plain)
                 .help("Open SK Mole")
@@ -93,18 +93,18 @@ struct MenuBarCompanionPopoverView: View {
 
             configurationChips(snapshot.systemConfiguration)
         }
-        .padding(14)
-        .background(panelFill(cornerRadius: 26))
+        .padding(10)
+        .background(panelFill(cornerRadius: 20))
     }
 
     private func configurationChips(_ configuration: MenuBarSystemConfiguration) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 5) {
                 chip(configuration.modelName)
                 chip(configuration.chipName)
             }
 
-            HStack(spacing: 6) {
+            HStack(spacing: 5) {
                 chip(MenuBarHelperFormatting.formatBytes(configuration.memoryBytes))
                 chip(configuration.osVersion)
                 chip(configuration.uptime)
@@ -113,9 +113,9 @@ struct MenuBarCompanionPopoverView: View {
     }
 
     private var alertsCard: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 5) {
             Label("\(model.activeAlerts.count) alert\(model.activeAlerts.count == 1 ? "" : "s")", systemImage: "exclamationmark.triangle.fill")
-                .font(.caption.weight(.bold))
+                .font(.caption2.weight(.bold))
                 .foregroundStyle(CompanionPalette.warning)
 
             ForEach(model.activeAlerts.prefix(2)) { alert in
@@ -125,20 +125,20 @@ struct MenuBarCompanionPopoverView: View {
                     .lineLimit(2)
             }
         }
-        .padding(10)
+        .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(CompanionPalette.warning.opacity(0.12))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .strokeBorder(CompanionPalette.warning.opacity(0.24))
                 )
         )
     }
 
     private func metricGrid(_ snapshot: MenuBarSnapshot) -> some View {
-        LazyVGrid(columns: columns, spacing: 8) {
+        LazyVGrid(columns: columns, spacing: 6) {
             metricCard(
                 title: "CPU",
                 value: percent(snapshot.cpuUsage),
@@ -197,41 +197,41 @@ struct MenuBarCompanionPopoverView: View {
 
     private var updatesStrip: some View {
         Button(action: openUpdates) {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 Label("Updates", systemImage: "arrow.triangle.2.circlepath.circle")
-                    .font(.caption.weight(.bold))
+                    .font(.caption2.weight(.bold))
                     .foregroundStyle(.secondary)
 
                 Spacer()
 
                 if let updateSnapshot = model.updateSnapshot {
                     Text("\(updateSnapshot.actionableCount) action")
-                        .font(.callout.weight(.bold))
+                        .font(.caption.weight(.bold))
 
                     Text("\(updateSnapshot.automaticCount) auto")
-                        .font(.caption.monospacedDigit())
+                        .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                 } else {
                     Text("Open")
-                        .font(.callout.weight(.bold))
+                        .font(.caption.weight(.bold))
                 }
 
                 Image(systemName: "chevron.right")
                     .font(.caption.weight(.bold))
                     .foregroundStyle(.tertiary)
             }
-            .padding(12)
+            .padding(9)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(panelFill(cornerRadius: 18))
+        .background(panelFill(cornerRadius: 14))
     }
 
     private func topProcessesCard(_ snapshot: MenuBarSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Label("Top processes", systemImage: "chart.bar.xaxis")
-                    .font(.caption.weight(.bold))
+                    .font(.caption2.weight(.bold))
                     .foregroundStyle(.secondary)
 
                 Spacer()
@@ -239,17 +239,17 @@ struct MenuBarCompanionPopoverView: View {
                 Button("Inspect") {
                     openProcesses()
                 }
-                .font(.caption.weight(.semibold))
+                .font(.caption2.weight(.semibold))
                 .buttonStyle(.plain)
             }
 
             if snapshot.topProcesses.isEmpty {
                 Text("Process sampler is warming up.")
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                VStack(spacing: 6) {
+                VStack(spacing: 4) {
                     processHeader
 
                     ForEach(snapshot.topProcesses.prefix(5)) { process in
@@ -258,8 +258,8 @@ struct MenuBarCompanionPopoverView: View {
                 }
             }
         }
-        .padding(12)
-        .background(panelFill(cornerRadius: 20))
+        .padding(9)
+        .background(panelFill(cornerRadius: 15))
     }
 
     private var processHeader: some View {
@@ -278,30 +278,30 @@ struct MenuBarCompanionPopoverView: View {
     private func processRow(_ process: MenuBarTopProcessSummary) -> some View {
         HStack(spacing: 8) {
             Text(process.name)
-                .font(.caption.weight(.semibold))
+                .font(.caption2.weight(.semibold))
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             Text(String(format: "%.1f%%", process.cpuPercent))
-                .font(.caption.monospacedDigit())
+                .font(.caption2.monospacedDigit())
                 .frame(width: 54, alignment: .trailing)
 
             Text(MenuBarHelperFormatting.formatBytes(process.memoryBytes))
-                .font(.caption.monospacedDigit())
+                .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 72, alignment: .trailing)
         }
     }
 
     private var footerActions: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 8) {
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
                 footerButton("Open", systemImage: "circle.grid.2x2", action: openMainApp)
                 footerButton("Updates", systemImage: "arrow.triangle.2.circlepath.circle", action: openUpdates)
                 footerButton("Smart", systemImage: "sparkles", action: openSmartCare)
             }
 
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 footerButton("Network", systemImage: "network", action: openNetwork)
                 footerButton("Privacy", systemImage: "lock.shield", action: openPrivacySecurity)
                 footerButton("Quit", systemImage: "power", action: quitCompanion)
@@ -318,24 +318,24 @@ struct MenuBarCompanionPopoverView: View {
         progress: Double?
     ) -> some View {
         VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 5) {
+            HStack(spacing: 4) {
                 Image(systemName: systemImage)
-                    .font(.caption.weight(.bold))
+                    .font(.caption2.weight(.bold))
                     .foregroundStyle(tint)
                 Text(title)
-                    .font(.caption.weight(.heavy))
-                    .tracking(1.6)
+                    .font(.caption2.weight(.heavy))
+                    .tracking(1.2)
                     .foregroundStyle(tint)
                 Spacer(minLength: 0)
             }
 
             Text(value)
-                .font(.system(size: 24, weight: .bold, design: .rounded))
+                .font(.system(size: 18, weight: .bold, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
 
             Text(detail)
-                .font(.caption.monospacedDigit())
+                .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
 
@@ -343,36 +343,36 @@ struct MenuBarCompanionPopoverView: View {
                 progressBar(value: progress, tint: tint)
             }
         }
-        .padding(11)
-        .frame(maxWidth: .infinity, minHeight: 104, alignment: .topLeading)
-        .background(panelFill(cornerRadius: 18))
+        .padding(8)
+        .frame(maxWidth: .infinity, minHeight: 78, alignment: .topLeading)
+        .background(panelFill(cornerRadius: 14))
     }
 
     private func footerButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Label(title, systemImage: systemImage)
-                .font(.caption.weight(.bold))
+                .font(.caption2.weight(.bold))
                 .labelStyle(.titleAndIcon)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
+                .padding(.vertical, 6)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
+            RoundedRectangle(cornerRadius: 11, style: .continuous)
                 .fill(CompanionPalette.control)
         )
     }
 
     private func chip(_ title: String) -> some View {
         Text(title)
-            .font(.caption.monospacedDigit().weight(.bold))
+            .font(.caption2.monospacedDigit().weight(.bold))
             .foregroundStyle(.secondary)
             .lineLimit(1)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 4)
             .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .fill(CompanionPalette.control)
             )
     }
@@ -387,7 +387,7 @@ struct MenuBarCompanionPopoverView: View {
                     .frame(width: proxy.size.width * max(0, min(1, value)))
             }
         }
-        .frame(height: 5)
+        .frame(height: 4)
     }
 
     private func panelFill(cornerRadius: CGFloat) -> some View {
