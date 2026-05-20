@@ -11,7 +11,7 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
     private let contentModel = MenuBarCompanionContentModel()
-    private let popoverWidth: CGFloat = 312
+    private let popoverWidth: CGFloat = 300
     private var cachedSettings = MenuBarCompanionSettings.default
     private var lastSettingsLoadDate = Date.distantPast
     private var lastUpdateSnapshotLoadDate = Date.distantPast
@@ -57,11 +57,6 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
                 model: contentModel,
                 openMainApp: { [weak self] in self?.openMainApp() },
                 openUpdates: { [weak self] in self?.openUpdates() },
-                openNetwork: { [weak self] in self?.openNetworkInspector() },
-                openProcesses: { [weak self] in self?.openProcesses() },
-                openSmartCare: { [weak self] in self?.openSmartCare() },
-                openPrivacySecurity: { [weak self] in self?.openPrivacySecurity() },
-                quitMainApp: { [weak self] in self?.quitMainApp() },
                 quitCompanion: { [weak self] in self?.quitCompanion() }
             )
         )
@@ -94,7 +89,7 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
 
     private func preferredPopoverHeight(anchor screen: NSScreen?) -> CGFloat {
         let visibleHeight = (screen ?? NSScreen.main)?.visibleFrame.height ?? 720
-        return max(260, min(560, visibleHeight - 80))
+        return max(390, min(500, visibleHeight - 80))
     }
 
     private func apply(snapshot: MenuBarSnapshot) {

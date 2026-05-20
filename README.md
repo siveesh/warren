@@ -4,6 +4,19 @@ SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppC
 
 ## Recent release highlights
 
+### v1.1.6
+
+- The menu bar companion adds a compact Updates card back into the no-scroll popover so update status is visible without reopening the main dashboard
+- Metric card headers are tightened so longer labels such as `THERMAL` stay on one line while retaining right-aligned values
+- The companion keeps the simplified footer with only Open SK Mole and the power-icon quit action
+
+### v1.1.5
+
+- The menu bar companion popover has been tightened into a no-scroll compact layout that fits the core status view inside the normal menu bar popover space
+- System configuration now renders as one small single-line summary, keeping model, chip, memory, macOS version, and uptime visible without stacked chips
+- CPU, memory, network, disk, power, and thermal cards now use smaller top-right values opposite the card label, with shorter card heights and slimmer progress bars
+- The companion footer now keeps only the essentials after Top Processes: Open SK Mole and a compact power icon to quit the companion
+
 ### v1.1.4
 
 - Dashboard cards are significantly denser, with smaller metric tiles, tighter panel spacing, reduced typography, slimmer sparklines, compact per-core CPU rows, and smaller top-process cards
