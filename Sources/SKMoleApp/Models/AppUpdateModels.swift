@@ -123,13 +123,28 @@ struct AppStoreAutomationStatus: Hashable {
     let version: String?
     let accountName: String?
     let accountDetail: String?
+    let canAccessAppStore: Bool
+
+    init(
+        executablePath: String?,
+        version: String?,
+        accountName: String?,
+        accountDetail: String?,
+        canAccessAppStore: Bool? = nil
+    ) {
+        self.executablePath = executablePath
+        self.version = version
+        self.accountName = accountName
+        self.accountDetail = accountDetail
+        self.canAccessAppStore = canAccessAppStore ?? (accountName != nil)
+    }
 
     var isInstalled: Bool {
         executablePath != nil
     }
 
     var isSignedIn: Bool {
-        accountName != nil
+        canAccessAppStore
     }
 
     var canInstallUpdates: Bool {
@@ -145,6 +160,14 @@ struct AppStoreAutomationStatus: Hashable {
             return "mas signed in as \(accountName)"
         }
 
+        if canAccessAppStore {
+            if let version {
+                return "mas \(version) can access the App Store"
+            }
+
+            return "mas can access the App Store"
+        }
+
         if isInstalled {
             return "mas installed, but no App Store account detected"
         }
@@ -155,6 +178,10 @@ struct AppStoreAutomationStatus: Hashable {
     var detail: String {
         if let accountDetail, !accountDetail.isEmpty {
             return accountDetail
+        }
+
+        if canAccessAppStore {
+            return "Install automation is available for Mac App Store updates."
         }
 
         if isInstalled {

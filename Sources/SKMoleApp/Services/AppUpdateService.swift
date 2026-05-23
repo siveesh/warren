@@ -922,18 +922,48 @@ actor AppUpdateService {
 
         let accountOutput = accountResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
         let accountName: String?
+        let canAccessAppStore: Bool
+        let accountDetail: String?
         if accountResult.terminationStatus == 0, !accountOutput.isEmpty {
             accountName = accountOutput
+            canAccessAppStore = true
+            accountDetail = accountOutput
         } else {
             accountName = nil
+            let accessProbe = try await detectMasAppStoreAccess(executable: path, accountOutput: accountOutput)
+            canAccessAppStore = accessProbe.canAccessAppStore
+            accountDetail = accessProbe.detail
         }
 
         return AppStoreAutomationStatus(
             executablePath: path,
             version: version,
             accountName: accountName,
-            accountDetail: accountOutput.isEmpty ? nil : accountOutput
+            accountDetail: accountDetail,
+            canAccessAppStore: canAccessAppStore
         )
+    }
+
+    private func detectMasAppStoreAccess(
+        executable path: String,
+        accountOutput: String
+    ) async throws -> (canAccessAppStore: Bool, detail: String?) {
+        let accountCommandIsUnavailable = accountOutput.localizedCaseInsensitiveContains("Unexpected argument")
+            || accountOutput.localizedCaseInsensitiveContains("Unknown command")
+            || accountOutput.localizedCaseInsensitiveContains("Usage: mas")
+
+        guard accountCommandIsUnavailable else {
+            return (false, accountOutput.isEmpty ? nil : accountOutput)
+        }
+
+        let outdatedResult = try await runProcess(executable: path, arguments: ["outdated"])
+        let outdatedOutput = outdatedResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard outdatedResult.terminationStatus == 0 else {
+            return (false, outdatedOutput.isEmpty ? accountOutput : outdatedOutput)
+        }
+
+        return (true, "`mas account` is not available in this mas release, but `mas outdated` can access App Store updates.")
     }
 
     private func detectExecutable(named executableName: String) async throws -> String? {
