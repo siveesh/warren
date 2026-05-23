@@ -19,6 +19,16 @@ struct MenuBarSystemConfiguration: Hashable {
     let memoryBytes: UInt64
     let osVersion: String
     let uptime: String
+
+    func refreshingUptime() -> MenuBarSystemConfiguration {
+        MenuBarSystemConfiguration(
+            modelName: modelName,
+            chipName: chipName,
+            memoryBytes: memoryBytes,
+            osVersion: osVersion,
+            uptime: MenuBarHelperSampler.currentUptimeString()
+        )
+    }
 }
 
 struct MenuBarSnapshot {
@@ -123,7 +133,7 @@ final class MenuBarHelperSampler: @unchecked Sendable {
             topProcessMemoryBytes: topProcess?.memoryBytes,
             topProcesses: topProcesses,
             powerSummary: power.summary,
-            systemConfiguration: systemConfiguration
+            systemConfiguration: systemConfiguration.refreshingUptime()
         )
     }
 
@@ -381,16 +391,76 @@ final class MenuBarHelperSampler: @unchecked Sendable {
             ? "macOS \(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
             : "macOS \(os.majorVersion).\(os.minorVersion)"
         let modelIdentifier = sysctlString("hw.model") ?? "Mac"
-        let modelName = marketingModelName(for: modelIdentifier)
-        let chipName = normalizedChipName(sysctlString("machdep.cpu.brand_string"))
+        let hardwareOverview = readHardwareOverview()
+        let modelName = hardwareOverview.modelName ?? marketingModelName(for: modelIdentifier)
+        let chipName = hardwareOverview.chipName ?? normalizedChipName(sysctlString("machdep.cpu.brand_string"))
 
         return MenuBarSystemConfiguration(
             modelName: modelName,
             chipName: chipName,
             memoryBytes: processInfo.physicalMemory,
             osVersion: osVersion,
-            uptime: uptimeString(processInfo.systemUptime)
+            uptime: currentUptimeString()
         )
+    }
+
+    private struct HardwareOverview {
+        let modelName: String?
+        let chipName: String?
+    }
+
+    private static func readHardwareOverview() -> HardwareOverview {
+        guard
+            let profilerURL = executableURL(forSystemTool: "system_profiler"),
+            let data = runSystemTool(profilerURL, arguments: ["SPHardwareDataType", "-json", "-detailLevel", "mini"]),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let hardwareItems = json["SPHardwareDataType"] as? [[String: Any]],
+            let hardware = hardwareItems.first
+        else {
+            return HardwareOverview(modelName: nil, chipName: nil)
+        }
+
+        return HardwareOverview(
+            modelName: trimmedString(hardware["machine_name"]),
+            chipName: trimmedString(hardware["chip_type"])
+        )
+    }
+
+    private static func executableURL(forSystemTool name: String) -> URL? {
+        ["/usr/sbin", "/usr/bin", "/bin"].lazy
+            .map { URL(fileURLWithPath: $0).appendingPathComponent(name) }
+            .first { FileManager.default.isExecutableFile(atPath: $0.path) }
+    }
+
+    private static func runSystemTool(_ executableURL: URL, arguments: [String]) -> Data? {
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.standardOutput = output
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        guard process.terminationStatus == 0 else {
+            return nil
+        }
+
+        return output.fileHandleForReading.readDataToEndOfFile()
+    }
+
+    private static func trimmedString(_ value: Any?) -> String? {
+        guard let string = value as? String else {
+            return nil
+        }
+
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func sysctlString(_ name: String) -> String? {
@@ -415,7 +485,6 @@ final class MenuBarHelperSampler: @unchecked Sendable {
         }
 
         return rawValue
-            .replacingOccurrences(of: "Apple ", with: "")
             .replacingOccurrences(of: " processor", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -423,33 +492,51 @@ final class MenuBarHelperSampler: @unchecked Sendable {
     private static func marketingModelName(for identifier: String) -> String {
         switch identifier {
         case "Mac13,1", "Mac13,2":
-            return "Mac Studio 2022"
+            return "Mac Studio"
         case "Mac14,13", "Mac14,14":
-            return "Mac Studio 2023"
+            return "Mac Studio"
         case "Mac15,13", "Mac15,14":
-            return "Mac Studio 2025"
+            return "Mac Studio"
         case "Mac14,3", "Mac14,8":
-            return "Mac mini 2023"
+            return "Mac mini"
         case "Mac16,10", "Mac16,11":
-            return "Mac mini 2024"
+            return "Mac mini"
         default:
             return identifier
         }
     }
 
-    private static func uptimeString(_ uptime: TimeInterval) -> String {
-        let totalHours = max(0, Int(uptime / 3_600))
-        let days = totalHours / 24
-        let hours = totalHours % 24
+    fileprivate static func currentUptimeString(now: Date = .now) -> String {
+        uptimeString(intervalSinceBoot(now: now))
+    }
+
+    private static func intervalSinceBoot(now: Date) -> TimeInterval {
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_BOOTTIME]
+
+        guard sysctl(&mib, 2, &bootTime, &size, nil, 0) == 0, bootTime.tv_sec > 0 else {
+            return ProcessInfo.processInfo.systemUptime
+        }
+
+        let bootDate = Date(timeIntervalSince1970: TimeInterval(bootTime.tv_sec) + TimeInterval(bootTime.tv_usec) / 1_000_000)
+        return now.timeIntervalSince(bootDate)
+    }
+
+    fileprivate static func uptimeString(_ uptime: TimeInterval) -> String {
+        let totalMinutes = max(0, Int(uptime / 60))
+        let days = totalMinutes / 1_440
+        let hours = (totalMinutes % 1_440) / 60
+        let minutes = totalMinutes % 60
 
         if days > 0 {
-            return "up \(days)d \(hours)h"
+            return "up \(days)d \(hours)h \(minutes)m"
         }
 
         if hours > 0 {
-            return "up \(hours)h"
+            return "up \(hours)h \(minutes)m"
         }
 
-        return "up <1h"
+        return "up \(minutes)m"
     }
 }
