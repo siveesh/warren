@@ -7,6 +7,12 @@ final class MenuBarCompanionContentModel: ObservableObject {
     @Published var updateSnapshot: AppUpdateStatusSnapshot?
 }
 
+private struct PopoverLayoutMetrics {
+    let sectionSpacing: CGFloat
+    let metricCardHeight: CGFloat
+    let topProcessesMinHeight: CGFloat
+}
+
 struct MenuBarCompanionPopoverView: View {
     @ObservedObject var model: MenuBarCompanionContentModel
     let openMainApp: () -> Void
@@ -19,26 +25,47 @@ struct MenuBarCompanionPopoverView: View {
     ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        GeometryReader { proxy in
             if let snapshot = model.snapshot {
-                hero(snapshot)
-
-                if !model.activeAlerts.isEmpty {
-                    alertsCard
-                }
-
-                metricGrid(snapshot)
-                topProcessesCard(snapshot)
-                updatesCard
-                footerActions
+                content(snapshot, availableHeight: proxy.size.height)
             } else {
                 loadingCard
+                    .padding(8)
             }
         }
-        .padding(8)
         .frame(width: 300)
-        .frame(maxHeight: .infinity, alignment: .topLeading)
         .background(CompanionPalette.canvas)
+    }
+
+    @ViewBuilder
+    private func content(_ snapshot: MenuBarSnapshot, availableHeight: CGFloat) -> some View {
+        let layout = layoutMetrics(for: availableHeight, showsAlerts: !model.activeAlerts.isEmpty)
+
+        VStack(alignment: .leading, spacing: layout.sectionSpacing) {
+            hero(snapshot)
+
+            if !model.activeAlerts.isEmpty {
+                alertsCard
+            }
+
+            metricGrid(snapshot, cardHeight: layout.metricCardHeight)
+            topProcessesCard(snapshot, minHeight: layout.topProcessesMinHeight)
+            updatesCard
+            footerActions
+        }
+        .padding(8)
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private func layoutMetrics(for availableHeight: CGFloat, showsAlerts: Bool) -> PopoverLayoutMetrics {
+        let compactHeight: CGFloat = showsAlerts ? 468 : 430
+        let room = max(0, min(1, (availableHeight - compactHeight) / 70))
+
+        return PopoverLayoutMetrics(
+            sectionSpacing: 6 + room,
+            metricCardHeight: 56 + (room * 12),
+            topProcessesMinHeight: 94 + (room * 16)
+        )
     }
 
     private var loadingCard: some View {
@@ -135,7 +162,7 @@ struct MenuBarCompanionPopoverView: View {
         )
     }
 
-    private func metricGrid(_ snapshot: MenuBarSnapshot) -> some View {
+    private func metricGrid(_ snapshot: MenuBarSnapshot, cardHeight: CGFloat) -> some View {
         LazyVGrid(columns: columns, spacing: 5) {
             metricCard(
                 title: "CPU",
@@ -143,7 +170,8 @@ struct MenuBarCompanionPopoverView: View {
                 detail: snapshot.topProcessName ?? "idle",
                 systemImage: "cpu",
                 tint: CompanionPalette.accent,
-                progress: snapshot.cpuUsage
+                progress: snapshot.cpuUsage,
+                minHeight: cardHeight
             )
 
             metricCard(
@@ -152,7 +180,8 @@ struct MenuBarCompanionPopoverView: View {
                 detail: "\(MenuBarHelperFormatting.formatBytes(snapshot.memoryUsed)) / \(MenuBarHelperFormatting.formatBytes(snapshot.memoryTotal))",
                 systemImage: "memorychip",
                 tint: CompanionPalette.sand,
-                progress: snapshot.memoryUsage
+                progress: snapshot.memoryUsage,
+                minHeight: cardHeight
             )
 
             metricCard(
@@ -161,7 +190,8 @@ struct MenuBarCompanionPopoverView: View {
                 detail: "down \(MenuBarHelperFormatting.formatRate(snapshot.downloadRate))  up \(MenuBarHelperFormatting.formatRate(snapshot.uploadRate))",
                 systemImage: "network",
                 tint: CompanionPalette.sky,
-                progress: nil
+                progress: nil,
+                minHeight: cardHeight
             )
 
             metricCard(
@@ -170,7 +200,8 @@ struct MenuBarCompanionPopoverView: View {
                 detail: "\(MenuBarHelperFormatting.formatBytes(snapshot.diskFreeBytes)) free",
                 systemImage: "internaldrive",
                 tint: CompanionPalette.sky,
-                progress: 1 - snapshot.diskFreeRatio
+                progress: 1 - snapshot.diskFreeRatio,
+                minHeight: cardHeight
             )
 
             metricCard(
@@ -179,7 +210,8 @@ struct MenuBarCompanionPopoverView: View {
                 detail: snapshot.powerSummary ?? "AC power",
                 systemImage: "bolt.fill",
                 tint: CompanionPalette.amber,
-                progress: snapshot.batteryLevel
+                progress: snapshot.batteryLevel,
+                minHeight: cardHeight
             )
 
             metricCard(
@@ -188,12 +220,13 @@ struct MenuBarCompanionPopoverView: View {
                 detail: "Pressure \(pressureTitle(snapshot.memoryPressureLevel))",
                 systemImage: "thermometer.medium",
                 tint: thermalTint(snapshot.thermalStateLevel),
-                progress: Double(snapshot.thermalStateLevel) / 3
+                progress: Double(snapshot.thermalStateLevel) / 3,
+                minHeight: cardHeight
             )
         }
     }
 
-    private func topProcessesCard(_ snapshot: MenuBarSnapshot) -> some View {
+    private func topProcessesCard(_ snapshot: MenuBarSnapshot, minHeight: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Label("Top processes", systemImage: "chart.bar.xaxis")
@@ -219,6 +252,7 @@ struct MenuBarCompanionPopoverView: View {
             }
         }
         .padding(8)
+        .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .topLeading)
         .background(panelFill(cornerRadius: 13))
     }
 
@@ -301,7 +335,8 @@ struct MenuBarCompanionPopoverView: View {
         detail: String,
         systemImage: String,
         tint: Color,
-        progress: Double?
+        progress: Double?,
+        minHeight: CGFloat
     ) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
@@ -338,7 +373,7 @@ struct MenuBarCompanionPopoverView: View {
             }
         }
         .padding(7)
-        .frame(maxWidth: .infinity, minHeight: 56, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: minHeight, alignment: .topLeading)
         .background(panelFill(cornerRadius: 12))
     }
 

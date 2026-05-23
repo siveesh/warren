@@ -4,6 +4,11 @@ SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppC
 
 ## Recent release highlights
 
+### v1.1.7
+
+- The menu bar companion now redistributes spare popover height across the metric cards and Top Processes panel, reducing the empty area below the footer
+- The adaptive spacing keeps the compact no-scroll companion layout intact on shorter screens while giving the normal popover a more balanced, professional look
+
 ### v1.1.6
 
 - The menu bar companion adds a compact Updates card back into the no-scroll popover so update status is visible without reopening the main dashboard
