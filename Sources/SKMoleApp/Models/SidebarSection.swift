@@ -136,3 +136,77 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         }
     }
 }
+
+/// The collapsible groups the sidebar is divided into.
+enum SidebarGroup: String, CaseIterable, Hashable, Identifiable {
+    case overview
+    case apps
+    case storage
+    case developer
+    case system
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .overview: "Overview"
+        case .apps: "Apps"
+        case .storage: "Storage"
+        case .developer: "Developer"
+        case .system: "System"
+        }
+    }
+
+    /// Sections in the order they appear inside the group.
+    var sections: [SidebarSection] {
+        switch self {
+        case .overview: [.dashboard, .smartCare, .updates]
+        case .apps: [.uninstall, .orphans, .quarantine]
+        case .storage: [.cleanup, .storage, .fileIntelligence]
+        case .developer: [.homebrew, .github, .relay]
+        case .system: [.network, .processes, .optimize]
+        }
+    }
+}
+
+extension SidebarSection {
+    var group: SidebarGroup {
+        SidebarGroup.allCases.first { $0.sections.contains(self) } ?? .overview
+    }
+}
+
+/// Which sidebar groups are collapsed and which sections the user hid, kept as comma-separated strings so they
+/// can live in `@AppStorage` and survive relaunches.
+struct SidebarPreferences: Equatable {
+    static let collapsedGroupsKey = "sidebar.collapsedGroups"
+    static let hiddenSectionsKey = "sidebar.hiddenSections"
+
+    private(set) var collapsedGroups: Set<SidebarGroup>
+    private(set) var hiddenSections: Set<SidebarSection>
+
+    init(collapsedStored: String = "", hiddenStored: String = "") {
+        collapsedGroups = Set(collapsedStored.split(separator: ",").compactMap { SidebarGroup(rawValue: String($0)) })
+        hiddenSections = Set(hiddenStored.split(separator: ",").compactMap { SidebarSection(rawValue: String($0)) })
+    }
+
+    var collapsedStored: String { collapsedGroups.map(\.rawValue).sorted().joined(separator: ",") }
+    var hiddenStored: String { hiddenSections.map(\.rawValue).sorted().joined(separator: ",") }
+
+    func isExpanded(_ group: SidebarGroup) -> Bool { !collapsedGroups.contains(group) }
+
+    mutating func setExpanded(_ expanded: Bool, for group: SidebarGroup) {
+        if expanded { collapsedGroups.remove(group) } else { collapsedGroups.insert(group) }
+    }
+
+    func shows(_ section: SidebarSection) -> Bool { !hiddenSections.contains(section) }
+
+    mutating func setShown(_ shown: Bool, for section: SidebarSection) {
+        if shown { hiddenSections.remove(section) } else { hiddenSections.insert(section) }
+    }
+
+    /// Sections of a group that should be listed. The selected section stays visible even if hidden, so the
+    /// highlighted row never disappears.
+    func visibleSections(in group: SidebarGroup, selection: SidebarSection) -> [SidebarSection] {
+        group.sections.filter { shows($0) || $0 == selection }
+    }
+}

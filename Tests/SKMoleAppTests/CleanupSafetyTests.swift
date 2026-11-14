@@ -177,3 +177,24 @@ private let sparkleFixture = """
     #expect(store.filteredManualItems.isEmpty)
     #expect(store.ignoredItems.map(\.id) == [item.id])
 }
+
+@Test func everySidebarSectionBelongsToExactlyOneGroup() {
+    let grouped = SidebarGroup.allCases.flatMap(\.sections)
+    #expect(Set(grouped) == Set(SidebarSection.allCases))
+    #expect(grouped.count == SidebarSection.allCases.count)
+    #expect(SidebarSection.homebrew.group == .developer)
+}
+
+@Test func sidebarPreferencesRoundTripAndKeepSelectionVisible() {
+    var preferences = SidebarPreferences()
+    #expect(preferences.isExpanded(.storage))
+
+    preferences.setExpanded(false, for: .storage)
+    preferences.setShown(false, for: .cleanup)
+    let restored = SidebarPreferences(collapsedStored: preferences.collapsedStored, hiddenStored: preferences.hiddenStored)
+
+    #expect(!restored.isExpanded(.storage))
+    #expect(restored.isExpanded(.apps))
+    #expect(!restored.visibleSections(in: .storage, selection: .dashboard).contains(.cleanup))
+    #expect(restored.visibleSections(in: .storage, selection: .cleanup).contains(.cleanup))
+}

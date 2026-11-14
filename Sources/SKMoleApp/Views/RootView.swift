@@ -2,6 +2,8 @@ import SwiftUI
 
 struct RootView: View {
     @ObservedObject var model: AppModel
+    @AppStorage(SidebarPreferences.collapsedGroupsKey) private var collapsedGroupsStored = ""
+    @AppStorage(SidebarPreferences.hiddenSectionsKey) private var hiddenSectionsStored = ""
 
     var body: some View {
         NavigationSplitView {
@@ -59,25 +61,55 @@ struct RootView: View {
         }
     }
 
+    @ViewBuilder
     private var sidebar: some View {
+        let preferences = SidebarPreferences(collapsedStored: collapsedGroupsStored, hiddenStored: hiddenSectionsStored)
+
         List(
-            SidebarSection.allCases,
-            selection: Binding(
+            selection: Binding<SidebarSection?>(
                 get: { model.selection },
-                set: { model.open(section: $0) }
+                set: { if let section = $0 { model.open(section: section) } }
             )
-        ) { section in
-            VStack(alignment: .leading, spacing: 6) {
-                Label(section.title, systemImage: section.symbol)
-                    .font(.headline)
-                Text(section.subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        ) {
+            ForEach(SidebarGroup.allCases) { group in
+                let sections = preferences.visibleSections(in: group, selection: model.selection)
+
+                if !sections.isEmpty {
+                    Section(
+                        group.title,
+                        isExpanded: Binding(
+                            get: { preferences.isExpanded(group) },
+                            set: { expanded in
+                                var updated = preferences
+                                updated.setExpanded(expanded, for: group)
+                                collapsedGroupsStored = updated.collapsedStored
+                            }
+                        )
+                    ) {
+                        ForEach(sections) { section in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Label(section.title, systemImage: section.symbol)
+                                    .font(.headline)
+                                Text(section.subtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                            .tag(section)
+                        }
+                    }
+                }
             }
-            .padding(.vertical, 4)
-            .tag(section)
         }
         .listStyle(.sidebar)
+        // A section opened from elsewhere (deep link, menu, Smart Care) must not sit inside a collapsed group.
+        .onChange(of: model.selection) { _, section in
+            var updated = preferences
+            if !updated.isExpanded(section.group) {
+                updated.setExpanded(true, for: section.group)
+                collapsedGroupsStored = updated.collapsedStored
+            }
+        }
         .safeAreaInset(edge: .top) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {

@@ -3,6 +3,7 @@ import SKMoleShared
 
 struct SettingsView: View {
     @ObservedObject var model: AppModel
+    @AppStorage(SidebarPreferences.hiddenSectionsKey) private var hiddenSidebarSections = ""
 
     var body: some View {
         ScrollView {
@@ -130,6 +131,35 @@ struct SettingsView: View {
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SectionCard(
+                    title: "Sidebar",
+                    subtitle: "Choose which tools appear in the sidebar. Hidden tools stay reachable from the menu bar, the Sections menu and links.",
+                    symbol: "sidebar.left"
+                ) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(SidebarGroup.allCases) { group in
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(group.title)
+                                    .font(.headline)
+
+                                ForEach(group.sections) { section in
+                                    Toggle(
+                                        section.title,
+                                        isOn: Binding(
+                                            get: { SidebarPreferences(hiddenStored: hiddenSidebarSections).shows(section) },
+                                            set: { shown in
+                                                var updated = SidebarPreferences(hiddenStored: hiddenSidebarSections)
+                                                updated.setShown(shown, for: section)
+                                                hiddenSidebarSections = updated.hiddenStored
+                                            }
+                                        )
+                                    )
                                 }
                             }
                         }
