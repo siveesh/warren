@@ -13,6 +13,8 @@ struct CleanupView: View {
                     errorBanner(cleanupError)
                 }
 
+                homebrewNote
+
                 ForEach(model.cleanupCategories) { category in
                     CleanupCategoryCard(
                         category: category,
@@ -45,6 +47,25 @@ struct CleanupView: View {
         }
     }
 
+    /// Homebrew's installation and cache are protected: only Homebrew itself cleans its cache.
+    private var homebrewNote: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "shippingbox")
+                .foregroundStyle(AppPalette.sky)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Homebrew is protected here").font(.subheadline.weight(.semibold))
+                Text("Warren never deletes Homebrew's folders. Its cache is cleaned by Homebrew itself, with a preview, on the Homebrew page.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Open Homebrew Cleanup") { model.open(section: .homebrew) }
+                .buttonStyle(.bordered)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(AppPalette.secondaryCard.opacity(0.7)))
+    }
+
     private var header: some View {
         SectionCard(
             title: "Cleanup preview",
@@ -53,7 +74,7 @@ struct CleanupView: View {
         ) {
             HStack(spacing: 14) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(ByteFormatting.format(model.cleanupBytes))
+                    Text(MeasuredSize(bytes: model.cleanupBytes, state: model.cleanupBytesAreComplete ? .exact : .atLeast).text)
                         .font(.system(size: 30, weight: .bold, design: .rounded))
                     Text("estimated reclaimable space")
                         .foregroundStyle(.secondary)
@@ -144,7 +165,7 @@ private struct CleanupCategoryCard: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack {
                     Pill(title: category.safetyLevel.title, tint: tint)
-                    Text(ByteFormatting.format(category.totalBytes))
+                    Text(MeasuredSize(bytes: category.totalBytes, state: category.totalIsComplete ? .exact : .atLeast).text)
                         .font(.headline)
                     Spacer()
                     Text("\(selectedCount) selected")
@@ -228,7 +249,7 @@ private struct CleanupCandidateRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(candidate.displayName)
                     .font(.headline)
-                Text("\(ByteFormatting.format(candidate.sizeBytes)) • \(DateFormatting.relativeString(from: candidate.lastModified))")
+                Text("\(candidate.measuredSize.text) • \(DateFormatting.relativeString(from: candidate.lastModified))")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }

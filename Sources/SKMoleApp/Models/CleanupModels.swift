@@ -38,8 +38,11 @@ struct CleanupCandidate: Identifiable, Hashable {
     let lastModified: Date?
     let rationale: String
     let safetyLevel: SafetyLevel
+    /// How much is known about `sizeBytes`: all of it, a lower bound, or nothing.
+    var sizeState: MeasuredSize.State = .exact
 
     var id: String { url.path }
+    var measuredSize: MeasuredSize { MeasuredSize(bytes: sizeBytes, state: sizeState) }
 }
 
 struct CleanupCategorySummary: Identifiable, Hashable {
@@ -49,6 +52,8 @@ struct CleanupCategorySummary: Identifiable, Hashable {
     let icon: String
     let safetyLevel: SafetyLevel
     let totalBytes: UInt64
+    /// False when some item's size is a lower bound or unknown, so the total is "at least".
+    var totalIsComplete = true
     let candidates: [CleanupCandidate]
 
     var id: CleanupCategoryID { category }

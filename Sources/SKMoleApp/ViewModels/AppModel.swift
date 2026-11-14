@@ -641,6 +641,10 @@ final class AppModel: ObservableObject {
         }
     }
 
+    var cleanupBytesAreComplete: Bool {
+        cleanupCategories.allSatisfy(\.totalIsComplete)
+    }
+
     var cleanupBytes: UInt64 {
         cleanupCategories.reduce(into: 0) { $0 += $1.totalBytes }
     }

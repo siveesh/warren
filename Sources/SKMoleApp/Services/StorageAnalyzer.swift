@@ -228,7 +228,7 @@ actor StorageAnalyzer {
                 continue
             }
 
-            let directChildren = await sizer.sizedChildren(of: root, includeHidden: includeHidden)
+            let directChildren = await sizer.sizedChildrenMeasured(of: root, includeHidden: includeHidden)
 
             for sizedChild in directChildren {
                 if Task.isCancelled {
@@ -241,8 +241,10 @@ actor StorageAnalyzer {
                     continue
                 }
 
-                let size = sizedChild.sizeBytes
-                guard size > 0 else {
+                let measured = sizedChild.size
+                let size = measured.bytes
+                // A folder that could not be read stays in the list as unknown; only a known empty one is skipped.
+                guard size > 0 || !measured.isKnown else {
                     continue
                 }
 
@@ -278,7 +280,8 @@ actor StorageAnalyzer {
                         url: child,
                         sizeBytes: size,
                         kind: kind,
-                        children: childNodes
+                        children: childNodes,
+                        sizeState: measured.state
                     )
                 )
             }

@@ -50,10 +50,31 @@ struct RemovalScope: Sendable {
         [URL(fileURLWithPath: "/Applications")] + ["Applications", "Downloads", "Desktop", "Documents"].map(home(_:))
     }
 
+    /// Homebrew's own folders: its installation and its cache. Warren never removes anything in them directly;
+    /// Homebrew cleans its cache itself (`brew cleanup`, on the Homebrew page).
+    func isHomebrewManaged(_ url: URL) -> Bool {
+        let path = URLPathSafety.standardized(url).path
+        let folders = [
+            "/opt/homebrew", "/usr/local/Homebrew", "/usr/local/Cellar", "/usr/local/Caskroom", "/usr/local/opt",
+            home("Library/Caches/Homebrew").path, home("Library/Logs/Homebrew").path, home(".cache/Homebrew").path,
+        ]
+        return folders.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    /// Folders where local AI tools keep downloaded models. Never offered for cleanup or uninstall.
+    func isAIModelStorage(_ url: URL) -> Bool {
+        let path = URLPathSafety.standardized(url).path
+        return PeelProtectedModels.folders.contains { path == home($0).path || path.hasPrefix(home($0).path + "/") }
+    }
+
     /// Whether `url` lies in a place `purpose` may work in.
     func allows(_ url: URL, purpose: GuardPurpose, profile: CleanupSafetyProfile) -> Bool {
         let normalized = URLPathSafety.standardized(url)
         let path = normalized.path
+
+        if purpose == .cleanup || purpose == .uninstall, isHomebrewManaged(normalized) || isAIModelStorage(normalized) {
+            return false
+        }
 
         switch purpose {
         case .cleanup:

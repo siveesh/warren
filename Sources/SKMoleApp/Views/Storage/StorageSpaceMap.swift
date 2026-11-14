@@ -134,7 +134,7 @@ private struct StorageSpaceCard: View {
                     .background(Capsule().fill(Color.white.opacity(0.18)))
             }
 
-            Text(ByteFormatting.format(node.sizeBytes))
+            Text(node.measuredSize.text)
                 .font(.title3.weight(.bold))
 
             GeometryReader { proxy in
@@ -216,7 +216,7 @@ private struct StorageSpaceRow: View {
                     .lineLimit(1)
 
                 HStack(spacing: 8) {
-                    Text(ByteFormatting.format(node.sizeBytes))
+                    Text(node.measuredSize.text)
                     Text(percentageText)
                 }
                 .font(.caption)

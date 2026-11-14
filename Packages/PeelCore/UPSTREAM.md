@@ -22,3 +22,4 @@ TerminalTheme, and `safetyMDCountsEveryPlace` in DesktopWalletTests.
 a test file that needs the CLI target).
 Also removed (depended on removed tests): SystemSettingsStep, TargetSize, TerminalThemeLedger, PrivateDatabase, InflectionMarkup, LinkedText tests.
 - `Support/PeelFolder.swift`: data folder is `Library/Application Support/SK Mole/Engine` instead of `.../Peel`.
+- `Sources/PeelPrivileged/ProtectedData.swift`: `aiModelFolders` (local AI model folders) added to `homeTrees`, so every removal path refuses them.

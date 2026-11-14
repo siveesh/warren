@@ -242,3 +242,74 @@ private let sparkleFixture = """
     #expect(StartupPreference.history.resolve(lastSelection: nil) == .history)
     #expect(Set(SidebarSection.allCases.map(\.shortcutKey)).count == SidebarSection.allCases.count)
 }
+
+@Test func measuredSizeNeverTurnsUnknownIntoZeroOrExact() {
+    #expect(MeasuredSize.unknown.text == "unknown")
+    #expect(MeasuredSize.atLeast(2_048).text == "at least 2 KB")
+    #expect(MeasuredSize.exact(2_048).text == "2 KB")
+
+    let sum = MeasuredSize.exact(1_024) + .unknown
+    #expect(sum.state == .atLeast)
+    #expect(sum.bytes == 1_024)
+    #expect(MeasuredSize.total([.exact(1), .exact(2)]).state == .exact)
+}
+
+@Test func directorySizerReportsAnUnreadableFolderAsNotExactZero() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("warren-sizer-\(UUID().uuidString)")
+    let readable = root.appendingPathComponent("readable")
+    let locked = root.appendingPathComponent("locked")
+    try FileManager.default.createDirectory(at: readable, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+    try Data(repeating: 1, count: 64 * 1_024).write(to: readable.appendingPathComponent("a"))
+    try Data(repeating: 1, count: 64 * 1_024).write(to: locked.appendingPathComponent("b"))
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+    defer {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked.path)
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    let sizer = DirectorySizer()
+    let good = await sizer.measure(of: readable)
+    #expect(good.isExact)
+    #expect(good.bytes >= 64 * 1_024)
+
+    let bad = await sizer.measure(of: locked)
+    #expect(!(bad.isExact && bad.bytes == 0), "an unreadable folder must not be reported as exactly 0")
+
+    let children = await sizer.sizedChildrenMeasured(of: root)
+    let lockedChild = try #require(children.first { $0.url.lastPathComponent == "locked" })
+    #expect(!(lockedChild.size.isExact && lockedChild.size.bytes == 0))
+}
+
+@Test func homebrewFoldersAreNeverOfferedToCleanupOrUninstall() {
+    let scope = RemovalScope()
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let paths = [
+        home.appendingPathComponent("Library/Caches/Homebrew"),
+        home.appendingPathComponent("Library/Caches/Homebrew/downloads/x"),
+        URL(fileURLWithPath: "/opt/homebrew/Cellar/wget"),
+        URL(fileURLWithPath: "/usr/local/Cellar/wget"),
+    ]
+    for path in paths {
+        for profile in CleanupSafetyProfile.allCases {
+            #expect(!scope.allows(path, purpose: .cleanup, profile: profile))
+        }
+        #expect(!scope.allows(path, purpose: .uninstall, profile: .balanced))
+    }
+    // Ordinary caches stay in scope.
+    #expect(scope.allows(home.appendingPathComponent("Library/Caches/com.example.app"), purpose: .cleanup, profile: .balanced))
+}
+
+@Test func localAIModelFoldersAreProtectedEverywhere() {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let scope = RemovalScope()
+    let service = TrashService()
+
+    for path in [".ollama/models/blobs/x", ".lmstudio/models/a.gguf", ".cache/huggingface/hub/models--x", ".cache/lm-studio/y"] {
+        let url = home.appendingPathComponent(path)
+        for profile in CleanupSafetyProfile.allCases {
+            #expect(!scope.allows(url, purpose: .cleanup, profile: profile), "\(path) must not be offered for cleanup")
+        }
+        #expect(service.refusal(of: url) != nil, "\(path) must be refused by the removal guard")
+    }
+}

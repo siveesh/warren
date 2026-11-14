@@ -214,7 +214,18 @@ public enum ProtectedData: Sendable {
 
     /// Every protected place named from a home folder (`homeFolders`, `homeKeys`, `walletKeys`, `cloudState`), which
     /// `refuses`, `holds` and `RemovalGuard` all read, so a place added to one of them is protected by all three.
-    public static let homeTrees = homeFolders + homeKeys + walletKeys + cloudState
+    public static let homeTrees = homeFolders + homeKeys + walletKeys + cloudState + aiModelFolders
+
+    /// Warren addition (not in upstream Peel): where local AI tools keep the models people downloaded. They are
+    /// large, slow to fetch again and not rebuilt by any app, so they stay whole, whichever tool asks.
+    public static let aiModelFolders = [
+        ".ollama", ".lmstudio", ".cache/lm-studio", ".cache/huggingface", ".cache/torch", ".cache/llama.cpp",
+        ".cache/mlx", ".cache/whisper", ".cache/gpt4all", ".cache/modelscope", ".cache/instructlab",
+        "Library/Application Support/LM Studio", "Library/Application Support/Ollama",
+        "Library/Application Support/nomic.ai", "Library/Application Support/Jan",
+        "Library/Application Support/DiffusionBee", "Library/Application Support/com.liuliu.draw-things",
+        "Library/Containers/com.liuliu.draw-things", "Library/Caches/huggingface", "Library/Caches/lm-studio",
+    ]
 
     /// Hidden items in the home folder that belong to no single app: shells, git, and the folders many tools
     /// share. Never removed on any app's behalf, but what sits inside `.config`, `.cache`, and `.local` still

@@ -733,7 +733,7 @@ private struct StorageExplorerSummary: View {
             HStack(spacing: 12) {
                 explorerMetric(
                     title: "Current total",
-                    value: ByteFormatting.format(currentNode.sizeBytes)
+                    value: currentNode.measuredSize.text
                 )
                 explorerMetric(
                     title: "Visible contributors",

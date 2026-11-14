@@ -45,7 +45,8 @@ let package = Package(
                 .product(name: "RelaySecurity", package: "RelayKit"),
                 .product(name: "RelayTasks", package: "RelayKit"),
                 .product(name: "RelayCommandPacks", package: "RelayKit"),
-                .product(name: "PeelCore", package: "PeelCore")
+                .product(name: "PeelCore", package: "PeelCore"),
+                .product(name: "PeelPrivileged", package: "PeelCore")
             ],
             path: "Sources/SKMoleApp"
         ),

@@ -149,6 +149,10 @@ struct StorageNode: Identifiable, Hashable, Sendable {
     let sizeBytes: UInt64
     let kind: StorageNodeKind
     let children: [StorageNode]
+    /// A lower bound or unknown when something inside could not be read; never shown as an exact zero.
+    var sizeState: MeasuredSize.State = .exact
+
+    var measuredSize: MeasuredSize { MeasuredSize(bytes: sizeBytes, state: sizeState) }
 
     var isDrillable: Bool {
         !children.isEmpty && kind != .remainder

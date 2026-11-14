@@ -173,6 +173,7 @@ actor CleanupScanner {
 
                     let children = await sizer.children(of: root, includeHidden: rule.id == .trash)
 
+                    var eligible: [URL] = []
                     for child in children {
                         if Task.isCancelled {
                             return results
@@ -187,8 +188,16 @@ actor CleanupScanner {
                             continue
                         }
 
-                        let size = await sizer.size(of: child)
-                        guard size >= rule.minimumSize else {
+                        eligible.append(child)
+                    }
+
+                    // Folders are measured side by side, so one slow folder does not hold up the rest.
+                    let sizes = await sizer.measureAll(eligible)
+
+                    for child in eligible {
+                        let measured = sizes[child] ?? .unknown
+                        // An item whose size cannot be read is listed as unknown, never hidden as zero.
+                        guard !measured.isKnown || measured.bytes >= rule.minimumSize else {
                             continue
                         }
 
@@ -196,10 +205,11 @@ actor CleanupScanner {
                         let candidate = CleanupCandidate(
                             url: child,
                             displayName: values?.localizedName ?? child.lastPathComponent,
-                            sizeBytes: size,
+                            sizeBytes: measured.bytes,
                             lastModified: values?.contentModificationDate,
                             rationale: rule.subtitle,
-                            safetyLevel: rule.safetyLevel
+                            safetyLevel: rule.safetyLevel,
+                            sizeState: measured.state
                         )
                         candidates.append(candidate)
                     }
@@ -216,6 +226,7 @@ actor CleanupScanner {
                     icon: rule.icon,
                     safetyLevel: rule.safetyLevel,
                     totalBytes: candidates.reduce(into: 0) { $0 += $1.sizeBytes },
+                    totalIsComplete: candidates.allSatisfy { $0.sizeState == .exact },
                     candidates: candidates
                 )
             )
@@ -268,10 +279,7 @@ actor CleanupScanner {
                     return false
                 }
 
-                guard await guardService.canOperate(on: file, purpose: .cleanup) else {
-                    return true
-                }
-
+                // Cheap checks first: the removal guard reads the disk, so it only judges real candidates.
                 let lowerExtension = file.pathExtension.lowercased()
                 guard installerExtensions.contains(lowerExtension) else {
                     return true
@@ -279,6 +287,10 @@ actor CleanupScanner {
 
                 let size = await sizer.size(of: file)
                 guard size >= profile.minimumSize(8 * 1_024 * 1_024) else {
+                    return true
+                }
+
+                guard await guardService.canOperate(on: file, purpose: .cleanup) else {
                     return true
                 }
 
@@ -307,6 +319,7 @@ actor CleanupScanner {
             icon: "shippingbox.circle",
             safetyLevel: .review,
             totalBytes: candidates.reduce(into: 0) { $0 += $1.sizeBytes },
+                    totalIsComplete: candidates.allSatisfy { $0.sizeState == .exact },
             candidates: candidates
         )
     }
@@ -343,8 +356,8 @@ actor CleanupScanner {
                 continue
             }
 
-            let size = await sizer.size(of: child)
-            guard size >= profile.minimumSize(48 * 1_024 * 1_024) else {
+            let measured = await sizer.measure(of: child)
+            guard !measured.isKnown || measured.bytes >= profile.minimumSize(48 * 1_024 * 1_024) else {
                 continue
             }
 
@@ -352,10 +365,11 @@ actor CleanupScanner {
                 CleanupCandidate(
                     url: child,
                     displayName: values?.localizedName ?? child.lastPathComponent,
-                    sizeBytes: size,
+                    sizeBytes: measured.bytes,
                     lastModified: modified,
                     rationale: "Older download that looks inactive. Review before removing in case it is still part of your working set.",
-                    safetyLevel: .review
+                    safetyLevel: .review,
+                    sizeState: measured.state
                 )
             )
         }
@@ -374,6 +388,7 @@ actor CleanupScanner {
             icon: "arrow.down.circle.dotted",
             safetyLevel: .review,
             totalBytes: candidates.reduce(into: 0) { $0 += $1.sizeBytes },
+                    totalIsComplete: candidates.allSatisfy { $0.sizeState == .exact },
             candidates: candidates
         )
     }
@@ -407,10 +422,6 @@ actor CleanupScanner {
                     return false
                 }
 
-                guard await guardService.canOperate(on: file, purpose: .cleanup) else {
-                    return true
-                }
-
                 let values = try? file.resourceValues(forKeys: [
                     .isDirectoryKey,
                     .isPackageKey,
@@ -426,6 +437,11 @@ actor CleanupScanner {
 
                 let size = UInt64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? values?.fileSize ?? 0)
                 guard size >= profile.duplicateMinimumSize else {
+                    return true
+                }
+
+                // The removal guard reads the disk, so only files big enough to matter are judged by it.
+                guard await guardService.canOperate(on: file, purpose: .cleanup) else {
                     return true
                 }
 
@@ -513,6 +529,7 @@ actor CleanupScanner {
             icon: "square.on.square",
             safetyLevel: .review,
             totalBytes: candidates.reduce(into: 0) { $0 += $1.sizeBytes },
+                    totalIsComplete: candidates.allSatisfy { $0.sizeState == .exact },
             candidates: candidates
         )
     }
@@ -522,40 +539,48 @@ actor CleanupScanner {
             home.appendingPathComponent("Library/Containers"),
             home.appendingPathComponent("Library/Group Containers")
         ]
-        var candidates: [CleanupCandidate] = []
+        var found: [(cacheRoot: URL, container: URL)] = []
 
         for root in roots where fileManager.fileExists(atPath: root.path) {
             let containers = await sizer.children(of: root, includeHidden: true)
 
             for container in containers {
                 if Task.isCancelled {
-                    return candidates
+                    return []
                 }
 
-                let cacheCandidates = cacheRoots(in: container)
-                for cacheRoot in cacheCandidates where fileManager.fileExists(atPath: cacheRoot.path) {
+                for cacheRoot in cacheRoots(in: container) where fileManager.fileExists(atPath: cacheRoot.path) {
                     guard await guardService.canOperate(on: cacheRoot, purpose: .cleanup) else {
                         continue
                     }
 
-                    let size = await sizer.size(of: cacheRoot)
-                    guard size >= profile.minimumSize(32 * 1_024 * 1_024) else {
-                        continue
-                    }
-
-                    let values = try? cacheRoot.resourceValues(forKeys: [.contentModificationDateKey, .localizedNameKey])
-                    candidates.append(
-                        CleanupCandidate(
-                            url: cacheRoot,
-                            displayName: readableSandboxCacheName(for: cacheRoot, container: container),
-                            sizeBytes: size,
-                            lastModified: values?.contentModificationDate,
-                            rationale: "Cache content discovered dynamically inside a sandbox or group container. Apps normally rebuild this state, but Warren keeps it review-first.",
-                            safetyLevel: .review
-                        )
-                    )
+                    found.append((cacheRoot, container))
                 }
             }
+        }
+
+        // Measured side by side, so one slow container does not hold up the rest.
+        let sizes = await sizer.measureAll(found.map(\.cacheRoot))
+        var candidates: [CleanupCandidate] = []
+
+        for (cacheRoot, container) in found {
+            let measured = sizes[cacheRoot] ?? .unknown
+            guard !measured.isKnown || measured.bytes >= profile.minimumSize(32 * 1_024 * 1_024) else {
+                continue
+            }
+
+            let values = try? cacheRoot.resourceValues(forKeys: [.contentModificationDateKey, .localizedNameKey])
+            candidates.append(
+                CleanupCandidate(
+                    url: cacheRoot,
+                    displayName: readableSandboxCacheName(for: cacheRoot, container: container),
+                    sizeBytes: measured.bytes,
+                    lastModified: values?.contentModificationDate,
+                    rationale: "Cache content discovered dynamically inside a sandbox or group container. Apps normally rebuild this state, but Warren keeps it review-first.",
+                    safetyLevel: .review,
+                    sizeState: measured.state
+                )
+            )
         }
 
         return Dictionary(grouping: candidates, by: \.id)
