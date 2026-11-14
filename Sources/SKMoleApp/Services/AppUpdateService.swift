@@ -547,7 +547,7 @@ actor AppUpdateService {
         homepageURL: URL?
     ) async -> AppUpdateItem? {
         do {
-            let feed = try await fetchSparkleFeed(from: feedURL)
+            let feed = try await fetchSparkleFeed(from: feedURL, allowPrerelease: Self.looksLikePrerelease(installedVersion))
             guard let latestVersion = Self.normalizedVersion(feed.latestVersion) else {
                 return nil
             }
@@ -844,7 +844,7 @@ actor AppUpdateService {
         throw AppUpdateError.lookupFailed("Apple did not return a lookup result for App Store ID \(adamID).")
     }
 
-    private func fetchSparkleFeed(from url: URL) async throws -> SparkleFeedSummary {
+    private func fetchSparkleFeed(from url: URL, allowPrerelease: Bool) async throws -> SparkleFeedSummary {
         let request = try makeRequest(url: url)
         let (data, _) = try await fetchLimitedData(
             for: request,
@@ -852,7 +852,12 @@ actor AppUpdateService {
             source: "Sparkle appcast"
         )
         let parser = SparkleAppcastParser(baseURL: url)
-        return try parser.parse(data: data)
+        return try parser.parse(data: data, allowPrerelease: allowPrerelease)
+    }
+
+    static func looksLikePrerelease(_ version: String?) -> Bool {
+        guard let version = version?.lowercased() else { return false }
+        return ["alpha", "beta", "rc", "preview", "nightly", "dev"].contains { version.contains($0) }
     }
 
     private func fetchLatestGitHubRelease(repositoryURL: URL) async throws -> GitHubRelease {
@@ -1242,7 +1247,7 @@ private struct GitHubReleaseAsset: Decodable {
     }
 }
 
-private struct SparkleFeedSummary {
+struct SparkleFeedSummary {
     let latestVersion: String?
     let itemURL: URL?
     let releaseNotesURL: URL?
@@ -1251,7 +1256,7 @@ private struct SparkleFeedSummary {
     let embeddedReleaseNotes: String?
 }
 
-private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
+final class SparkleAppcastParser: NSObject, XMLParserDelegate {
     private struct Item {
         var itemURL: URL?
         var releaseNotesURL: URL?
@@ -1260,11 +1265,16 @@ private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
         var shortVersion: String?
         var version: String?
         var itemDescription: String?
+        var channel: String?
+        var minimumSystemVersion: String?
+        var maximumSystemVersion: String?
     }
 
     private let baseURL: URL
     private var currentItem: Item?
-    private var parsedItem: Item?
+    private var items: [Item] = []
+    private var deltaDepth = 0
+    private var allowPrerelease = false
     private var currentElement: String?
     private var currentText = ""
     private let maximumElementTextLength = 16_384
@@ -1273,7 +1283,8 @@ private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
         self.baseURL = baseURL
     }
 
-    func parse(data: Data) throws -> SparkleFeedSummary {
+    func parse(data: Data, allowPrerelease: Bool) throws -> SparkleFeedSummary {
+        self.allowPrerelease = allowPrerelease
         let parser = XMLParser(data: data)
         parser.shouldResolveExternalEntities = false
         parser.delegate = self
@@ -1282,7 +1293,7 @@ private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
             throw parser.parserError ?? AppUpdateError.lookupFailed("The Sparkle appcast could not be parsed.")
         }
 
-        let resolved = parsedItem ?? currentItem
+        let resolved = bestEligibleItem()
         return SparkleFeedSummary(
             latestVersion: resolved?.shortVersion ?? resolved?.version,
             itemURL: resolved?.itemURL,
@@ -1312,7 +1323,13 @@ private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
             return
         }
 
-        if elementName == "enclosure" {
+        if elementName == "sparkle:deltas" {
+            deltaDepth += 1
+            return
+        }
+
+        // Delta enclosures describe patches between builds, not the full download.
+        if elementName == "enclosure", deltaDepth == 0 {
             if let download = resolvedSecureURL(attributeDict["url"]) {
                 currentItem?.downloadURL = download
             }
@@ -1342,8 +1359,24 @@ private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
     ) {
         let text = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        if elementName == "sparkle:deltas" {
+            deltaDepth = max(0, deltaDepth - 1)
+        }
+
         if currentItem != nil {
             switch elementName {
+            case "sparkle:channel":
+                if !text.isEmpty {
+                    currentItem?.channel = text
+                }
+            case "sparkle:minimumSystemVersion":
+                if !text.isEmpty {
+                    currentItem?.minimumSystemVersion = text
+                }
+            case "sparkle:maximumSystemVersion":
+                if !text.isEmpty {
+                    currentItem?.maximumSystemVersion = text
+                }
             case "link":
                 if currentItem?.itemURL == nil, let url = resolvedSecureURL(text) {
                     currentItem?.itemURL = url
@@ -1369,8 +1402,8 @@ private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
                     currentItem?.itemDescription = text
                 }
             case "item":
-                if parsedItem == nil {
-                    parsedItem = currentItem
+                if let finished = currentItem {
+                    items.append(finished)
                 }
                 currentItem = nil
             default:
@@ -1380,6 +1413,39 @@ private final class SparkleAppcastParser: NSObject, XMLParserDelegate {
 
         currentElement = nil
         currentText = ""
+    }
+
+    /// Mirrors what Sparkle itself would offer: items on a named channel (beta, nightly, ...) are skipped
+    /// unless the installed build is a prerelease, items must support this macOS, and the highest build wins.
+    private func bestEligibleItem() -> Item? {
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        let currentOS = "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+
+        let eligible = items.filter { item in
+            if let channel = item.channel, !channel.isEmpty, !allowPrerelease {
+                return false
+            }
+
+            if let minimum = item.minimumSystemVersion,
+               currentOS.compare(minimum, options: .numeric) == .orderedAscending {
+                return false
+            }
+
+            if let maximum = item.maximumSystemVersion,
+               currentOS.compare(maximum, options: .numeric) == .orderedDescending {
+                return false
+            }
+
+            if !allowPrerelease, AppUpdateService.looksLikePrerelease(item.shortVersion) {
+                return false
+            }
+
+            return true
+        }
+
+        return eligible.max { left, right in
+            (left.version ?? left.shortVersion ?? "").compare(right.version ?? right.shortVersion ?? "", options: .numeric) == .orderedAscending
+        }
     }
 
     private func resolvedSecureURL(_ value: String?) -> URL? {

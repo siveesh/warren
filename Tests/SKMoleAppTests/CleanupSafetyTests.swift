@@ -117,3 +117,36 @@ private func candidate(_ path: String, safety: SafetyLevel) -> CleanupCandidate 
     #expect(AppUpdateService.parseOutdatedAdamIDs(output) == [497799835, 1295203466])
     #expect(AppUpdateService.parseOutdatedAdamIDs("").isEmpty)
 }
+
+private let sparkleFixture = """
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0"><channel>
+<item><title>beta</title><sparkle:channel>beta</sparkle:channel><sparkle:version>125</sparkle:version>
+<sparkle:shortVersionString>1.40.2</sparkle:shortVersionString>
+<enclosure url="https://example.com/beta.dmg"/>
+<sparkle:deltas><enclosure url="https://example.com/d.delta" sparkle:deltaFrom="119"/></sparkle:deltas></item>
+<item><title>stable</title><sparkle:version>119</sparkle:version>
+<sparkle:shortVersionString>1.40.1</sparkle:shortVersionString>
+<enclosure url="https://example.com/stable.dmg"/></item>
+<item><title>needs future macOS</title><sparkle:version>200</sparkle:version>
+<sparkle:shortVersionString>9.0</sparkle:shortVersionString>
+<sparkle:minimumSystemVersion>99.0</sparkle:minimumSystemVersion>
+<enclosure url="https://example.com/future.dmg"/></item>
+</channel></rss>
+"""
+
+@Test func sparkleParserSkipsBetaChannelAndUnsupportedMacOS() throws {
+    let data = Data(sparkleFixture.utf8)
+    let stable = try SparkleAppcastParser(baseURL: URL(string: "https://example.com/feed.xml")!).parse(data: data, allowPrerelease: false)
+    #expect(stable.latestVersion == "1.40.1")
+    #expect(stable.downloadURL?.absoluteString == "https://example.com/stable.dmg")
+
+    let beta = try SparkleAppcastParser(baseURL: URL(string: "https://example.com/feed.xml")!).parse(data: data, allowPrerelease: true)
+    #expect(beta.latestVersion == "1.40.2")
+    #expect(beta.downloadURL?.absoluteString == "https://example.com/beta.dmg")
+}
+
+@Test func prereleaseDetectionRecognizesCommonTags() {
+    #expect(AppUpdateService.looksLikePrerelease("0.9.1-beta.144"))
+    #expect(!AppUpdateService.looksLikePrerelease("1.40.1"))
+    #expect(!AppUpdateService.looksLikePrerelease(nil))
+}
