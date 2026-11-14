@@ -24,6 +24,10 @@ let package = Package(
             targets: ["SKMoleMenuBarHelper"]
         )
     ],
+    dependencies: [
+        // Relay command palette and workflow engine (bundled copy of the standalone Relay app's core).
+        .package(path: "Packages/RelayKit")
+    ],
     targets: [
         .target(
             name: "SKMoleShared",
@@ -31,7 +35,15 @@ let package = Package(
         ),
         .executableTarget(
             name: "SKMoleApp",
-            dependencies: ["SKMoleShared"],
+            dependencies: [
+                "SKMoleShared",
+                .product(name: "RelayAppSupport", package: "RelayKit"),
+                .product(name: "RelayCore", package: "RelayKit"),
+                .product(name: "RelayUI", package: "RelayKit"),
+                .product(name: "RelaySecurity", package: "RelayKit"),
+                .product(name: "RelayTasks", package: "RelayKit"),
+                .product(name: "RelayCommandPacks", package: "RelayKit")
+            ],
             path: "Sources/SKMoleApp"
         ),
         .executableTarget(
@@ -41,7 +53,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "SKMoleMenuBarHelper",
-            dependencies: ["SKMoleShared"],
+            dependencies: [
+                "SKMoleShared",
+                .product(name: "RelayAppSupport", package: "RelayKit"),
+                .product(name: "RelayCore", package: "RelayKit"),
+                .product(name: "RelayUI", package: "RelayKit")
+            ],
             path: "Sources/SKMoleMenuBarHelper"
         ),
         .testTarget(

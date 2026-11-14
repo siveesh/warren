@@ -1,3 +1,4 @@
+import RelayCore
 import SwiftUI
 import SKMoleShared
 
@@ -5,6 +6,9 @@ final class MenuBarCompanionContentModel: ObservableObject {
     @Published var snapshot: MenuBarSnapshot?
     @Published var activeAlerts: [MenuBarActiveAlert] = []
     @Published var updateSnapshot: AppUpdateStatusSnapshot?
+    @Published var relayQuickRun: [RelayCommand] = []
+    @Published var relayCategories: [(category: String, commands: [RelayCommand])] = []
+    @Published var relayHotKey = ""
 }
 
 private struct PopoverLayoutMetrics {
@@ -17,6 +21,8 @@ struct MenuBarCompanionPopoverView: View {
     @ObservedObject var model: MenuBarCompanionContentModel
     let openMainApp: () -> Void
     let openUpdates: () -> Void
+    let openPalette: () -> Void
+    let runRelayCommand: (RelayCommand) -> Void
     let quitCompanion: () -> Void
 
     private let columns = [
@@ -58,7 +64,7 @@ struct MenuBarCompanionPopoverView: View {
     }
 
     private func layoutMetrics(for availableHeight: CGFloat, showsAlerts: Bool) -> PopoverLayoutMetrics {
-        let compactHeight: CGFloat = showsAlerts ? 468 : 430
+        let compactHeight: CGFloat = showsAlerts ? 504 : 466
         let room = max(0, min(1, (availableHeight - compactHeight) / 70))
 
         return PopoverLayoutMetrics(
@@ -73,7 +79,7 @@ struct MenuBarCompanionPopoverView: View {
             ProgressView()
             Text("Sampling your Mac...")
                 .font(.subheadline.weight(.semibold))
-            Text("SK Mole Companion keeps the menu bar light and fills in richer details when opened.")
+            Text("Warren Companion keeps the menu bar light and fills in richer details when opened.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -109,7 +115,7 @@ struct MenuBarCompanionPopoverView: View {
                         .font(.subheadline.weight(.semibold))
                 }
                 .buttonStyle(.plain)
-                .help("Open SK Mole")
+                .help("Open Warren")
             }
 
             Text(configurationLine(snapshot.systemConfiguration))
@@ -323,9 +329,60 @@ struct MenuBarCompanionPopoverView: View {
     }
 
     private var footerActions: some View {
+        VStack(spacing: 6) {
+            relayActions
+            HStack(spacing: 6) {
+                footerButton("Open", systemImage: "circle.grid.2x2", action: openMainApp)
+                footerIconButton(systemImage: "power", accessibilityLabel: "Quit Companion", action: quitCompanion)
+            }
+        }
+    }
+
+    private var relayActions: some View {
         HStack(spacing: 6) {
-            footerButton("Open", systemImage: "circle.grid.2x2", action: openMainApp)
-            footerIconButton(systemImage: "power", accessibilityLabel: "Quit Companion", action: quitCompanion)
+            footerButton(
+                model.relayHotKey.isEmpty ? "Palette" : "Palette \(model.relayHotKey)",
+                systemImage: "chevron.right.2",
+                action: openPalette
+            )
+
+            Menu {
+                if model.relayQuickRun.isEmpty {
+                    Text("No favorites yet - star commands in the palette")
+                } else {
+                    Section("Favorites") {
+                        ForEach(model.relayQuickRun) { command in
+                            Button { runRelayCommand(command) } label: {
+                                Label(command.name, systemImage: command.icon)
+                            }
+                        }
+                    }
+                }
+
+                Divider()
+
+                Menu("All Commands") {
+                    ForEach(model.relayCategories, id: \.category) { group in
+                        Menu(group.category) {
+                            ForEach(group.commands) { command in
+                                Button(command.name) { runRelayCommand(command) }
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Label("Favorites", systemImage: "star.circle")
+                    .font(.caption2.weight(.bold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(CompanionPalette.control)
+            )
         }
     }
 

@@ -44,7 +44,7 @@ struct GitHubCLIStatus: Hashable {
         }
 
         guard let userLogin else {
-            return "Authenticate with GitHub CLI in your browser, then SK Mole can verify your session and list repositories owned by the signed-in account."
+            return "Authenticate with GitHub CLI in your browser, then Warren can verify your session and list repositories owned by the signed-in account."
         }
 
         let displayName: String

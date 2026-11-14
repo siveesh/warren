@@ -17,25 +17,29 @@ actor CleanupScanner {
     private let fileManager = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser
     private let installerExtensions: Set<String> = ["dmg", "pkg", "xip", "iso"]
-    private let duplicateMinimumSize: UInt64 = 16 * 1_024 * 1_024
-    private let sandboxCacheMinimumSize: UInt64 = 32 * 1_024 * 1_024
+    private var profile: CleanupSafetyProfile = .balanced
 
     init(guardService: SystemGuard, sizer: DirectorySizer) {
         self.guardService = guardService
         self.sizer = sizer
     }
 
-    func scan(progress: @escaping @Sendable (ScanProgress) async -> Void = { _ in }) async -> [CleanupCategorySummary] {
+    func scan(
+        profile: CleanupSafetyProfile,
+        progress: @escaping @Sendable (ScanProgress) async -> Void = { _ in }
+    ) async -> [CleanupCategorySummary] {
+        self.profile = profile
+        await guardService.setCleanupProfile(profile)
         await sizer.pruneMissingEntries()
 
-        let rules = [
+        var rules = [
             CleanupRule(
                 id: .userCaches,
                 title: "User caches",
                 subtitle: "App caches in your home Library that macOS and apps can rebuild safely.",
                 icon: "externaldrive.badge.timemachine",
                 safetyLevel: .safe,
-                minimumSize: 32 * 1_024 * 1_024,
+                minimumSize: profile.minimumSize(32 * 1_024 * 1_024),
                 roots: [home.appendingPathComponent("Library/Caches")]
             ),
             CleanupRule(
@@ -44,7 +48,7 @@ actor CleanupScanner {
                 subtitle: "Per-app caches inside sandbox containers and group containers that apps can usually rebuild.",
                 icon: "shippingbox.circle",
                 safetyLevel: .review,
-                minimumSize: sandboxCacheMinimumSize,
+                minimumSize: profile.minimumSize(32 * 1_024 * 1_024),
                 roots: []
             ),
             CleanupRule(
@@ -53,7 +57,7 @@ actor CleanupScanner {
                 subtitle: "Browser cache stores and web process leftovers, not bookmarks or saved logins.",
                 icon: "globe",
                 safetyLevel: .review,
-                minimumSize: 48 * 1_024 * 1_024,
+                minimumSize: profile.minimumSize(48 * 1_024 * 1_024),
                 roots: [
                     home.appendingPathComponent("Library/Caches/Google/Chrome"),
                     home.appendingPathComponent("Library/Caches/BraveSoftware/Brave-Browser"),
@@ -68,7 +72,7 @@ actor CleanupScanner {
                 subtitle: "Rotating logs and crash diagnostics that are safe to reclaim when no longer needed.",
                 icon: "doc.text.magnifyingglass",
                 safetyLevel: .safe,
-                minimumSize: 8 * 1_024 * 1_024,
+                minimumSize: profile.minimumSize(8 * 1_024 * 1_024),
                 roots: [
                     home.appendingPathComponent("Library/Logs"),
                     home.appendingPathComponent("Library/Logs/DiagnosticReports")
@@ -80,7 +84,7 @@ actor CleanupScanner {
                 subtitle: "Build outputs and simulator caches that can consume tens of gigabytes.",
                 icon: "hammer",
                 safetyLevel: .safe,
-                minimumSize: 64 * 1_024 * 1_024,
+                minimumSize: profile.minimumSize(64 * 1_024 * 1_024),
                 roots: [
                     home.appendingPathComponent("Library/Developer/Xcode/DerivedData"),
                     home.appendingPathComponent("Library/Developer/CoreSimulator/Caches")
@@ -92,7 +96,7 @@ actor CleanupScanner {
                 subtitle: "Docker Desktop log and cache folders that are usually safe to rebuild, without touching your images or container data.",
                 icon: "shippingbox.circle.fill",
                 safetyLevel: .review,
-                minimumSize: 16 * 1_024 * 1_024,
+                minimumSize: profile.minimumSize(16 * 1_024 * 1_024),
                 roots: [
                     home.appendingPathComponent("Library/Caches/com.docker.docker"),
                     home.appendingPathComponent("Library/Containers/com.docker.docker/Data/log"),
@@ -105,7 +109,7 @@ actor CleanupScanner {
                 subtitle: "npm, pnpm, Yarn, and Gradle caches. Safe, but expect slower first rebuilds afterward.",
                 icon: "shippingbox",
                 safetyLevel: .review,
-                minimumSize: 64 * 1_024 * 1_024,
+                minimumSize: profile.minimumSize(64 * 1_024 * 1_024),
                 roots: [
                     home.appendingPathComponent(".npm/_cacache"),
                     home.appendingPathComponent(".pnpm-store"),
@@ -124,7 +128,23 @@ actor CleanupScanner {
             )
         ]
 
+        if profile.includesExtendedRoots {
+            rules.insert(
+                CleanupRule(
+                    id: .toolCaches,
+                    title: "Developer tool caches",
+                    subtitle: "Cargo registry downloads, ~/.cache contents, and Xcode device support files that tools re-download when needed.",
+                    icon: "wrench.and.screwdriver",
+                    safetyLevel: .review,
+                    minimumSize: profile.minimumSize(64 * 1_024 * 1_024),
+                    roots: CleanupSafetyProfile.extendedRoots(home: home)
+                ),
+                at: rules.count - 1
+            )
+        }
+
         var results: [CleanupCategorySummary] = []
+        var claimedPaths = Set<String>()
         let totalSteps = rules.count + 3
 
         for (index, rule) in rules.enumerated() {
@@ -159,6 +179,11 @@ actor CleanupScanner {
                         }
 
                         guard await guardService.canOperate(on: child, purpose: .cleanup) else {
+                            continue
+                        }
+
+                        // Overlapping roots (for example ~/.cache/yarn) belong to the first rule that claims them.
+                        guard claimedPaths.insert(child.path).inserted else {
                             continue
                         }
 
@@ -253,7 +278,7 @@ actor CleanupScanner {
                 }
 
                 let size = await sizer.size(of: file)
-                guard size >= 8 * 1_024 * 1_024 else {
+                guard size >= profile.minimumSize(8 * 1_024 * 1_024) else {
                     return true
                 }
 
@@ -319,7 +344,7 @@ actor CleanupScanner {
             }
 
             let size = await sizer.size(of: child)
-            guard size >= 48 * 1_024 * 1_024 else {
+            guard size >= profile.minimumSize(48 * 1_024 * 1_024) else {
                 continue
             }
 
@@ -370,7 +395,7 @@ actor CleanupScanner {
 
         var sizeBuckets: [UInt64: [DuplicateSource]] = [:]
         var duplicateSourcesConsidered = 0
-        let duplicateSourceLimit = 5_000
+        let duplicateSourceLimit = profile.duplicateSourceLimit
 
         duplicateRoots: for root in roots where fileManager.fileExists(atPath: root.path) {
             let shouldContinue = await enumerateFiles(in: root, includePackages: false) { file in
@@ -400,7 +425,7 @@ actor CleanupScanner {
                 }
 
                 let size = UInt64(values?.totalFileAllocatedSize ?? values?.fileAllocatedSize ?? values?.fileSize ?? 0)
-                guard size >= duplicateMinimumSize else {
+                guard size >= profile.duplicateMinimumSize else {
                     return true
                 }
 
@@ -429,14 +454,28 @@ actor CleanupScanner {
                 break
             }
 
-            var digestBuckets: [String: [DuplicateSource]] = [:]
+            // Cheap first-megabyte hash narrows each same-size bucket before any full-file hashing.
+            var prefixBuckets: [String: [DuplicateSource]] = [:]
             for source in bucket {
                 if Task.isCancelled {
                     break
                 }
 
-                if let digest = digest(for: source.url) {
-                    digestBuckets[digest, default: []].append(source)
+                if let prefix = digest(for: source.url, maxBytes: 1_048_576) {
+                    prefixBuckets[prefix, default: []].append(source)
+                }
+            }
+
+            var digestBuckets: [String: [DuplicateSource]] = [:]
+            for prefixGroup in prefixBuckets.values where prefixGroup.count > 1 {
+                for source in prefixGroup {
+                    if Task.isCancelled {
+                        break
+                    }
+
+                    if let digest = digest(for: source.url, maxBytes: nil) {
+                        digestBuckets[digest, default: []].append(source)
+                    }
                 }
             }
 
@@ -453,13 +492,13 @@ actor CleanupScanner {
                             displayName: duplicate.displayName,
                             sizeBytes: duplicate.sizeBytes,
                             lastModified: duplicate.modifiedAt,
-                            rationale: "Duplicate of \(retained.displayName). SK Mole keeps the newest copy selected by default and surfaces the extras for review.",
+                            rationale: "Duplicate of \(retained.displayName). Warren keeps the newest copy selected by default and surfaces the extras for review.",
                             safetyLevel: .review
                         )
                     )
 
-                    if candidates.count > 96 {
-                        candidates = Array(candidates.sorted { $0.sizeBytes > $1.sizeBytes }.prefix(48))
+                    if candidates.count > profile.duplicateResultLimit * 2 {
+                        candidates = Array(candidates.sorted { $0.sizeBytes > $1.sizeBytes }.prefix(profile.duplicateResultLimit))
                     }
                 }
             }
@@ -470,7 +509,7 @@ actor CleanupScanner {
         return CleanupCategorySummary(
             category: .duplicates,
             title: "Duplicate files",
-            subtitle: "Likely duplicate files from common user folders. SK Mole keeps one copy and surfaces the extras for review.",
+            subtitle: "Likely duplicate files from common user folders. Warren keeps one copy and surfaces the extras for review.",
             icon: "square.on.square",
             safetyLevel: .review,
             totalBytes: candidates.reduce(into: 0) { $0 += $1.sizeBytes },
@@ -500,7 +539,7 @@ actor CleanupScanner {
                     }
 
                     let size = await sizer.size(of: cacheRoot)
-                    guard size >= sandboxCacheMinimumSize else {
+                    guard size >= profile.minimumSize(32 * 1_024 * 1_024) else {
                         continue
                     }
 
@@ -511,7 +550,7 @@ actor CleanupScanner {
                             displayName: readableSandboxCacheName(for: cacheRoot, container: container),
                             sizeBytes: size,
                             lastModified: values?.contentModificationDate,
-                            rationale: "Cache content discovered dynamically inside a sandbox or group container. Apps normally rebuild this state, but SK Mole keeps it review-first.",
+                            rationale: "Cache content discovered dynamically inside a sandbox or group container. Apps normally rebuild this state, but Warren keeps it review-first.",
                             safetyLevel: .review
                         )
                     )
@@ -584,7 +623,7 @@ actor CleanupScanner {
         return true
     }
 
-    private func digest(for url: URL) -> String? {
+    private func digest(for url: URL, maxBytes: Int?) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else {
             return nil
         }
@@ -592,13 +631,22 @@ actor CleanupScanner {
         defer { try? handle.close() }
 
         var hasher = SHA256()
+        var remaining = maxBytes
         while autoreleasepool(invoking: {
-            let data = try? handle.read(upToCount: 1_048_576)
+            let chunk = min(1_048_576, remaining ?? 1_048_576)
+            guard chunk > 0 else {
+                return false
+            }
+
+            let data = try? handle.read(upToCount: chunk)
             guard let data, !data.isEmpty else {
                 return false
             }
 
             hasher.update(data: data)
+            if let current = remaining {
+                remaining = current - data.count
+            }
             return true
         }) {}
 

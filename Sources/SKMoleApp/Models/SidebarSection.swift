@@ -4,6 +4,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
     case dashboard
     case updates
     case homebrew
+    case github
+    case relay
     case fileIntelligence
     case network
     case processes
@@ -22,6 +24,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .dashboard: "Dashboard"
         case .updates: "Updates"
         case .homebrew: "Homebrew"
+        case .github: "GitHub"
+        case .relay: "Relay"
         case .fileIntelligence: "File Intelligence"
         case .network: "Network"
         case .processes: "Processes"
@@ -40,6 +44,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .dashboard: "gauge.with.dots.needle.50percent"
         case .updates: "arrow.triangle.2.circlepath.circle"
         case .homebrew: "cup.and.saucer.fill"
+        case .github: "chevron.left.forwardslash.chevron.right"
+        case .relay: "chevron.right.2"
         case .fileIntelligence: "doc.text.viewfinder"
         case .network: "network"
         case .processes: "list.bullet.rectangle.portrait"
@@ -58,6 +64,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .dashboard: "Real-time system health and fast actions"
         case .updates: "Check application, App Store, Homebrew, and GitHub updates"
         case .homebrew: "Manage Homebrew packages, casks, services, and maintenance"
+        case .github: "Install and sign in to GitHub CLI and browse your repositories"
+        case .relay: "Saved commands, workflows and the command palette"
         case .fileIntelligence: "Use Magika to classify files by content and scan folders recursively"
         case .network: "On-demand process, connection, and remote-host inspection"
         case .processes: "Inspect active processes and safely terminate user-owned work"
@@ -76,6 +84,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .dashboard: "1"
         case .updates: "u"
         case .homebrew: "2"
+        case .github: "g"
+        case .relay: "r"
         case .fileIntelligence: "f"
         case .network: "3"
         case .processes: "p"
@@ -97,6 +107,10 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
             self = .updates
         case "homebrew", "brew":
             self = .homebrew
+        case "github", "gh":
+            self = .github
+        case "relay", "palette":
+            self = .relay
         case "file-intelligence", "file-intel", "magika":
             self = .fileIntelligence
         case "network":

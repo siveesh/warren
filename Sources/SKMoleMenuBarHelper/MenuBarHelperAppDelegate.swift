@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import RelayAppSupport
 import SKMoleShared
 
 @MainActor
@@ -11,6 +12,7 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let popover = NSPopover()
     private let contentModel = MenuBarCompanionContentModel()
+    private let relay = RelayCompanionController()
     private let popoverWidth: CGFloat = 300
     private var cachedSettings = MenuBarCompanionSettings.default
     private var lastSettingsLoadDate = Date.distantPast
@@ -21,6 +23,7 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupStatusItem()
         setupPopover()
+        relay.start()
         cachedSettings = settingsStore.load()
         lastSettingsLoadDate = .now
         refreshSharedUpdateSummary(force: true)
@@ -39,7 +42,7 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
     private func setupStatusItem() {
         guard let button = statusItem.button else { return }
 
-        button.image = NSImage(systemSymbolName: "aqi.medium", accessibilityDescription: "SK Mole Companion")
+        button.image = NSImage(systemSymbolName: "aqi.medium", accessibilityDescription: "Warren Companion")
         button.imagePosition = .imageOnly
         button.title = ""
         button.target = self
@@ -57,6 +60,8 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
                 model: contentModel,
                 openMainApp: { [weak self] in self?.openMainApp() },
                 openUpdates: { [weak self] in self?.openUpdates() },
+                openPalette: { [weak self] in self?.openRelayPalette() },
+                runRelayCommand: { [weak self] command in self?.relay.run(command) },
                 quitCompanion: { [weak self] in self?.quitCompanion() }
             )
         )
@@ -71,6 +76,13 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
         guard let button = statusItem.button else {
             return
         }
+
+        Task {
+            await relay.environment.library.load()
+            contentModel.relayQuickRun = relay.favoriteCommands()
+            contentModel.relayCategories = relay.commandsByCategory()
+        }
+        contentModel.relayHotKey = relay.hotKeyDisplay
 
         if popover.isShown {
             popover.performClose(sender)
@@ -89,7 +101,7 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
 
     private func preferredPopoverHeight(anchor screen: NSScreen?) -> CGFloat {
         let visibleHeight = (screen ?? NSScreen.main)?.visibleFrame.height ?? 720
-        return max(390, min(500, visibleHeight - 80))
+        return max(430, min(540, visibleHeight - 80))
     }
 
     private func apply(snapshot: MenuBarSnapshot) {
@@ -137,15 +149,15 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
         guard let button = statusItem.button else { return }
 
         if !activeAlerts.isEmpty {
-            button.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "SK Mole alerts")
+            button.image = NSImage(systemSymbolName: "exclamationmark.circle.fill", accessibilityDescription: "Warren alerts")
             button.toolTip = activeAlerts.map(\.title).joined(separator: "\n")
             return
         }
 
         if let updateSnapshot, updateSnapshot.actionableCount > 0 {
-            button.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle.fill", accessibilityDescription: "SK Mole updates")
+            button.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath.circle.fill", accessibilityDescription: "Warren updates")
         } else {
-            button.image = NSImage(systemSymbolName: statusSymbol(for: settings.visibleStatusMetrics.first ?? .cpu), accessibilityDescription: "SK Mole Companion")
+            button.image = NSImage(systemSymbolName: statusSymbol(for: settings.visibleStatusMetrics.first ?? .cpu), accessibilityDescription: "Warren Companion")
         }
 
         let metrics = settings.visibleStatusMetrics.isEmpty ? [.cpu] : settings.visibleStatusMetrics
@@ -233,6 +245,12 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
         configuration.addsToRecentItems = false
 
         NSWorkspace.shared.openApplication(at: mainAppURL, configuration: configuration)
+    }
+
+    private func openRelayPalette() {
+        popover.performClose(nil)
+        sampler.setPopoverVisible(false)
+        relay.togglePalette()
     }
 
     @objc

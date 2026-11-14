@@ -138,6 +138,39 @@ actor GitHubCLIService {
         }
     }
 
+    /// Stores a personal access token in the macOS Keychain through `gh auth login --with-token`.
+    /// The token is passed on stdin only, never as an argument, and is never logged.
+    func storeToken(_ token: String) async -> OptimizationLog {
+        let title = "Update GitHub token"
+        do {
+            guard let executablePath = try await detectStatus().executablePath else {
+                return OptimizationLog(actionTitle: title, output: GitHubCLIError.notInstalled.localizedDescription, succeeded: false, timestamp: .now)
+            }
+
+            var environment = Self.processEnvironment(for: executablePath)
+            // An environment token would take precedence over, and block, the stored credential.
+            environment["GH_TOKEN"] = nil
+            environment["GITHUB_TOKEN"] = nil
+
+            let result = try await ProcessRunner.run(
+                executable: executablePath,
+                arguments: ["auth", "login", "--hostname", "github.com", "--with-token"],
+                environment: environment,
+                standardInput: Data((token + "\n").utf8),
+                timeout: 45
+            )
+            let succeeded = result.terminationStatus == 0
+            return OptimizationLog(
+                actionTitle: title,
+                output: succeeded ? "Token saved to the macOS Keychain." : result.output.replacingOccurrences(of: token, with: "•••"),
+                succeeded: succeeded,
+                timestamp: .now
+            )
+        } catch {
+            return OptimizationLog(actionTitle: title, output: error.localizedDescription, succeeded: false, timestamp: .now)
+        }
+    }
+
     private func runProcess(executable: String, arguments: [String]) async throws -> GitHubCLIProcessResult {
         let result = try await ProcessRunner.run(
             executable: executable,

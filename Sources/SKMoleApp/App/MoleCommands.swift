@@ -7,7 +7,7 @@ struct MoleCommands: Commands {
 
     var body: some Commands {
         CommandGroup(replacing: .appInfo) {
-            Button("About SK Mole") {
+            Button("About Warren") {
                 openWindow(id: "about-window")
                 NSApp.activate(ignoringOtherApps: true)
             }
@@ -42,6 +42,10 @@ struct MoleCommands: Commands {
 
             Button("Open Homebrew") {
                 open(.homebrew)
+            }
+
+            Button("Open GitHub") {
+                open(.github)
             }
 
             Button("Open Updates") {

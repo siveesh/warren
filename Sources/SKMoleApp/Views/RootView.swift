@@ -39,6 +39,24 @@ struct RootView: View {
         .onOpenURL { url in
             Task { await model.handleIncomingURL(url) }
         }
+        .confirmationDialog(
+            "Confirm cleanup",
+            isPresented: Binding(
+                get: { model.pendingCleanupDeletion != nil },
+                set: { if !$0 { model.cancelPendingCleanupDeletion() } }
+            ),
+            titleVisibility: .visible,
+            presenting: model.pendingCleanupDeletion
+        ) { pending in
+            Button(pending.permanentCount > 0 ? "Clean Up" : "Move to Trash", role: .destructive) {
+                Task { await model.confirmPendingCleanupDeletion() }
+            }
+            Button("Cancel", role: .cancel) {
+                model.cancelPendingCleanupDeletion()
+            }
+        } message: { pending in
+            Text(pending.message)
+        }
     }
 
     private var sidebar: some View {
@@ -66,7 +84,7 @@ struct RootView: View {
                     Image(systemName: "aqi.medium")
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(AppPalette.accent)
-                    Text("SK Mole")
+                    Text("Warren")
                         .font(.title3.weight(.bold))
                 }
                 Text("Maintenance with guard rails, previews, and native performance.")
@@ -90,6 +108,10 @@ struct RootView: View {
             UpdatesView(model: model)
         case .homebrew:
             HomebrewView(model: model)
+        case .github:
+            GitHubView(model: model)
+        case .relay:
+            RelayView(model: model)
         case .fileIntelligence:
             FileIntelligenceView(model: model)
         case .network:

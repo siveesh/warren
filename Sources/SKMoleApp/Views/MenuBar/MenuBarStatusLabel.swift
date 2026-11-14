@@ -16,6 +16,6 @@ struct MenuBarStatusLabel: View {
             Text("\(Int((monitor.metrics.cpuUsage * 100).rounded()))%")
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
         }
-        .accessibilityLabel("SK Mole CPU \(Int((monitor.metrics.cpuUsage * 100).rounded())) percent")
+        .accessibilityLabel("Warren CPU \(Int((monitor.metrics.cpuUsage * 100).rounded())) percent")
     }
 }

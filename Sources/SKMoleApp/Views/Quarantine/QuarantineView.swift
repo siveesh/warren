@@ -71,7 +71,7 @@ struct QuarantineView: View {
                     .disabled(selectedApps.isEmpty || model.quarantineBusyActionID != nil)
                 }
 
-                Text("SK Mole only removes the `com.apple.quarantine` attribute. It does not repair missing signatures, notarization, or other Gatekeeper trust issues.")
+                Text("Warren only removes the `com.apple.quarantine` attribute. It does not repair missing signatures, notarization, or other Gatekeeper trust issues.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -83,13 +83,20 @@ struct QuarantineView: View {
                     Text(quarantineError)
                         .font(.subheadline)
                         .foregroundStyle(AppPalette.rose)
+
+                    if model.quarantineNeedsAppManagement {
+                        Button("Open App Management Settings") {
+                            model.openAppManagementSettings()
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 }
 
                 if model.filteredQuarantinedApplications.isEmpty {
                     ContentUnavailableView(
                         "No Quarantined Apps Found",
                         systemImage: "checkmark.shield",
-                        description: Text("SK Mole did not find any app bundles in the reviewed locations that still carry `com.apple.quarantine`.")
+                        description: Text("Warren did not find any app bundles in the reviewed locations that still carry `com.apple.quarantine`.")
                     )
                     .frame(minHeight: 360)
                 } else {
@@ -242,7 +249,7 @@ struct QuarantineView: View {
             Text("Multiple apps selected")
                 .font(.system(size: 28, weight: .bold, design: .rounded))
 
-            Text("SK Mole will run `xattr -d com.apple.quarantine` on each selected app bundle one by one.")
+            Text("Warren will run `xattr -d com.apple.quarantine` on each selected app bundle one by one.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 

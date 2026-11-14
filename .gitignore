@@ -2,7 +2,8 @@
 .build/
 dist/
 .swiftpm/
-Packages/
+Packages/*/.build/
+Packages/*/.swiftpm/
 xcuserdata/
 DerivedData/
 *.dSYM/

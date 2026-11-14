@@ -147,7 +147,7 @@ struct StorageView: View {
             HStack(alignment: .top, spacing: 22) {
                 SectionCard(
                     title: "Usage map",
-                    subtitle: "A focused view of the heaviest user-facing categories SK Mole tracks.",
+                    subtitle: "A focused view of the heaviest user-facing categories Warren tracks.",
                     symbol: "chart.pie.fill"
                 ) {
                     StorageDonutChart(sections: report.sections)
@@ -338,7 +338,7 @@ struct StorageView: View {
             Label("Manual scan required", systemImage: "externaldrive.badge.questionmark")
                 .font(.headline)
 
-            Text("SK Mole lists \(volume.name) immediately, but it does not read its folder tree until you explicitly run a storage scan with this volume selected.")
+            Text("Warren lists \(volume.name) immediately, but it does not read its folder tree until you explicitly run a storage scan with this volume selected.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 

@@ -76,7 +76,7 @@ private struct WelcomeStep: View {
             Spacer(minLength: 0)
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("Welcome to SK Mole")
+                Text("Welcome to Warren")
                     .font(.system(size: 36, weight: .bold, design: .rounded))
                 Text("A safety-first Mac toolkit that cleans, uninstalls, inspects storage, watches system health, and gives you clearer control over maintenance work.")
                     .font(.title3)
@@ -104,7 +104,7 @@ private struct AccessStep: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Permission Center")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
-                Text("SK Mole works without forcing broad access, but giving it a few approvals up front makes deeper scans smoother and easier to explain.")
+                Text("Warren works without forcing broad access, but giving it a few approvals up front makes deeper scans smoother and easier to explain.")
                     .font(.title3)
                     .foregroundStyle(.secondary)
             }
@@ -165,7 +165,7 @@ private struct FinishStep: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Shape the Daily Flow")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
-                Text("A few defaults make SK Mole feel much more native once the first-run setup is out of the way.")
+                Text("A few defaults make Warren feel much more native once the first-run setup is out of the way.")
                     .font(.title3)
                     .foregroundStyle(.secondary)
             }

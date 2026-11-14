@@ -190,7 +190,7 @@ struct UninstallView: View {
                                     }
                                 }
                             } else {
-                                Text("This app is already in Trash, so SK Mole will only review and remove leftovers that still live outside Trash.")
+                                Text("This app is already in Trash, so Warren will only review and remove leftovers that still live outside Trash.")
                                     .font(.subheadline)
                                     .foregroundStyle(.secondary)
                             }
@@ -323,7 +323,7 @@ struct UninstallView: View {
                 Spacer()
             }
 
-            Text("This mirrors the fast AppCleaner-style workflow, Finder can send `.app` bundles here through `Open With SK Mole`, and apps already in Trash show up separately for SmartDelete review.")
+            Text("This mirrors the fast AppCleaner-style workflow, Finder can send `.app` bundles here through `Open With Warren`, and apps already in Trash show up separately for SmartDelete review.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

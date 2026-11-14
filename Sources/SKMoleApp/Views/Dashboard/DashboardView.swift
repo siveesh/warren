@@ -288,7 +288,7 @@ struct DashboardView: View {
 
             DashboardPanel(
                 title: "Cleanup Outlook",
-                subtitle: "What SK Mole can reclaim from safe cache, download, and leftover targets right now.",
+                subtitle: "What Warren can reclaim from safe cache, download, and leftover targets right now.",
                 symbol: "trash.slash"
             ) {
                 VStack(alignment: .leading, spacing: 8) {
@@ -344,14 +344,14 @@ struct DashboardView: View {
 
             DashboardPanel(
                 title: "Process Inspector",
-                subtitle: "Review active work by CPU or memory, then safely terminate only user-owned processes that SK Mole allows.",
+                subtitle: "Review active work by CPU or memory, then safely terminate only user-owned processes that Warren allows.",
                 symbol: "list.bullet.rectangle.portrait"
             ) {
                 VStack(alignment: .leading, spacing: 8) {
                     statHeader("Snapshot", "\(model.processInspectorItems.count)", AppPalette.accent)
                     Text(model.processInspectorItems.isEmpty
                         ? "No process snapshot yet."
-                        : "\(model.processInspectorItems.filter(SystemGuard.canTerminateSnapshot).count) processes are safe to terminate from SK Mole.")
+                        : "\(model.processInspectorItems.filter(SystemGuard.canTerminateSnapshot).count) processes are safe to terminate from Warren.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -396,7 +396,7 @@ struct DashboardView: View {
                     monitoringFact(
                         title: "Automatic",
                         value: "\(model.activeAvailableUpdateItems.filter(\.canAutoInstall).count)",
-                        detail: "installable from SK Mole",
+                        detail: "installable from Warren",
                         tint: AppPalette.accent
                     )
 

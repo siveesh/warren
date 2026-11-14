@@ -13,7 +13,7 @@ struct SmartCareView: View {
                 if model.recommendedActions.isEmpty {
                     SectionCard(
                         title: "No urgent recommendations",
-                        subtitle: "SK Mole has enough recent scan data to say the Mac looks steady right now.",
+                        subtitle: "Warren has enough recent scan data to say the Mac looks steady right now.",
                         symbol: "checkmark.circle"
                     ) {
                         Text("Run the individual sections anytime if you want a fresh cleanup, uninstall, or storage pass.")

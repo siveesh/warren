@@ -156,7 +156,7 @@ final class MaintenanceExportRegistry {
 
     private func markdown(from context: MaintenanceExportContext) -> String {
         var lines: [String] = [
-            "# SK Mole Overview",
+            "# Warren Overview",
             "",
             "- Generated: \(ISO8601DateFormatter().string(from: context.maintenanceReport.createdAt))",
             "- Smart Care score: \(context.maintenanceReport.score)",
@@ -206,7 +206,7 @@ final class MaintenanceExportRegistry {
 
     private func textOverview(from context: MaintenanceExportContext) -> String {
         [
-            "SK Mole Overview",
+            "Warren Overview",
             "",
             "Smart Care score: \(context.maintenanceReport.score)",
             "Full Disk Access: \(context.maintenanceReport.fullDiskAccessStatus)",

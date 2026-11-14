@@ -68,6 +68,8 @@ actor QuarantineAuditService {
         return sorted(apps)
     }
 
+    static let appManagementMessage = "macOS blocked Warren from changing this app. Turn on Warren in System Settings > Privacy & Security > App Management, then run xattr again."
+
     func removeQuarantine(from apps: [QuarantinedApplication]) async -> [OptimizationLog] {
         var logs: [OptimizationLog] = []
 
@@ -168,6 +170,16 @@ actor QuarantineAuditService {
 
         if result == 0 || errno == ENOATTR {
             return
+        }
+
+        // macOS protects other developers' app bundles; without the App Management permission
+        // the kernel answers EPERM even for apps the user owns.
+        if errno == EPERM || errno == EACCES {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: Self.appManagementMessage]
+            )
         }
 
         throw NSError(

@@ -191,7 +191,7 @@ struct NetworkInspectorView: View {
                 ContentUnavailableView(
                     "No Network Snapshot",
                     systemImage: "network.slash",
-                    description: Text("SK Mole only collects this data when you open the section or ask for a refresh.")
+                    description: Text("Warren only collects this data when you open the section or ask for a refresh.")
                 )
                 .frame(maxWidth: .infinity)
             }

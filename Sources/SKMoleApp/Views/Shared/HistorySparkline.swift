@@ -33,7 +33,7 @@ struct HistorySparkline: View {
                             .position(last)
                     }
                 } else {
-                    Text("History builds up as SK Mole samples your Mac.")
+                    Text("History builds up as Warren samples your Mac.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)

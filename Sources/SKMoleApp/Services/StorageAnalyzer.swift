@@ -545,7 +545,7 @@ actor StorageAnalyzer {
                 id: "system-caches",
                 title: "System caches",
                 subtitle: "Shared caches outside the user Library",
-                detail: "These are not deleted by SK Mole, but they help explain system-heavy disk usage.",
+                detail: "These are not deleted by Warren, but they help explain system-heavy disk usage.",
                 icon: "externaldrive.badge.timemachine",
                 url: URL(fileURLWithPath: "/Library/Caches"),
                 requiresAdminContext: true

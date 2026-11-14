@@ -136,7 +136,7 @@ actor AppInventoryService {
             throw NSError(
                 domain: "SKMole.Uninstall",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Protected apps cannot be removed from SK Mole."]
+                userInfo: [NSLocalizedDescriptionKey: "Protected apps cannot be removed from Warren."]
             )
         }
 

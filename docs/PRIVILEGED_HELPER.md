@@ -1,6 +1,6 @@
 # Privileged Helper Design
 
-SK Mole keeps its main app process unprivileged. Admin-only work is isolated into a separate launch daemon helper that exposes a very small XPC allow-list.
+Warren keeps its main app process unprivileged. Admin-only work is isolated into a separate launch daemon helper that exposes a very small XPC allow-list.
 
 ## Why this exists
 
@@ -20,7 +20,7 @@ SK Mole keeps its main app process unprivileged. Admin-only work is isolated int
 
 These are intentionally conservative. The helper does not accept arbitrary commands, paths, shell fragments, or file deletion requests.
 
-The helper now also validates XPC clients before accepting a connection. Developer ID builds require the calling app to share the helper's TeamIdentifier; local ad-hoc builds still require the expected SK Mole signing identifier so unrelated tools cannot accidentally reach the daemon.
+The helper now also validates XPC clients before accepting a connection. Developer ID builds require the calling app to share the helper's TeamIdentifier; local ad-hoc builds still require the expected Warren signing identifier so unrelated tools cannot accidentally reach the daemon.
 
 ## Bundle layout
 

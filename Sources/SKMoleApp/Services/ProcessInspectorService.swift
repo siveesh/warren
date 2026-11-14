@@ -19,7 +19,7 @@ actor ProcessInspectorService {
             throw NSError(
                 domain: "SKMole.Processes",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "SK Mole only terminates your own non-system processes."]
+                userInfo: [NSLocalizedDescriptionKey: "Warren only terminates your own non-system processes."]
             )
         }
 
@@ -27,7 +27,7 @@ actor ProcessInspectorService {
             return ProcessTerminationResult(
                 pid: process.pid,
                 processName: process.name,
-                detail: "\(process.name) already exited before SK Mole sent a signal.",
+                detail: "\(process.name) already exited before Warren sent a signal.",
                 succeeded: false
             )
         }
@@ -37,7 +37,7 @@ actor ProcessInspectorService {
             throw NSError(
                 domain: "SKMole.Processes",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "SK Mole stopped because that PID now belongs to a different or protected process."]
+                userInfo: [NSLocalizedDescriptionKey: "Warren stopped because that PID now belongs to a different or protected process."]
             )
         }
 

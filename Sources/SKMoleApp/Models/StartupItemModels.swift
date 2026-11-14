@@ -60,7 +60,7 @@ struct StartupItem: Identifiable, Hashable, Sendable {
 
     var stateDetail: String {
         if !canToggle {
-            return "This item lives outside the user domain, so SK Mole only surfaces it for review."
+            return "This item lives outside the user domain, so Warren only surfaces it for review."
         }
 
         if isDisabled {

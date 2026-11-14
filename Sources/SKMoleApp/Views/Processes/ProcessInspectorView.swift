@@ -23,7 +23,7 @@ struct ProcessInspectorView: View {
 
                 SectionCard(
                     title: "Active processes",
-                    subtitle: "An on-demand snapshot sorted by CPU, memory, or name. SK Mole only allows graceful termination for your own non-system processes.",
+                    subtitle: "An on-demand snapshot sorted by CPU, memory, or name. Warren only allows graceful termination for your own non-system processes.",
                     symbol: "list.bullet.rectangle.portrait"
                 ) {
                     VStack(alignment: .leading, spacing: 14) {
@@ -103,7 +103,7 @@ struct ProcessInspectorView: View {
             subtitle: "A MacOptimizer-style process surface built on native process sampling instead of shelling out. Use it to spot CPU hogs, RAM-heavy work, and background tasks that no longer need to run.",
             symbol: "waveform.path.ecg.rectangle"
         ) {
-            Text("SK Mole sends a normal terminate request only. It does not force-kill system processes, root-owned daemons, or its own helper apps from here.")
+            Text("Warren sends a normal terminate request only. It does not force-kill system processes, root-owned daemons, or its own helper apps from here.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }

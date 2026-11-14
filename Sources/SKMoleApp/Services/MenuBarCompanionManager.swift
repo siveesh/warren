@@ -22,7 +22,7 @@ final class MenuBarCompanionManager {
                 summary: isRunning ? "Running" : "Registered",
                 detail: isRunning
                     ? "The menu bar companion is running independently and is registered to relaunch at login."
-                    : "The menu bar companion is registered to relaunch at login. Open SK Mole once to start it in the current session if needed.",
+                    : "The menu bar companion is registered to relaunch at login. Open Warren once to start it in the current session if needed.",
                 isRunning: isRunning,
                 isRegistered: true,
                 requiresApproval: false

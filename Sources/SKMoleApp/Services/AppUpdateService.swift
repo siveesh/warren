@@ -60,7 +60,7 @@ actor AppUpdateService {
         await progress(
             ScanProgress(
                 title: "Update scan",
-                detail: "Checked SK Mole GitHub release",
+                detail: "Checked Warren GitHub release",
                 completedUnits: completedUnits,
                 totalUnits: totalUnits
             )
@@ -104,7 +104,7 @@ actor AppUpdateService {
             guard let executablePath = status.executablePath else {
                 return OptimizationLog(
                     actionTitle: actionTitle,
-                    output: "Install `mas` first to automate App Store updates from SK Mole.",
+                    output: "Install `mas` first to automate App Store updates from Warren.",
                     succeeded: false,
                     timestamp: .now
                 )
@@ -134,7 +134,7 @@ actor AppUpdateService {
             let (temporaryURL, response) = try await downloadLimitedFile(
                 for: request,
                 limit: 250 * 1_024 * 1_024,
-                source: "SK Mole GitHub release"
+                source: "Warren GitHub release"
             )
 
             let suggestedName = response.suggestedFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -153,8 +153,8 @@ actor AppUpdateService {
 
             return (
                 OptimizationLog(
-                    actionTitle: "Download SK Mole Update",
-                    output: "Downloaded SK Mole \(version) to \(destination.path). The disk image was opened so you can drag the new app into Applications.",
+                    actionTitle: "Download Warren Update",
+                    output: "Downloaded Warren \(version) to \(destination.path). The disk image was opened so you can drag the new app into Applications.",
                     succeeded: true,
                     timestamp: .now
                 ),
@@ -163,7 +163,7 @@ actor AppUpdateService {
         } catch {
             return (
                 OptimizationLog(
-                    actionTitle: "Download SK Mole Update",
+                    actionTitle: "Download Warren Update",
                     output: error.localizedDescription,
                     succeeded: false,
                     timestamp: .now
@@ -355,7 +355,7 @@ actor AppUpdateService {
                 latestVersion: nil,
                 sourceKind: .vendor,
                 status: .manualCheck,
-                detail: "No structured appcast or GitHub release source was detected, so SK Mole can only open the vendor site for a manual check.",
+                detail: "No structured appcast or GitHub release source was detected, so Warren can only open the vendor site for a manual check.",
                 sourceDescription: homepageURL.host ?? "Vendor site",
                 appURL: app.url,
                 homepageURL: homepageURL,
@@ -385,7 +385,7 @@ actor AppUpdateService {
             latestVersion: nil,
             sourceKind: .unknown,
             status: .unsupported,
-            detail: "SK Mole could not find App Store metadata, a Sparkle feed, a GitHub repository, or a vendor site inside this bundle.",
+            detail: "Warren could not find App Store metadata, a Sparkle feed, a GitHub repository, or a vendor site inside this bundle.",
             sourceDescription: "No structured source",
             appURL: app.url,
             homepageURL: nil,
@@ -423,7 +423,7 @@ actor AppUpdateService {
                 latestVersion: nil,
                 sourceKind: .appStore,
                 status: .manualCheck,
-                detail: "An App Store receipt was found, but SK Mole could not recover the store identifier needed for a direct version lookup.",
+                detail: "An App Store receipt was found, but Warren could not recover the store identifier needed for a direct version lookup.",
                 sourceDescription: "Mac App Store",
                 appURL: app.url,
                 homepageURL: homepageURL,
@@ -450,17 +450,31 @@ actor AppUpdateService {
             let metadata = try await fetchAppStoreMetadata(adamID: adamID)
             let latestVersion = Self.normalizedVersion(metadata.version)
             let comparison = Self.compareVersions(installedVersion, latestVersion)
-            let isUpdateAvailable = comparison == .orderedAscending
+            let lookupSaysNewer = comparison == .orderedAscending
+            let requiresNewerMacOS = Self.requiresNewerMacOS(metadata.minimumOsVersion)
             let storeURL = URL(string: "macappstore://itunes.apple.com/app/id\(adamID)") ?? metadata.trackViewURL
 
+            // `mas outdated` is Apple's own answer for this account, region and macOS version, so it wins
+            // over the public lookup, which can run ahead of staged rollouts or demand a newer macOS.
+            let isUpdateAvailable: Bool
+            if let outdated = appStoreAutomation.outdatedAdamIDs {
+                isUpdateAvailable = outdated.contains(adamID)
+            } else {
+                isUpdateAvailable = lookupSaysNewer && !requiresNewerMacOS
+            }
+
             let detail: String
-            if isUpdateAvailable {
+            if !isUpdateAvailable, lookupSaysNewer {
+                detail = requiresNewerMacOS && appStoreAutomation.outdatedAdamIDs == nil
+                    ? "A newer version exists but needs a newer macOS than this Mac runs, so the App Store will not offer it."
+                    : "The public listing shows a newer version, but the App Store does not offer an update for this Mac or account yet."
+            } else if isUpdateAvailable {
                 if appStoreAutomation.canInstallUpdates {
                     detail = "A newer Mac App Store build is available and can be installed with `mas`."
                 } else if appStoreAutomation.isInstalled {
                     detail = "A newer Mac App Store build is available, but `mas` does not appear signed in on this Mac yet."
                 } else {
-                    detail = "A newer Mac App Store build is available. Install `mas` to let SK Mole automate these updates."
+                    detail = "A newer Mac App Store build is available. Install `mas` to let Warren automate these updates."
                 }
             } else {
                 detail = "The installed App Store version matches the latest version Apple currently reports."
@@ -504,7 +518,7 @@ actor AppUpdateService {
                 latestVersion: nil,
                 sourceKind: .appStore,
                 status: .manualCheck,
-                detail: "App Store lookup failed, so SK Mole is falling back to opening the store page directly. \(error.localizedDescription)",
+                detail: "App Store lookup failed, so Warren is falling back to opening the store page directly. \(error.localizedDescription)",
                 sourceDescription: "Mac App Store",
                 appURL: app.url,
                 homepageURL: homepageURL,
@@ -550,7 +564,7 @@ actor AppUpdateService {
             }
 
             let detail = isUpdateAvailable
-                ? "A newer version was found in the app's Sparkle feed. SK Mole can alert you here, but the vendor still controls the actual install flow."
+                ? "A newer version was found in the app's Sparkle feed. Warren can alert you here, but the vendor still controls the actual install flow."
                 : "The installed version matches the newest version exposed by the app's Sparkle feed."
 
             return AppUpdateItem(
@@ -600,9 +614,9 @@ actor AppUpdateService {
 
             let detail: String
             if isUpdateAvailable {
-                detail = "A newer GitHub release was found for this app. SK Mole can open the release page or download source, but installation still depends on the vendor's distribution format."
+                detail = "A newer GitHub release was found for this app. Warren can open the release page or download source, but installation still depends on the vendor's distribution format."
             } else {
-                detail = "The installed version matches the latest GitHub release SK Mole could find."
+                detail = "The installed version matches the latest GitHub release Warren could find."
             }
 
             return AppUpdateItem(
@@ -652,17 +666,17 @@ actor AppUpdateService {
 
             let detail: String
             if isUpdateAvailable, installerAsset?.downloadURL != nil {
-                detail = "A newer SK Mole GitHub release is available. SK Mole can download the release DMG, open it, and guide you through replacing the app in Applications."
+                detail = "A newer Warren GitHub release is available. Warren can download the release DMG, open it, and guide you through replacing the app in Applications."
             } else if isUpdateAvailable {
-                detail = "A newer SK Mole GitHub release is available, but no DMG asset was found. Open the release page to download it manually."
+                detail = "A newer Warren GitHub release is available, but no DMG asset was found. Open the release page to download it manually."
             } else {
-                detail = "This SK Mole build matches the latest GitHub release."
+                detail = "This Warren build matches the latest GitHub release."
             }
 
             return AppUpdateItem(
                 id: Self.selfUpdateItemID,
                 kind: .application,
-                displayName: "SK Mole",
+                displayName: "Warren",
                 bundleIdentifier: Self.selfBundleIdentifier,
                 installedVersion: installedVersion,
                 latestVersion: latestVersion,
@@ -678,7 +692,7 @@ actor AppUpdateService {
                 secondaryURLTitle: "Release Notes",
                 homebrewReference: nil,
                 appStoreAdamID: nil,
-                commandPreview: installerAsset?.downloadURL == nil ? nil : "Auto-checks GitHub Releases and downloads the latest SK Mole DMG.",
+                commandPreview: installerAsset?.downloadURL == nil ? nil : "Auto-checks GitHub Releases and downloads the latest Warren DMG.",
                 canAutoInstall: isUpdateAvailable && installerAsset?.downloadURL != nil,
                 releaseNotesSummary: sanitizedReleaseNotes(release.body),
                 releaseNotesURL: release.htmlURL ?? repositoryURL,
@@ -691,13 +705,13 @@ actor AppUpdateService {
             return AppUpdateItem(
                 id: Self.selfUpdateItemID,
                 kind: .application,
-                displayName: "SK Mole",
+                displayName: "Warren",
                 bundleIdentifier: Self.selfBundleIdentifier,
                 installedVersion: installedVersion,
                 latestVersion: nil,
                 sourceKind: .github,
                 status: .error,
-                detail: "SK Mole could not check its own GitHub release feed. \(error.localizedDescription)",
+                detail: "Warren could not check its own GitHub release feed. \(error.localizedDescription)",
                 sourceDescription: "GitHub Releases",
                 appURL: appURL,
                 homepageURL: try? Self.selfRepositoryURL(),
@@ -790,6 +804,16 @@ actor AppUpdateService {
         return nil
     }
 
+    private static func requiresNewerMacOS(_ minimumOsVersion: String?) -> Bool {
+        guard let minimumOsVersion, !minimumOsVersion.isEmpty else {
+            return false
+        }
+
+        let current = ProcessInfo.processInfo.operatingSystemVersion
+        let installed = "\(current.majorVersion).\(current.minorVersion).\(current.patchVersion)"
+        return installed.compare(minimumOsVersion, options: .numeric) == .orderedAscending
+    }
+
     private func fetchAppStoreMetadata(adamID: Int) async throws -> AppStoreLookupResult {
         let primaryRegion = Locale.current.region?.identifier.lowercased() ?? "us"
         let fallbackRegions = Array(NSOrderedSet(array: [primaryRegion, "us"])).compactMap { $0 as? String }
@@ -846,7 +870,7 @@ actor AppUpdateService {
         }
         var request = try makeRequest(url: apiURL)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.setValue("SK Mole", forHTTPHeaderField: "User-Agent")
+        request.setValue("Warren", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await fetchLimitedData(
             for: request,
@@ -869,7 +893,7 @@ actor AppUpdateService {
         let (bytes, response) = try await session.bytes(for: request)
 
         if response.expectedContentLength > Int64(limit) {
-            throw AppUpdateError.lookupFailed("\(source) advertised \(ByteCountFormatter.string(fromByteCount: response.expectedContentLength, countStyle: .file)), which is larger than SK Mole's safety limit.")
+            throw AppUpdateError.lookupFailed("\(source) advertised \(ByteCountFormatter.string(fromByteCount: response.expectedContentLength, countStyle: .file)), which is larger than Warren's safety limit.")
         }
 
         var data = Data()
@@ -878,7 +902,7 @@ actor AppUpdateService {
         for try await byte in bytes {
             data.append(byte)
             if data.count > limit {
-                throw AppUpdateError.lookupFailed("\(source) exceeded \(ByteCountFormatter.string(fromByteCount: Int64(limit), countStyle: .file)), so SK Mole stopped reading it.")
+                throw AppUpdateError.lookupFailed("\(source) exceeded \(ByteCountFormatter.string(fromByteCount: Int64(limit), countStyle: .file)), so Warren stopped reading it.")
             }
         }
 
@@ -894,13 +918,13 @@ actor AppUpdateService {
 
         if response.expectedContentLength > limit {
             try? fileManager.removeItem(at: temporaryURL)
-            throw AppUpdateError.lookupFailed("\(source) advertised \(ByteCountFormatter.string(fromByteCount: response.expectedContentLength, countStyle: .file)), which is larger than SK Mole's safety limit.")
+            throw AppUpdateError.lookupFailed("\(source) advertised \(ByteCountFormatter.string(fromByteCount: response.expectedContentLength, countStyle: .file)), which is larger than Warren's safety limit.")
         }
 
         let fileSize = (try? temporaryURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         if Int64(fileSize) > limit {
             try? fileManager.removeItem(at: temporaryURL)
-            throw AppUpdateError.lookupFailed("\(source) exceeded \(ByteCountFormatter.string(fromByteCount: limit, countStyle: .file)), so SK Mole deleted the partial download.")
+            throw AppUpdateError.lookupFailed("\(source) exceeded \(ByteCountFormatter.string(fromByteCount: limit, countStyle: .file)), so Warren deleted the partial download.")
         }
 
         return (temporaryURL, response)
@@ -935,13 +959,27 @@ actor AppUpdateService {
             accountDetail = accessProbe.detail
         }
 
+        var outdatedAdamIDs: Set<Int>?
+        if canAccessAppStore, let outdated = try? await runProcess(executable: path, arguments: ["outdated"]),
+           outdated.terminationStatus == 0 {
+            outdatedAdamIDs = Self.parseOutdatedAdamIDs(outdated.output)
+        }
+
         return AppStoreAutomationStatus(
             executablePath: path,
             version: version,
             accountName: accountName,
             accountDetail: accountDetail,
-            canAccessAppStore: canAccessAppStore
+            canAccessAppStore: canAccessAppStore,
+            outdatedAdamIDs: outdatedAdamIDs
         )
+    }
+
+    /// Reads the leading App Store ID of each `mas outdated` line, for example `497799835 Xcode (15.0 -> 16.0)`.
+    static func parseOutdatedAdamIDs(_ output: String) -> Set<Int> {
+        Set(output.split(whereSeparator: \.isNewline).compactMap { line in
+            line.split(separator: " ", maxSplits: 1).first.flatMap { Int($0) }
+        })
     }
 
     private func detectMasAppStoreAccess(
@@ -1023,7 +1061,7 @@ actor AppUpdateService {
     }
 
     private func sanitizedInstallerFileName(_ suggestedName: String?, version: String) -> String {
-        let fallback = "SK-Mole-\(version).dmg"
+        let fallback = "Warren-\(version).dmg"
         let candidate: String
         if let suggestedName, !suggestedName.isEmpty {
             candidate = suggestedName
@@ -1107,9 +1145,9 @@ private enum AppUpdateError: LocalizedError {
         case .lookupFailed(let message):
             return message
         case .malformedURL:
-            return "SK Mole could not construct the update lookup URL."
+            return "Warren could not construct the update lookup URL."
         case .insecureURL(let value):
-            return "SK Mole blocked an insecure update source: \(value)"
+            return "Warren blocked an insecure update source: \(value)"
         }
     }
 }
@@ -1124,6 +1162,7 @@ private struct AppStoreLookupResult: Decodable {
     let artistViewUrl: String?
     let releaseNotes: String?
     let currentVersionReleaseDateRaw: String?
+    let minimumOsVersion: String?
 
     var trackViewURL: URL? {
         guard let trackViewUrl else { return nil }
@@ -1146,6 +1185,7 @@ private struct AppStoreLookupResult: Decodable {
         case artistViewUrl
         case releaseNotes
         case currentVersionReleaseDateRaw = "currentVersionReleaseDate"
+        case minimumOsVersion
     }
 }
 

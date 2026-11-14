@@ -17,7 +17,7 @@ struct AboutView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
 
             VStack(spacing: 8) {
-                Text("SK Mole")
+                Text("Warren")
                     .font(.system(size: 30, weight: .bold, design: .rounded))
 
                 Text("Native macOS maintenance, cleanup, uninstall, storage insight, and live system monitoring.")

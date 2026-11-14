@@ -23,7 +23,6 @@ struct HomebrewView: View {
 
                 discoverySection
                 servicesSection
-                developerSection
                 logSection
             }
             .padding(28)
@@ -172,7 +171,7 @@ struct HomebrewView: View {
         ) {
             VStack(alignment: .leading, spacing: 14) {
                 if model.homebrewDoctorLastOutput == nil {
-                    Text("Run Homebrew Doctor from the maintenance section above and SK Mole will surface any unexpected dylibs or other actionable follow-up here.")
+                    Text("Run Homebrew Doctor from the maintenance section above and Warren will surface any unexpected dylibs or other actionable follow-up here.")
                         .foregroundStyle(.secondary)
                 } else if model.homebrewDoctorIssues.isEmpty {
                     Text("The latest doctor run did not expose any unexpected dylibs with a safe in-app delete action.")
@@ -213,7 +212,7 @@ struct HomebrewView: View {
                     ContentUnavailableView(
                         "Install Homebrew First",
                         systemImage: "cup.and.saucer",
-                        description: Text("Once Homebrew is installed, SK Mole will list your installed formulae and casks here.")
+                        description: Text("Once Homebrew is installed, Warren will list your installed formulae and casks here.")
                     )
                     .frame(minHeight: 320)
                 } else if model.filteredHomebrewPackages.isEmpty {
@@ -444,123 +443,10 @@ struct HomebrewView: View {
         }
     }
 
-    private var developerSection: some View {
-        SectionCard(
-            title: "GitHub CLI For Developers",
-            subtitle: "Install `gh`, authenticate through your browser, verify the signed-in account, open token pages, and browse repositories owned by that account.",
-            symbol: "chevron.left.forwardslash.chevron.right"
-        ) {
-            VStack(alignment: .leading, spacing: 18) {
-                HStack(alignment: .top, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(model.gitHubCLIStatus.summary)
-                            .font(.system(size: 26, weight: .bold, design: .rounded))
-
-                        Text(model.gitHubCLIStatus.detail)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-
-                        if let executablePath = model.gitHubCLIStatus.executablePath {
-                            Text(executablePath)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    Spacer()
-
-                    VStack(alignment: .leading, spacing: 12) {
-                        metricRow(title: "CLI", value: model.gitHubCLIStatus.version ?? "Not installed")
-                        metricRow(title: "Signed In", value: model.gitHubCLIStatus.userLogin ?? "No")
-                        metricRow(title: "Projects", value: "\(model.gitHubRepositories.count)")
-                    }
-                }
-
-                if let gitHubCLIError = model.gitHubCLIError {
-                    errorBanner(gitHubCLIError)
-                }
-
-                HStack(spacing: 12) {
-                    if model.gitHubCLIStatus.isInstalled {
-                        Button("Authenticate in Terminal") {
-                            model.launchGitHubCLILoginInTerminal()
-                        }
-                        .buttonStyle(.borderedProminent)
-
-                        Button("Refresh Status") {
-                            Task { await model.refreshGitHubCLI() }
-                        }
-                        .buttonStyle(.bordered)
-                        .disabled(model.gitHubCLIBusy)
-
-                        Button("Create Personal Access Token") {
-                            model.openGitHubPersonalAccessTokenPage()
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button("Token Docs") {
-                            model.openGitHubPersonalAccessTokenDocs()
-                        }
-                        .buttonStyle(.bordered)
-                    } else {
-                        Button("Install GitHub CLI") {
-                            Task { await model.installGitHubCLI() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!model.homebrewStatus.isInstalled || model.homebrewBusyActionID == "install:gh-cli")
-
-                        Button("Open GitHub CLI") {
-                            model.openGitHubCLIHomepage()
-                        }
-                        .buttonStyle(.bordered)
-
-                        Button("Authentication Guide") {
-                            model.openGitHubCLILoginGuide()
-                        }
-                        .buttonStyle(.bordered)
-                    }
-
-                    if model.gitHubCLIBusy || model.homebrewBusyActionID == "install:gh-cli" {
-                        ProgressView()
-                    }
-                }
-
-                if !model.homebrewStatus.isInstalled && !model.gitHubCLIStatus.isInstalled {
-                    Text("Install Homebrew first if you want SK Mole to install GitHub CLI for you.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                CommandSnippetCard(title: "Install GitHub CLI", command: GitHubCLIStatus.installCommand)
-                CommandSnippetCard(title: "Authenticate", command: GitHubCLIStatus.authCommand)
-
-                if let authStatusOutput = model.gitHubCLIStatus.authStatusOutput, !authStatusOutput.isEmpty {
-                    CommandSnippetCard(title: "Authentication status", command: authStatusOutput, copyLabel: "Copy Status")
-                }
-
-                if model.gitHubCLIStatus.isAuthenticated {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Repositories owned by the signed-in account")
-                            .font(.headline)
-
-                        if model.gitHubRepositories.isEmpty {
-                            Text("No repositories were returned for this account yet. Refresh the status after authentication completes in Terminal.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            ForEach(model.gitHubRepositories) { repository in
-                                repositoryRow(repository)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     private var logSection: some View {
         SectionCard(
             title: "Homebrew command log",
-            subtitle: "Output from package installs, updates, service commands, and maintenance tasks run from SK Mole.",
+            subtitle: "Output from package installs, updates, service commands, and maintenance tasks run from Warren.",
             symbol: "terminal"
         ) {
             if model.homebrewLogs.isEmpty {
@@ -834,47 +720,6 @@ struct HomebrewView: View {
         )
     }
 
-    private func repositoryRow(_ repository: GitHubRepositorySummary) -> some View {
-        HStack(alignment: .center, spacing: 14) {
-            VStack(alignment: .leading, spacing: 5) {
-                Text(repository.nameWithOwner)
-                    .font(.headline)
-
-                if let description = repository.description, !description.isEmpty {
-                    Text(description)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Text(repository.updatedSummary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            Pill(title: repository.visibility.capitalized, tint: repository.isPrivate ? AppPalette.rose : AppPalette.accent)
-
-            if repository.isFork {
-                Pill(title: "Fork", tint: AppPalette.sky)
-            }
-
-            if repository.isArchived {
-                Pill(title: "Archived", tint: AppPalette.amber)
-            }
-
-            Button("Open") {
-                model.openGitHubRepository(repository)
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(AppPalette.secondaryCard.opacity(0.72))
-        )
-    }
 
     private func infoTagSection(title: String, values: [String]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -938,37 +783,6 @@ struct HomebrewView: View {
     }
 }
 
-private struct CommandSnippetCard: View {
-    let title: String
-    let command: String
-    var copyLabel = "Copy"
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text(title)
-                    .font(.headline)
-                Text(command)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-
-            Spacer()
-
-            Button(copyLabel) {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(command, forType: .string)
-            }
-            .buttonStyle(.bordered)
-        }
-        .padding(14)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(AppPalette.secondaryCard.opacity(0.72))
-        )
-    }
-}
 
 private struct FlowTagList: View {
     let values: [String]

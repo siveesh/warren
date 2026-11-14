@@ -38,6 +38,7 @@ public enum ProcessRunner {
         executable: String,
         arguments: [String],
         environment: [String: String]? = nil,
+        standardInput: Data? = nil,
         timeout: TimeInterval = defaultTimeout,
         maxOutputBytes: Int = defaultOutputLimit
     ) async throws -> ProcessRunnerResult {
@@ -62,6 +63,10 @@ public enum ProcessRunner {
                     }
                     process.standardOutput = pipe
                     process.standardError = pipe
+                    let inputPipe = standardInput == nil ? nil : Pipe()
+                    if let inputPipe {
+                        process.standardInput = inputPipe
+                    }
 
                     state.setProcess(process)
 
@@ -82,6 +87,10 @@ public enum ProcessRunner {
 
                     do {
                         try process.run()
+                        if let inputPipe, let standardInput {
+                            inputPipe.fileHandleForWriting.write(standardInput)
+                            try? inputPipe.fileHandleForWriting.close()
+                        }
                     } catch {
                         pipe.fileHandleForReading.readabilityHandler = nil
                         state.fail(.launchFailed(executable: executable, message: error.localizedDescription))
@@ -147,7 +156,7 @@ private final class ProcessRunnerState: @unchecked Sendable {
         completion.continuation?.resume(
             returning: ProcessRunnerResult(
                 output: completion.didTruncateOutput
-                    ? text + "\n\n[Output truncated by SK Mole to protect memory usage.]"
+                    ? text + "\n\n[Output truncated by Warren to protect memory usage.]"
                     : text,
                 terminationStatus: status,
                 didTruncateOutput: completion.didTruncateOutput

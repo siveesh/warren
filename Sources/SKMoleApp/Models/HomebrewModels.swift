@@ -83,14 +83,14 @@ struct HomebrewStatus: Hashable {
 
     var detail: String {
         guard isInstalled else {
-            return "Install Homebrew once and SK Mole can manage formulae, casks, services, and maintenance with a native UI."
+            return "Install Homebrew once and Warren can manage formulae, casks, services, and maintenance with a native UI."
         }
 
         if let prefix {
             return "Packages are managed under \(prefix)."
         }
 
-        return "SK Mole can manage installed formulae, casks, and brew services on this Mac."
+        return "Warren can manage installed formulae, casks, and brew services on this Mac."
     }
 }
 

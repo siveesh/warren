@@ -6,7 +6,7 @@ struct SKMoleApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        Window("SK Mole", id: "main-window") {
+        Window("Warren", id: "main-window") {
             RootView(model: model)
                 .frame(minWidth: 1180, minHeight: 760)
         }
@@ -21,7 +21,7 @@ struct SKMoleApp: App {
             SettingsView(model: model)
         }
 
-        Window("About SK Mole", id: "about-window") {
+        Window("About Warren", id: "about-window") {
             AboutView()
         }
         .windowResizability(.contentSize)

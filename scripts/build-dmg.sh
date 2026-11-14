@@ -3,15 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
-APP_NAME="SK Mole.app"
+APP_NAME="Warren.app"
 APP_PATH="$DIST_DIR/$APP_NAME"
 README_SOURCE="$ROOT_DIR/README.md"
 INFO_PLIST="$ROOT_DIR/Resources/Bundling/Info.plist.template"
 ICON_PATH="$ROOT_DIR/Resources/AppIcon.icns"
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST")"
-DMG_NAME="SK-Mole-${VERSION}.dmg"
+DMG_NAME="Warren-${VERSION}.dmg"
 DMG_PATH="$DIST_DIR/$DMG_NAME"
-VOLUME_NAME="SK Mole ${VERSION}"
+VOLUME_NAME="Warren ${VERSION}"
 
 if [[ ! -d "$APP_PATH" ]]; then
     "$ROOT_DIR/scripts/build-app.sh"

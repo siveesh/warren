@@ -5,9 +5,9 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>SK Mole</string>
+    <string>Warren</string>
     <key>CFBundleExecutable</key>
-    <string>SK Mole</string>
+    <string>Warren</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
@@ -15,7 +15,7 @@
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>SK Mole</string>
+    <string>Warren</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleDocumentTypes</key>
@@ -56,6 +56,8 @@
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Warren reads your Finder selection when a Relay workflow uses $SelectedFinderFiles or $CurrentFinderFolder.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
 </dict>

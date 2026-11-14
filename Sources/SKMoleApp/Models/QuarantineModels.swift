@@ -28,7 +28,7 @@ enum QuarantineSignatureStatus: Hashable {
         case .invalid(let message):
             message ?? "The code signature exists, but macOS reported a validation problem."
         case .unknown(let message):
-            message ?? "SK Mole could not determine the signature state for this app."
+            message ?? "Warren could not determine the signature state for this app."
         }
     }
 

@@ -28,10 +28,10 @@ struct MagikaStatus: Hashable {
 
     var detail: String {
         guard isInstalled else {
-            return "Install Magika once and SK Mole can identify files by content, scan folders recursively, surface confidence fallbacks, and flag extension mismatches."
+            return "Install Magika once and Warren can identify files by content, scan folders recursively, surface confidence fallbacks, and flag extension mismatches."
         }
 
-        return "SK Mole can now use Magika's trusted output, raw model guess, MIME details, and recursive directory scans through a native file-intelligence workflow."
+        return "Warren can now use Magika's trusted output, raw model guess, MIME details, and recursive directory scans through a native file-intelligence workflow."
     }
 }
 

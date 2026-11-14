@@ -27,23 +27,13 @@ struct CleanupView: View {
                             clearSelection(in: category)
                         },
                         onTrashCandidate: { candidate in
-                            Task {
-                                await model.trash(candidate)
-                                selectedCandidateIDs.remove(candidate.id)
-                            }
+                            Task { await model.trash(candidate) }
                         },
                         onTrashSelected: {
-                            Task {
-                                let candidates = selectedCandidates(in: category)
-                                await model.trashCleanupCandidates(candidates)
-                                clearSelection(in: category)
-                            }
+                            Task { await model.trashCleanupCandidates(selectedCandidates(in: category)) }
                         },
                         onTrashCategory: {
-                            Task {
-                                await model.trash(category)
-                                clearSelection(in: category)
-                            }
+                            Task { await model.trash(category) }
                         }
                     )
                 }
@@ -58,7 +48,7 @@ struct CleanupView: View {
     private var header: some View {
         SectionCard(
             title: "Cleanup preview",
-            subtitle: "Nothing is deleted blindly. Each candidate is sized first, filtered through path guards, and then permanently removed when you confirm cleanup.",
+            subtitle: "Every candidate is sized first and filtered through path guards. How cleanup is confirmed and whether items go to the Trash depends on your safety profile.",
             symbol: "sparkles.rectangle.stack"
         ) {
             HStack(spacing: 14) {
@@ -70,6 +60,20 @@ struct CleanupView: View {
                 }
 
                 Spacer()
+
+                Picker("Safety profile", selection: Binding(
+                    get: { model.cleanupSafetyProfile },
+                    set: { newValue in
+                        model.cleanupSafetyProfile = newValue
+                        Task { await model.refreshCleanup() }
+                    }
+                )) {
+                    ForEach(CleanupSafetyProfile.allCases) { profile in
+                        Text(profile.title).tag(profile)
+                    }
+                }
+                .frame(maxWidth: 240)
+                .help(model.cleanupSafetyProfile.subtitle)
 
                 Button("Scan Again") {
                     Task { await model.refreshCleanup() }
@@ -165,6 +169,12 @@ private struct CleanupCategoryCard: View {
                     Text("No reclaimable items found in this section right now.")
                         .foregroundStyle(.secondary)
                 } else {
+                    if category.candidates.count > 8 {
+                        Text("Showing the 8 largest of \(category.candidates.count) items. Delete Category removes all \(category.candidates.count).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     ForEach(category.candidates.prefix(8)) { candidate in
                         CleanupCandidateRow(
                             candidate: candidate,

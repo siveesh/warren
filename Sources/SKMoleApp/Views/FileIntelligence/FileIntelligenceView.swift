@@ -32,7 +32,7 @@ struct FileIntelligenceView: View {
     private var header: some View {
         SectionCard(
             title: "File Intelligence",
-            subtitle: "A Magika-inspired file classification surface that focuses on content, not just extensions. SK Mole uses Magika's trusted output by default and still shows the raw model guess when confidence rules force a safer fallback.",
+            subtitle: "A Magika-inspired file classification surface that focuses on content, not just extensions. Warren uses Magika's trusted output by default and still shows the raw model guess when confidence rules force a safer fallback.",
             symbol: "doc.text.viewfinder"
         ) {
             VStack(alignment: .leading, spacing: 16) {
@@ -180,7 +180,7 @@ struct FileIntelligenceView: View {
     private var targetsSection: some View {
         SectionCard(
             title: "Targets",
-            subtitle: "Drop files or folders here, or pick them manually. SK Mole keeps the selection around so you can rerun Magika after changing the recursive setting.",
+            subtitle: "Drop files or folders here, or pick them manually. Warren keeps the selection around so you can rerun Magika after changing the recursive setting.",
             symbol: "tray.and.arrow.down"
         ) {
             VStack(alignment: .leading, spacing: 14) {
@@ -239,7 +239,7 @@ struct FileIntelligenceView: View {
     private func summarySection(_ report: MagikaScanReport) -> some View {
         SectionCard(
             title: "Scan Summary",
-            subtitle: "Magika classifies based on content. SK Mole highlights the places where the trusted output differs from the raw model guess, which is often where the scan is most useful.",
+            subtitle: "Magika classifies based on content. Warren highlights the places where the trusted output differs from the raw model guess, which is often where the scan is most useful.",
             symbol: "chart.bar.doc.horizontal"
         ) {
             VStack(alignment: .leading, spacing: 16) {
@@ -297,7 +297,7 @@ struct FileIntelligenceView: View {
                     ContentUnavailableView(
                         "Results Hidden by Filters",
                         systemImage: "line.3.horizontal.decrease.circle",
-                        description: Text("SK Mole found \(report.items.count) result\(report.items.count == 1 ? "" : "s"), but the current search or interesting-only filter is hiding them.")
+                        description: Text("Warren found \(report.items.count) result\(report.items.count == 1 ? "" : "s"), but the current search or interesting-only filter is hiding them.")
                     )
                     .frame(minHeight: 220)
 
@@ -337,7 +337,7 @@ struct FileIntelligenceView: View {
             ContentUnavailableView(
                 "Nothing Scanned Yet",
                 systemImage: "doc.text.viewfinder",
-                description: Text("SK Mole keeps Magika optional. Install it only if you want AI-backed file type detection.")
+                description: Text("Warren keeps Magika optional. Install it only if you want AI-backed file type detection.")
             )
             .frame(maxWidth: .infinity)
         }

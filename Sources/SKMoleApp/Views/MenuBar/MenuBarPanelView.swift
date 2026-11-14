@@ -36,7 +36,7 @@ struct MenuBarPanelView: View {
     private var header: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("SK Mole")
+                Text("Warren")
                     .font(.title3.weight(.bold))
                 Text("Live Mac status, quick scan context, and one-click navigation.")
                     .font(.caption)

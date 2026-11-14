@@ -9,7 +9,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 20) {
                 SectionCard(
                     title: "Startup",
-                    subtitle: "Keep SK Mole light on launch and decide what the first main window should focus on.",
+                    subtitle: "Keep Warren light on launch and decide what the first main window should focus on.",
                     symbol: "sparkles.tv"
                 ) {
                     VStack(alignment: .leading, spacing: 14) {
@@ -33,7 +33,7 @@ struct SettingsView: View {
                             )
                         )
 
-                        Text("With this off, SK Mole only loads a section the first time you visit it and then reuses the latest scan until you refresh it.")
+                        Text("With this off, Warren only loads a section the first time you visit it and then reuses the latest scan until you refresh it.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -77,7 +77,7 @@ struct SettingsView: View {
                         Text(
                             model.updateCheckInterval == .off
                                 ? "Automatic update checks are off. Manual scans still work exactly the same."
-                                : "SK Mole will refresh update metadata on its maintenance timer and keep the latest summary ready for the dashboard and companion."
+                                : "Warren will refresh update metadata on its maintenance timer and keep the latest summary ready for the dashboard and companion."
                         )
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -98,7 +98,7 @@ struct SettingsView: View {
 
                 SectionCard(
                     title: "Uninstall Depth",
-                    subtitle: "Choose how aggressively SK Mole should look for related app leftovers before it builds an uninstall preview.",
+                    subtitle: "Choose how aggressively Warren should look for related app leftovers before it builds an uninstall preview.",
                     symbol: "xmark.app"
                 ) {
                     VStack(alignment: .leading, spacing: 14) {
@@ -127,6 +127,37 @@ struct SettingsView: View {
                                         Text(level.title)
                                             .font(.headline)
                                         Text(level.subtitle)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                SectionCard(
+                    title: "Cleanup Safety",
+                    subtitle: "Choose how much confirmation and protection cleanup uses. System folders, Keychains, Mail, SSH keys and symbolic links are always protected.",
+                    symbol: "checkmark.shield"
+                ) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Picker("Safety profile", selection: $model.cleanupSafetyProfile) {
+                            ForEach(CleanupSafetyProfile.allCases) { profile in
+                                Text(profile.title).tag(profile)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(CleanupSafetyProfile.allCases) { profile in
+                                HStack(alignment: .top, spacing: 10) {
+                                    Image(systemName: profile == model.cleanupSafetyProfile ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(profile == model.cleanupSafetyProfile ? AppPalette.accent : .secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(profile.title)
+                                            .font(.headline)
+                                        Text(profile.subtitle)
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
                                     }
@@ -412,7 +443,7 @@ struct SettingsView: View {
 
                 SectionCard(
                     title: "Scheduled Maintenance",
-                    subtitle: "Run a lightweight scan-and-export cycle on a daily or weekly cadence while SK Mole is running, then save the report to Documents/SK Mole Reports.",
+                    subtitle: "Run a lightweight scan-and-export cycle on a daily or weekly cadence while Warren is running, then save the report to Documents/Warren Reports.",
                     symbol: "calendar.badge.clock"
                 ) {
                     VStack(alignment: .leading, spacing: 14) {
@@ -456,7 +487,7 @@ struct SettingsView: View {
                             }
                             .buttonStyle(.borderedProminent)
 
-                            Text("These exports are dry-run reports only. SK Mole does not schedule automatic deletion.")
+                            Text("These exports are dry-run reports only. Warren does not schedule automatic deletion.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -465,7 +496,7 @@ struct SettingsView: View {
 
                 SectionCard(
                     title: "Export Plugins",
-                    subtitle: "Exporters are loaded only when you use them, so SK Mole can stay richer without paying the startup cost every time.",
+                    subtitle: "Exporters are loaded only when you use them, so Warren can stay richer without paying the startup cost every time.",
                     symbol: "square.and.arrow.up.on.square"
                 ) {
                     ExportPluginGridView(plugins: model.availableExportPlugins) { pluginID in
@@ -475,14 +506,14 @@ struct SettingsView: View {
 
                 SectionCard(
                     title: "Monitoring Notes",
-                    subtitle: "Keep the menu bar useful without turning SK Mole into another heavy background tool, while giving Console enough signal to help with debugging.",
+                    subtitle: "Keep the menu bar useful without turning Warren into another heavy background tool, while giving Console enough signal to help with debugging.",
                     symbol: "waveform.path.ecg.rectangle"
                 ) {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Top-process sampling is throttled to every five seconds to keep overhead low while still showing who is driving CPU and memory spikes.")
                         Text("Process termination is limited to your own non-system processes and uses a normal terminate signal instead of a force kill.")
                         Text("Battery, power source, swap pressure, thermal state, and per-core activity use public macOS APIs. Fine-grained temperatures, fan RPM, and per-app network accounting still need lower-level or non-public data sources.")
-                        Text("Key navigation, scan, uninstall, process, and maintenance actions now write through unified logging categories so they are visible in Console under the SK Mole subsystem.")
+                        Text("Key navigation, scan, uninstall, process, and maintenance actions now write through unified logging categories so they are visible in Console under the Warren subsystem.")
                     }
                     .font(.subheadline)
                     .foregroundStyle(.secondary)

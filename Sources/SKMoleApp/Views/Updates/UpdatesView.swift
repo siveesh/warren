@@ -29,7 +29,7 @@ struct UpdatesView: View {
     private var header: some View {
         SectionCard(
             title: "Application updates",
-            subtitle: "Check App Store apps, third-party downloads, Homebrew installs, and GitHub-sourced releases from one place. SK Mole installs what it can automate and links out when the source still controls the update flow.",
+            subtitle: "Check App Store apps, third-party downloads, Homebrew installs, and GitHub-sourced releases from one place. Warren installs what it can automate and links out when the source still controls the update flow.",
             symbol: "arrow.triangle.2.circlepath.circle"
         ) {
             VStack(alignment: .leading, spacing: 16) {
@@ -116,7 +116,7 @@ struct UpdatesView: View {
     private var filterSection: some View {
         SectionCard(
             title: "Filters",
-            subtitle: "Focus on updates that need action now, automatic installs that SK Mole can run directly, or manual checks that still depend on a vendor or release page.",
+            subtitle: "Focus on updates that need action now, automatic installs that Warren can run directly, or manual checks that still depend on a vendor or release page.",
             symbol: "line.3.horizontal.decrease.circle"
         ) {
             HStack(spacing: 12) {
@@ -146,7 +146,7 @@ struct UpdatesView: View {
                 emptyState(
                     title: "No Available Updates",
                     systemImage: "checkmark.circle",
-                    description: "SK Mole did not find any newer versions inside the currently visible filter."
+                    description: "Warren did not find any newer versions inside the currently visible filter."
                 )
             } else {
                 VStack(alignment: .leading, spacing: 12) {
@@ -185,7 +185,7 @@ struct UpdatesView: View {
     private var deferredSection: some View {
         SectionCard(
             title: "Deferred Updates",
-            subtitle: "These updates are still known, but SK Mole is holding them out of the active queue until the defer window expires.",
+            subtitle: "These updates are still known, but Warren is holding them out of the active queue until the defer window expires.",
             symbol: "clock.badge.pause"
         ) {
             let items = model.filteredDeferredUpdateItems
@@ -233,7 +233,7 @@ struct UpdatesView: View {
     private var unsupportedSection: some View {
         SectionCard(
             title: "Untracked Apps",
-            subtitle: "These installed apps did not advertise a structured update source inside the bundle, so SK Mole cannot verify a latest version yet.",
+            subtitle: "These installed apps did not advertise a structured update source inside the bundle, so Warren cannot verify a latest version yet.",
             symbol: "questionmark.app"
         ) {
             let items = model.filteredUnsupportedUpdateItems
@@ -285,7 +285,7 @@ struct UpdatesView: View {
             symbol: "terminal"
         ) {
             if model.updateLogs.isEmpty {
-                Text("Run an install or update action from this tab and SK Mole will keep the output here for quick troubleshooting.")
+                Text("Run an install or update action from this tab and Warren will keep the output here for quick troubleshooting.")
                     .foregroundStyle(.secondary)
             } else {
                 VStack(alignment: .leading, spacing: 10) {
@@ -352,7 +352,7 @@ struct UpdatesView: View {
     private var selfUpdateCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
-                Label("SK Mole auto update", systemImage: "sparkles.rectangle.stack")
+                Label("Warren auto update", systemImage: "sparkles.rectangle.stack")
                     .font(.headline)
 
                 Spacer()
@@ -391,11 +391,11 @@ struct UpdatesView: View {
                     }
                 }
             } else {
-                Text("Run a scan and SK Mole will check its own GitHub Releases feed before checking other apps.")
+                Text("Run a scan and Warren will check its own GitHub Releases feed before checking other apps.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Button("Check SK Mole Release") {
+                Button("Check Warren Release") {
                     Task { await model.refreshUpdates() }
                 }
                 .buttonStyle(.bordered)
@@ -415,8 +415,8 @@ struct UpdatesView: View {
 
             Text(
                 model.updateCheckInterval == .off
-                    ? "Automatic update checks are off. Turn them on in Settings if you want SK Mole to keep a fresh update snapshot for the dashboard and menu bar companion."
-                    : "SK Mole is set to check for updates \(model.updateCheckInterval.title.lowercased()). The menu bar companion can surface the last known results without making the Mac noisier."
+                    ? "Automatic update checks are off. Turn them on in Settings if you want Warren to keep a fresh update snapshot for the dashboard and menu bar companion."
+                    : "Warren is set to check for updates \(model.updateCheckInterval.title.lowercased()). The menu bar companion can surface the last known results without making the Mac noisier."
             )
             .font(.subheadline)
             .foregroundStyle(.secondary)
@@ -451,7 +451,7 @@ struct UpdatesView: View {
             return "Scan applications and packages to compare installed versions against App Store metadata, Sparkle feeds, GitHub releases, and Homebrew inventory."
         }
 
-        return "Checked \(report.scannedApplicationCount) apps and \(report.scannedPackageCount) Homebrew packages. \(model.activeAvailableUpdateItems.filter(\.canAutoInstall).count) update\(model.activeAvailableUpdateItems.filter(\.canAutoInstall).count == 1 ? "" : "s") can be installed directly from SK Mole, while \(model.ignoredUpdateItems.count + model.deferredUpdateItems.count) item\(model.ignoredUpdateItems.count + model.deferredUpdateItems.count == 1 ? "" : "s") are currently muted."
+        return "Checked \(report.scannedApplicationCount) apps and \(report.scannedPackageCount) Homebrew packages. \(model.activeAvailableUpdateItems.filter(\.canAutoInstall).count) update\(model.activeAvailableUpdateItems.filter(\.canAutoInstall).count == 1 ? "" : "s") can be installed directly from Warren, while \(model.ignoredUpdateItems.count + model.deferredUpdateItems.count) item\(model.ignoredUpdateItems.count + model.deferredUpdateItems.count == 1 ? "" : "s") are currently muted."
     }
 
     private func metricRow(title: String, value: String) -> some View {

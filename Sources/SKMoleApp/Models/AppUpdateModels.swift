@@ -124,14 +124,19 @@ struct AppStoreAutomationStatus: Hashable {
     let accountName: String?
     let accountDetail: String?
     let canAccessAppStore: Bool
+    /// App Store IDs that `mas outdated` reports as having an update, or nil when `mas` could not answer.
+    /// This is Apple's own answer for this account, region and macOS version, so it overrides the public lookup.
+    let outdatedAdamIDs: Set<Int>?
 
     init(
         executablePath: String?,
         version: String?,
         accountName: String?,
         accountDetail: String?,
-        canAccessAppStore: Bool? = nil
+        canAccessAppStore: Bool? = nil,
+        outdatedAdamIDs: Set<Int>? = nil
     ) {
+        self.outdatedAdamIDs = outdatedAdamIDs
         self.executablePath = executablePath
         self.version = version
         self.accountName = accountName
@@ -188,7 +193,7 @@ struct AppStoreAutomationStatus: Hashable {
             return "Install automation is available once `mas` can access an App Store account on this Mac."
         }
 
-        return "Install `mas` to let SK Mole upgrade Mac App Store apps from the command line when an update is available."
+        return "Install `mas` to let Warren upgrade Mac App Store apps from the command line when an update is available."
     }
 }
 

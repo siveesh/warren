@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import RelayAppSupport
 import SKMoleShared
 import UniformTypeIdentifiers
 
@@ -13,6 +14,7 @@ final class AppModel: ObservableObject {
         static let showFullDiskAccessReminders = "skmole.showFullDiskAccessReminders"
         static let hasCompletedOnboarding = "skmole.hasCompletedOnboarding"
         static let uninstallSensitivity = "skmole.uninstallSensitivity"
+        static let cleanupSafetyProfile = "skmole.cleanupSafetyProfile"
         static let storageInspectionMode = "skmole.storageInspectionMode"
         static let storageFocusMode = "skmole.storageFocusMode"
         static let storageMinimumSize = "skmole.storageMinimumSize"
@@ -112,6 +114,14 @@ final class AppModel: ObservableObject {
     @Published var applications: [InstalledApp] = []
     @Published var trashedApplications: [InstalledApp] = []
     @Published var appSearch = ""
+    @Published var cleanupSafetyProfile: CleanupSafetyProfile = .balanced {
+        didSet {
+            UserDefaults.standard.set(cleanupSafetyProfile.rawValue, forKey: PreferenceKey.cleanupSafetyProfile)
+        }
+    }
+
+    @Published var pendingCleanupDeletion: PendingCleanupDeletion?
+
     @Published var uninstallSensitivity: UninstallSensitivityLevel = .enhanced {
         didSet {
             UserDefaults.standard.set(uninstallSensitivity.rawValue, forKey: PreferenceKey.uninstallSensitivity)
@@ -197,6 +207,7 @@ final class AppModel: ObservableObject {
     @Published var quarantinedApplications: [QuarantinedApplication] = []
     @Published var quarantineBusy = false
     @Published var quarantineError: String?
+    @Published var quarantineNeedsAppManagement = false
     @Published var quarantineProgress: ScanProgress?
     @Published var quarantineSearch = ""
     @Published var selectedQuarantinedApp: QuarantinedApplication?
@@ -268,6 +279,7 @@ final class AppModel: ObservableObject {
     }
 
     private let guardService = SystemGuard()
+    lazy var relayEnvironment = RelayEnvironment()
     private let sizer = DirectorySizer()
     private lazy var cleanupScanner = CleanupScanner(guardService: guardService, sizer: sizer)
     private lazy var storageAnalyzer = StorageAnalyzer(guardService: guardService, sizer: sizer)
@@ -689,6 +701,7 @@ final class AppModel: ObservableObject {
         self.showFullDiskAccessReminders = defaults.object(forKey: PreferenceKey.showFullDiskAccessReminders) as? Bool ?? true
         self.hasCompletedOnboarding = defaults.object(forKey: PreferenceKey.hasCompletedOnboarding) as? Bool ?? false
         self.showOnboarding = !self.hasCompletedOnboarding
+        self.cleanupSafetyProfile = defaults.string(forKey: PreferenceKey.cleanupSafetyProfile).flatMap(CleanupSafetyProfile.init(rawValue:)) ?? .balanced
         self.uninstallSensitivity = defaults.string(forKey: PreferenceKey.uninstallSensitivity).flatMap(UninstallSensitivityLevel.init(rawValue:)) ?? .enhanced
         self.storageInspectionMode = defaults.string(forKey: PreferenceKey.storageInspectionMode).flatMap(StorageInspectionMode.init(rawValue:)) ?? .visible
         self.storageFocusMode = defaults.string(forKey: PreferenceKey.storageFocusMode).flatMap(StorageFocusMode.init(rawValue:)) ?? .balanced
@@ -816,16 +829,64 @@ final class AppModel: ObservableObject {
         await trashCleanupCandidates([candidate])
     }
 
+    /// Entry point for every cleanup deletion. Runs immediately or asks for confirmation first,
+    /// depending on the selected safety profile.
     func trashCleanupCandidates(_ candidates: [CleanupCandidate]) async {
+        let removable = candidates.filter { $0.safetyLevel != .protected }
+        guard !removable.isEmpty else {
+            return
+        }
+
+        if cleanupSafetyProfile.requiresConfirmation(for: removable) {
+            let permanentCount = removable.filter { cleanupSafetyProfile.removesPermanently($0) }.count
+            pendingCleanupDeletion = PendingCleanupDeletion(
+                candidates: removable,
+                permanentCount: permanentCount,
+                trashCount: removable.count - permanentCount,
+                totalBytes: removable.reduce(into: 0) { $0 += $1.sizeBytes }
+            )
+            return
+        }
+
+        await executeCleanupDeletion(removable)
+    }
+
+    func confirmPendingCleanupDeletion() async {
+        guard let pending = pendingCleanupDeletion else {
+            return
+        }
+
+        pendingCleanupDeletion = nil
+        await executeCleanupDeletion(pending.candidates)
+    }
+
+    func cancelPendingCleanupDeletion() {
+        pendingCleanupDeletion = nil
+    }
+
+    private func executeCleanupDeletion(_ candidates: [CleanupCandidate]) async {
         cleanupBusy = true
         cleanupError = nil
+        let profile = cleanupSafetyProfile
+        await guardService.setCleanupProfile(profile)
 
-        for candidate in candidates where candidate.safetyLevel != .protected {
+        var failures: [String] = []
+        for candidate in candidates {
             do {
-                try await guardService.removePermanently(candidate.url, purpose: .cleanup)
+                if profile.removesPermanently(candidate) {
+                    try await guardService.removePermanently(candidate.url, purpose: .cleanup)
+                } else {
+                    try await guardService.moveToTrash(candidate.url, purpose: .cleanup)
+                }
             } catch {
-                cleanupError = error.localizedDescription
+                failures.append("\(candidate.displayName): \(error.localizedDescription)")
             }
+        }
+
+        if let firstFailure = failures.first {
+            cleanupError = failures.count == 1
+                ? firstFailure
+                : "\(failures.count) items could not be removed. First error: \(firstFailure)"
         }
 
         await loadCleanup(force: true)
@@ -935,6 +996,12 @@ final class AppModel: ObservableObject {
         await loadQuarantinedApplications(force: true)
     }
 
+    func openAppManagementSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     func selectQuarantinedApplication(_ app: QuarantinedApplication) {
         selection = .quarantine
         selectedQuarantinedApp = app
@@ -948,12 +1015,14 @@ final class AppModel: ObservableObject {
 
         quarantineBusyActionID = actionableApps.count == 1 ? actionableApps[0].id : "bulk"
         quarantineError = nil
+        quarantineNeedsAppManagement = false
 
         let logs = await quarantineAudit.removeQuarantine(from: actionableApps)
         quarantineLogs.insert(contentsOf: logs.reversed(), at: 0)
 
         if let failedLog = logs.first(where: { !$0.succeeded }) {
             quarantineError = failedLog.output
+            quarantineNeedsAppManagement = logs.contains { !$0.succeeded && $0.output == QuarantineAuditService.appManagementMessage }
         } else {
             await loadQuarantinedApplications(force: true)
         }
@@ -1248,7 +1317,7 @@ final class AppModel: ObservableObject {
         switch item.sourceKind {
         case .homebrew:
             guard let reference = item.homebrewReference else {
-                updatesError = "SK Mole could not resolve the Homebrew package backing this update."
+                updatesError = "Warren could not resolve the Homebrew package backing this update."
                 updatesBusyActionID = nil
                 return
             }
@@ -1260,7 +1329,7 @@ final class AppModel: ObservableObject {
             homebrewLogs.insert(log, at: 0)
         case .appStore:
             guard let adamID = item.appStoreAdamID else {
-                updatesError = "SK Mole could not resolve the App Store identifier needed for this update."
+                updatesError = "Warren could not resolve the App Store identifier needed for this update."
                 updatesBusyActionID = nil
                 return
             }
@@ -1352,7 +1421,7 @@ final class AppModel: ObservableObject {
 
     func installMASFromUpdates() async {
         guard homebrewStatus.isInstalled else {
-            updatesError = "Install Homebrew first, then SK Mole can install `mas` for App Store automation."
+            updatesError = "Install Homebrew first, then Warren can install `mas` for App Store automation."
             selection = .homebrew
             return
         }
@@ -1416,7 +1485,7 @@ final class AppModel: ObservableObject {
 
     func ignoreUpdate(_ item: AppUpdateItem) {
         guard let version = item.normalizedLatestVersion else {
-            updatesError = "SK Mole could not resolve the version to ignore for \(item.displayName)."
+            updatesError = "Warren could not resolve the version to ignore for \(item.displayName)."
             return
         }
 
@@ -1598,7 +1667,7 @@ final class AppModel: ObservableObject {
     func installMagika() async {
         guard homebrewStatus.isInstalled else {
             selection = .homebrew
-            homebrewError = "Install Homebrew first, then SK Mole can install Magika with brew."
+            homebrewError = "Install Homebrew first, then Warren can install Magika with brew."
             return
         }
 
@@ -1710,7 +1779,7 @@ final class AppModel: ObservableObject {
 
     func installGitHubCLI() async {
         guard homebrewStatus.isInstalled else {
-            homebrewError = "Install Homebrew first, then SK Mole can install GitHub CLI with brew."
+            gitHubCLIError = "Install Homebrew first, then Warren can install GitHub CLI with brew."
             return
         }
 
@@ -1723,6 +1792,28 @@ final class AppModel: ObservableObject {
         if log.succeeded {
             await loadGitHubCLI(force: true)
         }
+    }
+
+    /// Saves a new personal access token to the Keychain via `gh`, then refreshes the account status.
+    func updateGitHubToken(_ token: String) async -> Bool {
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            gitHubCLIError = "Paste a token first."
+            return false
+        }
+
+        gitHubCLIError = nil
+        gitHubCLIBusy = true
+        let log = await gitHubCLIService.storeToken(trimmed)
+        gitHubCLIBusy = false
+
+        guard log.succeeded else {
+            gitHubCLIError = log.output
+            return false
+        }
+
+        await loadGitHubCLI(force: true)
+        return true
     }
 
     func launchGitHubCLILoginInTerminal() {
@@ -1746,6 +1837,11 @@ final class AppModel: ObservableObject {
 
     func openGitHubPersonalAccessTokenDocs() {
         NSWorkspace.shared.open(GitHubCLIStatus.personalAccessTokenDocsURL)
+    }
+
+    /// Relay's palette lives in the menu bar companion, so ask it to open the palette.
+    func openRelayPalette() {
+        RelayShared.requestPalette()
     }
 
     func openGitHubRepository(_ repository: GitHubRepositorySummary) {
@@ -1874,7 +1970,7 @@ final class AppModel: ObservableObject {
         storageVolumeCurrentNode = volume.browserRoot
         storageVolumeBreadcrumb = [volume.browserRoot]
         storageVolumeError = volume.requiresManualScan
-            ? "This volume is listed immediately, but SK Mole waits for a manual scan before building its folder map."
+            ? "This volume is listed immediately, but Warren waits for a manual scan before building its folder map."
             : nil
     }
 
@@ -2409,7 +2505,7 @@ final class AppModel: ObservableObject {
 
     private func scheduledMaintenanceDestination(for descriptor: MaintenanceExportPluginDescriptor) throws -> URL {
         let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/SK Mole Reports", isDirectory: true)
+            .appendingPathComponent("Documents/Warren Reports", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: nil)
 
         let formatter = ISO8601DateFormatter()
@@ -2497,6 +2593,10 @@ final class AppModel: ObservableObject {
         case .fileIntelligence:
             await loadMagika(force: force || !hasLoadedMagika)
         case .homebrew:
+            await loadHomebrew(force: force || !hasLoadedHomebrew || !homebrewStatus.isInstalled)
+        case .relay:
+            await relayEnvironment.reload()
+        case .github:
             let shouldRefreshHomebrew = force || !hasLoadedHomebrew || !homebrewStatus.isInstalled
             let shouldRefreshGitHubCLI = force || !hasLoadedGitHubCLI
             async let refreshHomebrew: Void = loadHomebrew(force: shouldRefreshHomebrew)
@@ -2565,8 +2665,9 @@ final class AppModel: ObservableObject {
         )
 
         let scanner = cleanupScanner
+        let profile = cleanupSafetyProfile
         let task = Task { [requestID] in
-            await scanner.scan { progress in
+            await scanner.scan(profile: profile) { progress in
                 await MainActor.run {
                     guard self.cleanupRequestID == requestID else { return }
                     self.cleanupProgress = progress
@@ -3042,7 +3143,7 @@ final class AppModel: ObservableObject {
                 return try await service.loadInventory(using: status)
             } catch {
                 await MainActor.run {
-                    guard self.homebrewRequestID == requestID else { return }
+                    guard self.homebrewRequestID == requestID, !Self.isCancellation(error) else { return }
                     self.homebrewError = error.localizedDescription
                 }
 
@@ -3234,6 +3335,18 @@ final class AppModel: ObservableObject {
         updateRecommendedActions()
     }
 
+    nonisolated private static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError || Task.isCancelled {
+            return true
+        }
+
+        if case .cancelled = error as? ProcessRunnerError {
+            return true
+        }
+
+        return false
+    }
+
     private func loadHomebrewPackageDetail(for reference: HomebrewPackageReference) async {
         homebrewSelectedReference = reference
         homebrewDetailBusy = true
@@ -3245,6 +3358,13 @@ final class AppModel: ObservableObject {
             homebrewError = nil
         } catch {
             guard homebrewSelectedReference == reference else { return }
+
+            // A superseded or cancelled lookup is not a failure worth showing.
+            if Self.isCancellation(error) {
+                homebrewDetailBusy = false
+                return
+            }
+
             homebrewSelectedPackageDetail = nil
 
             if homebrewStatus.isInstalled {
@@ -3284,7 +3404,7 @@ final class AppModel: ObservableObject {
         #!/bin/zsh
         export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
         clear
-        echo "SK Mole"
+        echo "Warren"
         echo
         \(command)
         status=$?
@@ -3306,7 +3426,7 @@ final class AppModel: ObservableObject {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
             guard NSWorkspace.shared.open(scriptURL) else {
-                onError("SK Mole could not open Terminal for this command. You can run it manually:\n\(command)")
+                onError("Warren could not open Terminal for this command. You can run it manually:\n\(command)")
                 return
             }
         } catch {
@@ -3664,7 +3784,7 @@ final class AppModel: ObservableObject {
                     id: "duplicates-review",
                     title: "Review duplicate files",
                     subtitle: ByteFormatting.format(duplicateCategory.totalBytes),
-                    detail: "SK Mole found likely duplicates in common user folders and kept one likely-primary copy. Review the extras before moving them to Trash.",
+                    detail: "Warren found likely duplicates in common user folders and kept one likely-primary copy. Review the extras before moving them to Trash.",
                     icon: duplicateCategory.icon,
                     priority: .recommended,
                     estimatedImpactBytes: duplicateCategory.totalBytes,
@@ -3696,7 +3816,7 @@ final class AppModel: ObservableObject {
                     id: "old-downloads-review",
                     title: "Review old downloads",
                     subtitle: ByteFormatting.format(downloadsCategory.totalBytes),
-                    detail: "SK Mole found large downloads that have been untouched for over 45 days. This is usually one of the quickest manual wins.",
+                    detail: "Warren found large downloads that have been untouched for over 45 days. This is usually one of the quickest manual wins.",
                     icon: downloadsCategory.icon,
                     priority: .optional,
                     estimatedImpactBytes: downloadsCategory.totalBytes,
@@ -3712,7 +3832,7 @@ final class AppModel: ObservableObject {
                     id: "orphaned-files-review",
                     title: "Review orphaned app leftovers",
                     subtitle: ByteFormatting.format(orphanedFileBytes),
-                    detail: "SK Mole found user-domain support files whose owning apps no longer appear installed. Review them before moving them to Trash.",
+                    detail: "Warren found user-domain support files whose owning apps no longer appear installed. Review them before moving them to Trash.",
                     icon: "questionmark.folder",
                     priority: .recommended,
                     estimatedImpactBytes: orphanedFileBytes,
@@ -3745,7 +3865,7 @@ final class AppModel: ObservableObject {
                     id: "startup-items-review",
                     title: "Review startup items",
                     subtitle: "\(activeStartupItems.count) user launch agents are enabled",
-                    detail: "A larger startup set can slow login and keep extra background processes around. SK Mole can review and disable user launch agents one by one.",
+                    detail: "A larger startup set can slow login and keep extra background processes around. Warren can review and disable user launch agents one by one.",
                     icon: "person.crop.circle.badge.plus",
                     priority: .optional,
                     callToAction: "Open Optimize",
@@ -3760,7 +3880,7 @@ final class AppModel: ObservableObject {
                     id: "smart-delete-\(trashedApp.id)",
                     title: "Finish uninstall from Trash",
                     subtitle: trashedApp.name,
-                    detail: "This app is already in Trash. SK Mole can run a SmartDelete-style leftover review and show any user-domain support files still outside Trash.",
+                    detail: "This app is already in Trash. Warren can run a SmartDelete-style leftover review and show any user-domain support files still outside Trash.",
                     icon: "trash.square",
                     priority: .recommended,
                     estimatedImpactBytes: trashedApp.sizeBytes,
@@ -3779,7 +3899,7 @@ final class AppModel: ObservableObject {
                     id: "app-review-\(removableApp.id)",
                     title: "Preview a large app uninstall",
                     subtitle: removableApp.name,
-                    detail: "This app occupies \(ByteFormatting.format(removableApp.sizeBytes)). SK Mole can preview its user-domain remnants before anything moves to Trash.",
+                    detail: "This app occupies \(ByteFormatting.format(removableApp.sizeBytes)). Warren can preview its user-domain remnants before anything moves to Trash.",
                     icon: "xmark.app",
                     priority: .optional,
                     estimatedImpactBytes: removableApp.sizeBytes,
@@ -3798,7 +3918,7 @@ final class AppModel: ObservableObject {
                     id: "app-reset-\(resetCandidate.id)",
                     title: "Preview an app reset",
                     subtitle: resetCandidate.name,
-                    detail: "When an app is misbehaving, a reset can clear user-domain support files without removing the app bundle itself. SK Mole can preview that path first.",
+                    detail: "When an app is misbehaving, a reset can clear user-domain support files without removing the app bundle itself. Warren can preview that path first.",
                     icon: "arrow.counterclockwise.circle",
                     priority: .optional,
                     estimatedImpactBytes: resetCandidate.sizeBytes,
@@ -3814,7 +3934,7 @@ final class AppModel: ObservableObject {
                     id: "system-pressure",
                     title: "Mac is under pressure right now",
                     subtitle: "\(metrics.memoryPressure.title) memory pressure • \(metrics.thermalState.title) thermal state",
-                    detail: "SK Mole is seeing system strain from public macOS signals. Clearing space or pausing heavy work may help the Mac recover faster.",
+                    detail: "Warren is seeing system strain from public macOS signals. Clearing space or pausing heavy work may help the Mac recover faster.",
                     icon: "waveform.path.ecg",
                     priority: .urgent,
                     callToAction: "Open Dashboard",
@@ -3829,7 +3949,7 @@ final class AppModel: ObservableObject {
                     id: "process-inspector-\(hottestProcess.pid)",
                     title: "Inspect a hot process",
                     subtitle: "\(hottestProcess.name) • \(String(format: "%.1f%% CPU", hottestProcess.cpuPercent))",
-                    detail: "SK Mole is seeing a user-visible CPU spike. Open the process inspector for a wider list and, when safe, terminate non-system work from there.",
+                    detail: "Warren is seeing a user-visible CPU spike. Open the process inspector for a wider list and, when safe, terminate non-system work from there.",
                     icon: "list.bullet.rectangle.portrait",
                     priority: .recommended,
                     callToAction: "Open Processes",
@@ -3844,10 +3964,10 @@ final class AppModel: ObservableObject {
             let callToAction: String
 
             if automaticCount > 0 {
-                detail = "SK Mole found \(activeAvailableUpdateItems.count) available update\(activeAvailableUpdateItems.count == 1 ? "" : "s"), and \(automaticCount) of them can be installed directly from the Updates tab."
+                detail = "Warren found \(activeAvailableUpdateItems.count) available update\(activeAvailableUpdateItems.count == 1 ? "" : "s"), and \(automaticCount) of them can be installed directly from the Updates tab."
                 callToAction = "Open Updates"
             } else {
-                detail = "SK Mole found \(activeAvailableUpdateItems.count) available update\(activeAvailableUpdateItems.count == 1 ? "" : "s"), but these sources still need a manual visit or vendor-controlled installer."
+                detail = "Warren found \(activeAvailableUpdateItems.count) available update\(activeAvailableUpdateItems.count == 1 ? "" : "s"), but these sources still need a manual visit or vendor-controlled installer."
                 callToAction = "Review Updates"
             }
 

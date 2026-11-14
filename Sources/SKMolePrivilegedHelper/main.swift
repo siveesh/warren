@@ -105,7 +105,7 @@ private final class HelperReplyBox: @unchecked Sendable {
 private final class HelperDelegate: NSObject, NSXPCListenerDelegate {
     func listener(_ listener: NSXPCListener, shouldAcceptNewConnection newConnection: NSXPCConnection) -> Bool {
         guard HelperClientVerifier.isTrusted(connection: newConnection) else {
-            NSLog("SK Mole privileged helper rejected untrusted XPC client with pid %d", newConnection.processIdentifier)
+            NSLog("Warren privileged helper rejected untrusted XPC client with pid %d", newConnection.processIdentifier)
             return false
         }
 
@@ -139,7 +139,7 @@ private enum HelperClientVerifier {
         }
 
         // Local ad-hoc builds do not carry a TeamIdentifier. Keep them usable for
-        // development, but require a real SK Mole app bundle shape rather than only
+        // development, but require a real Warren app bundle shape rather than only
         // trusting an arbitrary process that reused the bundle identifier.
         return isRecognizedDevelopmentClient(info: info)
     }
@@ -225,7 +225,7 @@ private enum HelperClientVerifier {
         }
 
         let components = executableURL.standardizedFileURL.pathComponents
-        guard Array(components.suffix(4)) == ["SK Mole.app", "Contents", "MacOS", "SK Mole"] else {
+        guard Array(components.suffix(4)) == ["Warren.app", "Contents", "MacOS", "Warren"] else {
             return false
         }
 

@@ -110,7 +110,7 @@ struct PrivilegedHelperManager: Sendable {
         if let helperExecutableURL,
            let helperSignature = await signatureSummary(for: helperExecutableURL),
            helperSignature.requiresTrustedSigning {
-            return "The embedded privileged helper is \(helperSignature.signatureDescription). macOS blocks launch daemons unless they are signed with a trusted Apple certificate. Rebuild SK Mole with `SKMOLE_CODESIGN_IDENTITY` set to a valid `Apple Development` or `Developer ID Application` identity, then reinstall the helper."
+            return "The embedded privileged helper is \(helperSignature.signatureDescription). macOS blocks launch daemons unless they are signed with a trusted Apple certificate. Rebuild Warren with `SKMOLE_CODESIGN_IDENTITY` set to a valid `Apple Development` or `Developer ID Application` identity, then reinstall the helper."
         }
 
         if let appSignature = await signatureSummary(for: Bundle.main.bundleURL),

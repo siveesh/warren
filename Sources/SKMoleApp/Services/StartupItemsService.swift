@@ -55,7 +55,7 @@ actor StartupItemsService {
             throw NSError(
                 domain: "SKMole.StartupItems",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Only user launch agents can be disabled from SK Mole."]
+                userInfo: [NSLocalizedDescriptionKey: "Only user launch agents can be disabled from Warren."]
             )
         }
 
@@ -74,7 +74,7 @@ actor StartupItemsService {
             throw NSError(
                 domain: "SKMole.StartupItems",
                 code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Only user launch agents can be enabled from SK Mole."]
+                userInfo: [NSLocalizedDescriptionKey: "Only user launch agents can be enabled from Warren."]
             )
         }
 

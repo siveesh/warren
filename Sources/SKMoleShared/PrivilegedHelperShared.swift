@@ -9,8 +9,8 @@ public enum PrivilegedHelperConstants {
 
 public enum MenuBarHelperConstants {
     public static let bundleIdentifier = "com.siveesh.skmole.menubar"
-    public static let executableName = "SK Mole Companion"
-    public static let displayName = "SK Mole Companion"
+    public static let executableName = "Warren Companion"
+    public static let displayName = "Warren Companion"
     public static let bundleRelativePath = "Contents/Library/LoginItems/\(displayName).app"
     public static let mainAppBundleIdentifier = "com.siveesh.skmole"
     public static let mainAppURLScheme = "skmole"

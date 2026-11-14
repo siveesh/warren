@@ -1,6 +1,6 @@
-# SK Mole
+# Warren
 
-SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppCleaner, DaisyDisk, iStat Menus, and Cork. It is designed around a safety-first workflow: preview before action, protect system-critical paths, isolate admin-only work behind a helper, and keep destructive operations tightly scoped.
+Warren is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppCleaner, DaisyDisk, iStat Menus, and Cork. It is designed around a safety-first workflow: preview before action, protect system-critical paths, isolate admin-only work behind a helper, and keep destructive operations tightly scoped.
 
 ## Recent release highlights
 
@@ -13,14 +13,14 @@ SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppC
 
 - The menu bar companion adds a compact Updates card back into the no-scroll popover so update status is visible without reopening the main dashboard
 - Metric card headers are tightened so longer labels such as `THERMAL` stay on one line while retaining right-aligned values
-- The companion keeps the simplified footer with only Open SK Mole and the power-icon quit action
+- The companion keeps the simplified footer with only Open Warren and the power-icon quit action
 
 ### v1.1.5
 
 - The menu bar companion popover has been tightened into a no-scroll compact layout that fits the core status view inside the normal menu bar popover space
 - System configuration now renders as one small single-line summary, keeping model, chip, memory, macOS version, and uptime visible without stacked chips
 - CPU, memory, network, disk, power, and thermal cards now use smaller top-right values opposite the card label, with shorter card heights and slimmer progress bars
-- The companion footer now keeps only the essentials after Top Processes: Open SK Mole and a compact power icon to quit the companion
+- The companion footer now keeps only the essentials after Top Processes: Open Warren and a compact power icon to quit the companion
 
 ### v1.1.4
 
@@ -32,7 +32,7 @@ SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppC
 ### v1.1.3
 
 - The menu bar companion now uses a smaller status-card design with system configuration chips, compact telemetry tiles, update status, and a concise top-process table
-- SK Mole now checks its own GitHub Releases feed during update scans and can download/open the latest release DMG when an update is available
+- Warren now checks its own GitHub Releases feed during update scans and can download/open the latest release DMG when an update is available
 - Monitoring updates are split into a dedicated store so high-frequency dashboard/menu-bar samples no longer invalidate the whole app model
 - Update filtering now uses a cached feature store for active, deferred, ignored, manual, and up-to-date buckets instead of recomputing those lists on every view refresh
 - Storage drill-down uses one-pass direct-child sizing for folder maps, improving responsiveness on large directory trees
@@ -60,16 +60,16 @@ SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppC
 - Storage explorer with multi-volume drill-down, focus filters, and large-file actions
 - Optimize center for low-risk cache, system-service, and helper-backed admin maintenance actions
 - Menu bar companion for compact monitoring, system configuration, top-process visibility, update awareness, and quick actions
-- Scheduled dry-run scan/report exports to `Documents/SK Mole Reports`
+- Scheduled dry-run scan/report exports to `Documents/Warren Reports`
 
 ## Developer workflows
 
-- Homebrew installation can be launched from SK Mole without Apple Events automation permission; the app now opens a temporary Terminal `.command` script instead of scripting Terminal directly
+- Homebrew installation can be launched from Warren without Apple Events automation permission; the app now opens a temporary Terminal `.command` script instead of scripting Terminal directly
 - GitHub CLI install/auth flows are surfaced in the Homebrew area, including auth-status refresh, PAT links, and repository listing for the signed-in account
 - Homebrew doctor output can surface actionable unexpected-dylib follow-up directly in the UI
 - Homebrew inventory loading is hardened so noisy or partial `brew` JSON output does not collapse the whole tab into a decode error
-- Magika can be installed from the existing Homebrew workflow, then used inside SK Mole without turning it into a bundled heavyweight ML runtime
-- Process and maintenance actions now emit unified `os.log` entries through clear SK Mole log categories for Console-based debugging
+- Magika can be installed from the existing Homebrew workflow, then used inside Warren without turning it into a bundled heavyweight ML runtime
+- Process and maintenance actions now emit unified `os.log` entries through clear Warren log categories for Console-based debugging
 - Localization groundwork now ships with an initial `en.lproj` bundle scaffold so the app can grow into fuller translation support cleanly
 
 ## Safety boundaries
@@ -87,12 +87,12 @@ SK Mole is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppC
 ## Notes for testers
 
 - The packaged app in `dist/` is ad-hoc signed in this workspace, so the main UI is testable but privileged-helper registration still requires a real Apple signing identity
-- Because this workspace build is unsigned for local distribution, macOS may place `SK Mole.app` in quarantine and show a misleading warning such as `"SK Mole.app" is damaged and can’t be opened. You should move it to the Trash.` That is a Gatekeeper/quarantine issue rather than actual app corruption. For local testing, you can remove the quarantine attribute with `xattr -d com.apple.quarantine "SK Mole.app"`.
-- Quarantine actions use the system `xattr` tool directly from SK Mole and do not require Terminal automation permission
+- Because this workspace build is unsigned for local distribution, macOS may place `Warren.app` in quarantine and show a misleading warning such as `"Warren.app" is damaged and can’t be opened. You should move it to the Trash.` That is a Gatekeeper/quarantine issue rather than actual app corruption. For local testing, you can remove the quarantine attribute with `xattr -d com.apple.quarantine "Warren.app"`.
+- Quarantine actions use the system `xattr` tool directly from Warren and do not require Terminal automation permission
 - Homebrew install/auth flows should now open Terminal normally without requiring Terminal Apple Events authorization
-- File Intelligence remains optional; if Magika is not installed, SK Mole stays fully usable and simply offers install/open guidance instead of shipping its own model runtime
-- Scheduled reports are dry-run exports only; SK Mole does not schedule unattended deletion
-- The DMG includes both `SK Mole.app` and this `README.md` for distribution
+- File Intelligence remains optional; if Magika is not installed, Warren stays fully usable and simply offers install/open guidance instead of shipping its own model runtime
+- Scheduled reports are dry-run exports only; Warren does not schedule unattended deletion
+- The DMG includes both `Warren.app` and this `README.md` for distribution
 
 ## GitHub-ready layout
 
@@ -125,7 +125,7 @@ To package a standalone `.app` bundle:
 ./scripts/build-app.sh
 ```
 
-The generated app bundle is created in `dist/SK Mole.app`.
+The generated app bundle is created in `dist/Warren.app`.
 
 To package a distributable `.dmg`:
 
@@ -133,7 +133,7 @@ To package a distributable `.dmg`:
 ./scripts/build-dmg.sh
 ```
 
-The generated disk image is created in `dist/SK-Mole-<version>.dmg` and now includes both `SK Mole.app` and this `README.md`.
+The generated disk image is created in `dist/Warren-<version>.dmg` and now includes both `Warren.app` and this `README.md`.
 
 For production helper registration, sign with a real Apple identity:
 

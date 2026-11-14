@@ -17,6 +17,14 @@ struct GuardedFileIdentity: Equatable, Sendable {
 
 actor SystemGuard {
     private let home = FileManager.default.homeDirectoryForCurrentUser
+    private var cleanupProfile: CleanupSafetyProfile = .balanced
+
+    func setCleanupProfile(_ profile: CleanupSafetyProfile) {
+        cleanupProfile = profile
+    }
+
+    /// Extra cache locations that only relaxed profiles may clean.
+    private lazy var extendedCleanupRoots: [URL] = CleanupSafetyProfile.extendedRoots(home: home)
 
     private lazy var cleanupRoots: [URL] = [
         home.appendingPathComponent("Library/Caches"),
@@ -128,7 +136,8 @@ actor SystemGuard {
 
         switch purpose {
         case .cleanup:
-            guard cleanupRoots.contains(where: { URLPathSafety.isDescendant(normalized, of: $0) }) else {
+            let roots = cleanupProfile.includesExtendedRoots ? cleanupRoots + extendedCleanupRoots : cleanupRoots
+            guard roots.contains(where: { URLPathSafety.isDescendant(normalized, of: $0) }) else {
                 return false
             }
 
@@ -186,7 +195,7 @@ actor SystemGuard {
             return false
         }
 
-        let protectedNames = ["SK Mole", "SK Mole Companion", "Finder", "Dock", "System Settings", "Activity Monitor", "loginwindow"]
+        let protectedNames = ["Warren", "Warren Companion", "Finder", "Dock", "System Settings", "Activity Monitor", "loginwindow"]
         if protectedNames.contains(where: { process.name.localizedCaseInsensitiveCompare($0) == .orderedSame }) {
             return false
         }
@@ -305,7 +314,7 @@ actor SystemGuard {
             throw NSError(
                 domain: "SKMole.SystemGuard",
                 code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "SK Mole refuses to operate on symbolic links for \(purpose)."]
+                userInfo: [NSLocalizedDescriptionKey: "Warren refuses to operate on symbolic links for \(purpose)."]
             )
         }
 
@@ -313,7 +322,7 @@ actor SystemGuard {
             throw NSError(
                 domain: "SKMole.SystemGuard",
                 code: 4,
-                userInfo: [NSLocalizedDescriptionKey: "SK Mole blocked a sensitive path while validating this action."]
+                userInfo: [NSLocalizedDescriptionKey: "Warren blocked a sensitive path while validating this action."]
             )
         }
     }
@@ -332,7 +341,7 @@ actor SystemGuard {
             throw NSError(
                 domain: "SKMole.SystemGuard",
                 code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "SK Mole stopped because the target changed during validation: \(url.path)"]
+                userInfo: [NSLocalizedDescriptionKey: "Warren stopped because the target changed during validation: \(url.path)"]
             )
         }
     }

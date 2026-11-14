@@ -22,15 +22,15 @@ struct MaintenanceExportPluginDescriptor: Identifiable, Hashable {
     var suggestedBaseName: String {
         switch id {
         case .dryRunJSON:
-            return "SK-Mole-Dry-Run"
+            return "Warren-Dry-Run"
         case .overviewMarkdown:
-            return "SK-Mole-Overview"
+            return "Warren-Overview"
         case .overviewText:
-            return "SK-Mole-Overview"
+            return "Warren-Overview"
         case .focusedStorageJSON:
-            return "SK-Mole-Storage-Focus"
+            return "Warren-Storage-Focus"
         case .networkSnapshotJSON:
-            return "SK-Mole-Network-Snapshot"
+            return "Warren-Network-Snapshot"
         }
     }
 }
