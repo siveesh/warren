@@ -36,6 +36,7 @@ struct IntelView: View {
                         .foregroundStyle(AppPalette.amber)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(28)
         }
         .task {

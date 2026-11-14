@@ -17,6 +17,7 @@ struct PackageReceiptsView: View {
             listPane
             detailPane
         }
+        .frame(maxHeight: .infinity, alignment: .top)
         .padding(28)
         .task {
             if library.receipts == nil { await library.refresh() }
@@ -74,7 +75,7 @@ struct PackageReceiptsView: View {
                 }
             }
         }
-        .frame(minWidth: 380)
+        .frame(minWidth: 300, maxWidth: .infinity)
     }
 
     private func receiptRow(_ receipt: PackageReceipt) -> some View {
@@ -137,7 +138,7 @@ struct PackageReceiptsView: View {
                     .frame(minHeight: 480)
             }
         }
-        .frame(minWidth: 520)
+        .frame(minWidth: 360, maxWidth: .infinity)
     }
 
     private func header(_ receipt: PackageReceipt) -> some View {

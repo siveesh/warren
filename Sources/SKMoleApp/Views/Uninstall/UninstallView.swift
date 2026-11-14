@@ -38,6 +38,7 @@ struct UninstallView: View {
             appsPane
             detailPane
         }
+        .frame(maxHeight: .infinity, alignment: .top)
         .padding(28)
         .task {
             if library.apps.isEmpty { await model.refreshApplications() }
@@ -201,7 +202,7 @@ struct UninstallView: View {
                 .frame(minHeight: 420)
             }
         }
-        .frame(minWidth: 400)
+        .frame(minWidth: 300, maxWidth: .infinity)
     }
 
     private func appRow(_ app: PeelCore.InstalledApp) -> some View {
@@ -335,7 +336,7 @@ struct UninstallView: View {
                 .frame(minHeight: 480)
             }
         }
-        .frame(minWidth: 520)
+        .frame(minWidth: 360, maxWidth: .infinity)
     }
 
     @ViewBuilder

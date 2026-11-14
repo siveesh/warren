@@ -41,6 +41,7 @@ struct OrphanedFilesView: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(28)
         }
         .safeAreaInset(edge: .bottom) { selectionBar }
