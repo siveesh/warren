@@ -590,26 +590,31 @@ struct UpdatesView: View {
                     }
                 }
 
-                if item.status == .updateAvailable {
+                if item.status == .updateAvailable || item.status == .manualCheck || item.status == .error {
                     Menu {
                         if model.deferredUpdateItems.contains(item) {
                             Button("Resume Update Alerts") {
                                 model.clearUpdateDeferral(item)
                             }
                         } else if model.ignoredUpdateItems.contains(item) {
-                            Button("Stop Ignoring This Version") {
+                            Button(model.updateIsPermanentlyIgnored(item) ? "Stop Ignoring This App" : "Stop Ignoring This Version") {
                                 model.stopIgnoringUpdate(item)
                             }
                         } else {
-                            Button("Defer 1 Day") {
-                                model.deferUpdate(item, by: 24 * 60 * 60)
+                            if item.status == .updateAvailable {
+                                Button("Defer 1 Day") {
+                                    model.deferUpdate(item, by: 24 * 60 * 60)
+                                }
+                                Button("Defer 1 Week") {
+                                    model.deferUpdate(item, by: 7 * 24 * 60 * 60)
+                                }
+                                Divider()
+                                Button("Ignore This Version") {
+                                    model.ignoreUpdate(item)
+                                }
                             }
-                            Button("Defer 1 Week") {
-                                model.deferUpdate(item, by: 7 * 24 * 60 * 60)
-                            }
-                            Divider()
-                            Button("Ignore This Version") {
-                                model.ignoreUpdate(item)
+                            Button("Ignore This App Permanently") {
+                                model.ignoreUpdatesPermanently(item)
                             }
                         }
                     } label: {

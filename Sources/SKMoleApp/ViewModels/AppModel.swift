@@ -1496,6 +1496,15 @@ final class AppModel: ObservableObject {
         updateRecommendedActions()
     }
 
+    /// Hides every future update and manual-review entry for this app until the user turns it back on.
+    func ignoreUpdatesPermanently(_ item: AppUpdateItem) {
+        ignoredUpdateVersions[updateDecisionKey(for: item)] = UpdatesFeatureStore.permanentIgnoreMarker
+        deferredUpdateExpirations.removeValue(forKey: updateDecisionKey(for: item))
+        persistUpdateDecisionState()
+        persistUpdateStatusSnapshot()
+        updateRecommendedActions()
+    }
+
     func stopIgnoringUpdate(_ item: AppUpdateItem) {
         ignoredUpdateVersions.removeValue(forKey: updateDecisionKey(for: item))
         persistUpdateDecisionState()
@@ -1527,13 +1536,23 @@ final class AppModel: ObservableObject {
         updateRecommendedActions()
     }
 
+    func updateIsPermanentlyIgnored(_ item: AppUpdateItem) -> Bool {
+        ignoredUpdateVersions[updateDecisionKey(for: item)] == UpdatesFeatureStore.permanentIgnoreMarker
+    }
+
     func updateDecisionSummary(for item: AppUpdateItem) -> String? {
         if let deferredUntil = updateDeferralDate(for: item) {
             return "Deferred until \(deferredUntil.formatted(date: .abbreviated, time: .shortened))"
         }
 
-        if isUpdateIgnored(item), let version = item.normalizedLatestVersion {
-            return "Ignoring version \(version)"
+        if isUpdateIgnored(item) {
+            if updateIsPermanentlyIgnored(item) {
+                return "Ignoring all updates for this app"
+            }
+
+            if let version = item.normalizedLatestVersion {
+                return "Ignoring version \(version)"
+            }
         }
 
         return nil
@@ -1734,8 +1753,12 @@ final class AppModel: ObservableObject {
         homebrewSearchTask = nil
     }
 
-    func selectHomebrewInstalledPackage(_ package: HomebrewInstalledPackage) async {
-        selection = .homebrew
+    /// `navigate: false` pre-selects the package without switching sections, for background loads
+    /// (for example while the Updates tab refreshes Homebrew).
+    func selectHomebrewInstalledPackage(_ package: HomebrewInstalledPackage, navigate: Bool = true) async {
+        if navigate {
+            selection = .homebrew
+        }
         homebrewSelectedPackageDetail = nil
         homebrewSelectedFallbackResult = HomebrewPackageSearchResult(
             reference: package.reference,
@@ -3172,7 +3195,7 @@ final class AppModel: ObservableObject {
         if let reference = homebrewSelectedReference {
             await loadHomebrewPackageDetail(for: reference)
         } else if let firstPackage = inventory.installedPackages.first {
-            await selectHomebrewInstalledPackage(firstPackage)
+            await selectHomebrewInstalledPackage(firstPackage, navigate: false)
         }
     }
 

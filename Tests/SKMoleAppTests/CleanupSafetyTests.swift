@@ -150,3 +150,30 @@ private let sparkleFixture = """
     #expect(!AppUpdateService.looksLikePrerelease("1.40.1"))
     #expect(!AppUpdateService.looksLikePrerelease(nil))
 }
+
+@Test @MainActor func permanentlyIgnoredManualReviewItemsMoveToIgnoredList() {
+    let item = AppUpdateItem(
+        id: "demo-review", kind: .application, displayName: "Demo Review", bundleIdentifier: "com.example.review",
+        installedVersion: "1.0", latestVersion: nil, sourceKind: .appStore, status: .manualCheck,
+        detail: "Needs a manual check.", sourceDescription: "Mac App Store", appURL: nil, homepageURL: nil,
+        primaryURL: nil, primaryURLTitle: nil, secondaryURL: nil, secondaryURLTitle: nil, homebrewReference: nil,
+        appStoreAdamID: nil, commandPreview: nil, canAutoInstall: false, releaseNotesSummary: nil,
+        releaseNotesURL: nil, releaseNotesURLTitle: nil, fullReleaseNotesURL: nil, fullReleaseNotesURLTitle: nil,
+        publishedAt: nil
+    )
+    let report = AppUpdateReport(
+        scannedAt: .now,
+        appStoreAutomation: AppStoreAutomationStatus(executablePath: nil, version: nil, accountName: nil, accountDetail: nil),
+        scannedApplicationCount: 1, scannedPackageCount: 0, items: [item]
+    )
+    let store = UpdatesFeatureStore()
+
+    store.rebuild(report: report, searchQuery: "", filter: .attention, ignoredVersions: [:], deferredExpirations: [:])
+    #expect(store.filteredManualItems.map(\.id) == [item.id])
+
+    let key = UpdatesFeatureStore.decisionKey(for: item)
+    store.rebuild(report: report, searchQuery: "", filter: .attention,
+                  ignoredVersions: [key: UpdatesFeatureStore.permanentIgnoreMarker], deferredExpirations: [:])
+    #expect(store.filteredManualItems.isEmpty)
+    #expect(store.ignoredItems.map(\.id) == [item.id])
+}

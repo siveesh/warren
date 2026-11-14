@@ -22,13 +22,16 @@ final class UpdatesFeatureStore: ObservableObject {
         now: Date = .now
     ) {
         let availableItems = report?.availableItems ?? []
+        // Manual-review and error entries can be muted permanently too, so they need an "ignored" home.
+        let reviewItems = (report?.items ?? []).filter { $0.status == .manualCheck || $0.status == .error }
         let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
 
         deferredItems = availableItems.filter { Self.isDeferred($0, deferredExpirations: deferredExpirations, now: now) }
-        ignoredItems = availableItems.filter {
+        ignoredItems = (availableItems + reviewItems).filter {
             Self.isIgnored($0, ignoredVersions: ignoredVersions)
                 && !Self.isDeferred($0, deferredExpirations: deferredExpirations, now: now)
         }
+        let ignoredReviewIDs = Set(reviewItems.filter { Self.isIgnored($0, ignoredVersions: ignoredVersions) }.map(\.id))
         activeAvailableItems = availableItems.filter {
             !Self.isIgnored($0, ignoredVersions: ignoredVersions)
                 && !Self.isDeferred($0, deferredExpirations: deferredExpirations, now: now)
@@ -36,6 +39,10 @@ final class UpdatesFeatureStore: ObservableObject {
 
         let activeIDs = Set(activeAvailableItems.map(\.id))
         let filtered = (report?.items ?? []).filter { item in
+            if ignoredReviewIDs.contains(item.id) {
+                return false
+            }
+
             let matchesFilter: Bool
             switch filter {
             case .attention:
@@ -101,8 +108,12 @@ final class UpdatesFeatureStore: ObservableObject {
             return false
         }
 
-        return ignoredVersion == item.normalizedLatestVersion
+        return ignoredVersion == permanentIgnoreMarker || ignoredVersion == item.normalizedLatestVersion
     }
+
+    /// Stored in place of a version number when every update for the app is muted.
+    static let permanentIgnoreMarker = "*"
+
 
     static func isDeferred(
         _ item: AppUpdateItem,
