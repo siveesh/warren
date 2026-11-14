@@ -11,5 +11,9 @@
         <key>com.siveesh.skmole.privilegedhelper</key>
         <true/>
     </dict>
+    <key>AssociatedBundleIdentifiers</key>
+    <array>
+        <string>com.siveesh.skmole</string>
+    </array>
 </dict>
 </plist>

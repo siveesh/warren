@@ -41,6 +41,12 @@ final class AppLibrary {
 
     private let removal: RemovalService
     var removalEngine: TrashService { removal.engine }
+    private func recordAdministrator(for app: PeelCore.InstalledApp) -> @Sendable (TrashResult) async -> Void {
+        { [removal] result in
+            await removal.record(result, source: "Uninstall \(app.name) (administrator)", tool: "uninstaller")
+        }
+    }
+
     /// Whether items that need administrator rights can be selected: only when the user allows asking for them.
     private var canUseHelper: Bool { AdministratorRights.current == .askEachTime }
 
@@ -223,7 +229,7 @@ final class AppLibrary {
             var adminFailures: [(url: URL, reason: String)] = []
 
             if appNeedsAdmin {
-                let outcome = await AdministratorRemoval.moveToTrash([plan.app.url], engine: removal.engine)
+                let outcome = await AdministratorRemoval.moveToTrash([plan.app.url], engine: removal.engine, recording: recordAdministrator(for: app))
                 adminMoved += outcome.moved
                 adminFailures += outcome.failures
                 if outcome.cancelled { adminLines.append("Administrator approval was cancelled, so nothing was moved.") }
@@ -235,7 +241,7 @@ final class AppLibrary {
 
                 let leftovers = privileged.subtracting([plan.app.url])
                 if !leftovers.isEmpty {
-                    let outcome = await AdministratorRemoval.moveToTrash(Array(leftovers), engine: removal.engine)
+                    let outcome = await AdministratorRemoval.moveToTrash(Array(leftovers), engine: removal.engine, recording: recordAdministrator(for: app))
                     adminMoved += outcome.moved
                     adminFailures += outcome.failures
                     if outcome.cancelled { adminLines.append("Administrator approval was cancelled for the system-owned items.") }

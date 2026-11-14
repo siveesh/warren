@@ -28,10 +28,10 @@ public enum FixedSentence: CaseIterable, Sendable {
     /// History keeps the words a removal was refused in.
     var englishBefore: [String] {
         switch self {
-        case .helperOutOfDate: ["Peel’s helper is out of date. Reinstall it in Settings."]
+        case .helperOutOfDate: ["Warren’s helper is out of date. Reinstall it in Settings."]
         case .leadsSomewhere: ["It still leads to something on this Mac."]
         case .declaredTwice: ["Two files declare this job."]
-        case .helperUnavailable: ["Peel’s helper isn’t available."]
+        case .helperUnavailable: ["Warren’s helper isn’t available."]
         default: []
         }
     }

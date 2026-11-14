@@ -54,6 +54,46 @@ final class HomebrewToolsLibrary {
     private(set) var isExporting = false
     private(set) var errorMessage: String?
 
+    private let removal: RemovalService
+
+    init(removal: RemovalService) {
+        self.removal = removal
+    }
+
+    /// Casks Homebrew still lists although the apps they installed are gone, so it keeps counting them installed.
+    private(set) var goneCasks: [HomebrewPackage] = []
+    private(set) var hasCheckedForGoneCasks = false
+    private(set) var isCheckingForGoneCasks = false
+    private(set) var isForgetting = false
+    private(set) var forgetMessage: String?
+
+    func findGoneCasks() async {
+        guard !isCheckingForGoneCasks else { return }
+        isCheckingForGoneCasks = true
+        forgetMessage = nil
+        let installed = (try? await Homebrew.installedPackages()) ?? []
+        goneCasks = installed.filter { $0.kind == .cask && $0.isMissingWhatItInstalled }
+        hasCheckedForGoneCasks = true
+        isCheckingForGoneCasks = false
+    }
+
+    /// Moves Homebrew's record of each gone cask to the Trash, which History can put back.
+    func forgetGoneCasks() async {
+        guard !isForgetting, !goneCasks.isEmpty else { return }
+        isForgetting = true
+        let result = await HomebrewReceipt.forget(goneCasks, exclusions: removal.exclusions)
+        await removal.record(result, source: "Forget gone Homebrew casks", tool: "homebrew")
+        let names = goneCasks.count
+        if result.failures.isEmpty {
+            forgetMessage = "Homebrew no longer lists \(names) cask\(names == 1 ? "" : "s") whose apps are gone."
+        } else {
+            forgetMessage = "Some records could not be moved: " + result.failures.prefix(3)
+                .map { "\($0.url.lastPathComponent): \(RemovalFailureText.describe($0.reason))" }.joined(separator: "; ")
+        }
+        isForgetting = false
+        await findGoneCasks()
+    }
+
     func loadInstallation() async {
         installation = await Homebrew.installation()
         hasLoadedInstallation = true

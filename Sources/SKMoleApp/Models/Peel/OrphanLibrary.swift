@@ -139,7 +139,9 @@ final class OrphanLibrary {
         if !privileged.isEmpty, canUseAdministrator {
             // Checked again against the installed apps, as for the rest, before the approved batch moves.
             let still = await scanner.stillOrphaned(privileged, installedApps: installed, remembered: remembered)
-            let outcome = await AdministratorRemoval.moveToTrash(still.map(\.url), engine: removal.engine)
+            let outcome = await AdministratorRemoval.moveToTrash(still.map(\.url), engine: removal.engine) { [removal] result in
+                await removal.record(result, source: "Orphaned files (administrator)", tool: "orphans")
+            }
             moved += outcome.moved.count
             lines += outcome.failures.prefix(4).map { "\($0.url.lastPathComponent): \($0.reason)" }
             if outcome.cancelled { lines.append("Administrator approval was cancelled, so system-owned items stayed.") }

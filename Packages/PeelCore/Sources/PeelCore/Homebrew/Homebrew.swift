@@ -1124,6 +1124,21 @@ public enum Homebrew {
         ).transcript()
     }
 
+    /// Installs `cask`, or with `adopting` lets Homebrew take over the copy of its app already in place, which keeps
+    /// the app and its settings and only has Homebrew manage it from then on. Adopting works only when the copy is
+    /// the very build the cask installs.
+    @concurrent
+    public static func install(
+        _ cask: HomebrewPackage,
+        adopting: Bool,
+        onOutput: @escaping @Sendable (Data) -> Void
+    ) async throws(CommandFailure) -> String {
+        let arguments = Self.arguments(["install", "--cask"] + (adopting ? ["--adopt"] : []), naming: [cask.fullName])
+        return try await execute(
+            arguments, autoUpdate: true, timeout: nil, inWritingOrder: true, onOutput: onOutput, changesApps: true
+        ).transcript()
+    }
+
     /// Upgrades `packages` the same way.
     @concurrent
     public static func upgrade(

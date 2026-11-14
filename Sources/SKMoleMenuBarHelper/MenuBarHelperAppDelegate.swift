@@ -6,6 +6,7 @@ import SKMoleShared
 @MainActor
 final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let sampler = MenuBarHelperSampler()
+    private let widgetFeed = WidgetFeed()
     private let settingsStore = MenuBarCompanionSettingsStore()
     private let alertEvaluator = MenuBarAlertEvaluator()
     private let updateStatusStore = AppUpdateStatusStore()
@@ -28,7 +29,8 @@ final class MenuBarHelperAppDelegate: NSObject, NSApplicationDelegate, NSPopover
         lastSettingsLoadDate = .now
         refreshSharedUpdateSummary(force: true)
 
-        sampler.start { [weak self] snapshot in
+        sampler.start { [weak self, widgetFeed] snapshot in
+            widgetFeed.offer(snapshot)
             Task { @MainActor [weak self] in
                 self?.apply(snapshot: snapshot)
             }

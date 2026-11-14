@@ -51,7 +51,7 @@ public struct CaskEvidence: Sendable, Hashable {
     /// number (`@19`), and none when no line is. A channel (`@esr`, `@beta`) is no older major line: where a product
     /// has only those beside the plain token, a copy behind the plain one is on it. A copy whose version can't be
     /// read gets the plain one.
-    static func cask(for app: InstalledApp, in casks: [HomebrewPackage]) -> HomebrewPackage? {
+    public static func cask(for app: InstalledApp, in casks: [HomebrewPackage]) -> HomebrewPackage? {
         let proving = casks.filter { proves($0, isThe: app) }
         if let installed = proving.first(where: { $0.installedVersion != nil }) { return installed }
         guard proving.count > 1 else { return proving.first }

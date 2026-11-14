@@ -1023,7 +1023,16 @@ final class AppModel: ObservableObject {
         return library
     }()
     private(set) lazy var intelLibrary = IntelLibrary(apps: appLibrary, removal: guardService)
-    private(set) lazy var homebrewTools = HomebrewToolsLibrary()
+    private(set) lazy var homebrewTools = HomebrewToolsLibrary(removal: guardService)
+    private(set) lazy var caskReplacement: CaskReplacementLibrary = {
+        let library = CaskReplacementLibrary(removal: guardService)
+        library.onChanged = { [weak self] in
+            guard let self else { return }
+            await self.refreshHomebrew()
+            await self.refreshAfterAppRemoval()
+        }
+        return library
+    }()
     private(set) lazy var packageLibrary = PackageLibrary(removal: guardService)
 
     private func makeHistoryLibrary() -> HistoryLibrary {
@@ -2016,9 +2025,19 @@ final class AppModel: ObservableObject {
         privilegedHelperError = nil
 
         do {
+            if privilegedHelperState.requiresApproval {
+                // macOS already holds the registration and waits for the person to allow it. Registering it afresh makes
+                // macOS post its approval notice again, and Login Items is where it is allowed.
+                try? await PrivilegedHelper.repair()
+                privilegedHelperState = privilegedHelper.status()
+                PrivilegedHelper.openLoginItemsSettings()
+                privilegedHelperError = "Turn on Warren in Login Items & Extensions, then choose Refresh Status."
+                privilegedHelperBusy = false
+                return
+            }
             if privilegedHelperState.isEnabled, privilegedHelperReachability == "Unavailable" {
-                _ = try privilegedHelper.unregister()
-                privilegedHelperState = try privilegedHelper.register()
+                try await PrivilegedHelper.repair()
+                privilegedHelperState = privilegedHelper.status()
                 optimizationLogs.insert(
                     OptimizationLog(
                         actionTitle: "Reinstall Privileged Helper",
@@ -2029,7 +2048,8 @@ final class AppModel: ObservableObject {
                     at: 0
                 )
             } else if !privilegedHelperState.isEnabled {
-                privilegedHelperState = try privilegedHelper.register()
+                try await PrivilegedHelper.register()
+                privilegedHelperState = privilegedHelper.status()
                 optimizationLogs.insert(
                     OptimizationLog(
                         actionTitle: "Register Privileged Helper",

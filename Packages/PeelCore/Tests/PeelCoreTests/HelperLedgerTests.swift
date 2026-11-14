@@ -443,7 +443,7 @@ struct HelperLedgerTests {
         }
         #expect(origins.map { $0 != nil } == [false, true, true])
         #expect(
-            HelperRefusal.notInRecord.rawValue.hasPrefix("Peel’s helper has no record of moving this from there"),
+            HelperRefusal.notInRecord.rawValue.hasPrefix("Warren’s helper has no record of moving this from there"),
             "the helper moved a.plist, and its Put Back would say it didn't"
         )
 

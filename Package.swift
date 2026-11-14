@@ -22,6 +22,10 @@ let package = Package(
         .executable(
             name: "SKMoleMenuBarHelper",
             targets: ["SKMoleMenuBarHelper"]
+        ),
+        .executable(
+            name: "SKMoleWidgets",
+            targets: ["SKMoleWidgets"]
         )
     ],
     dependencies: [
@@ -52,8 +56,18 @@ let package = Package(
         ),
         .executableTarget(
             name: "SKMolePrivilegedHelper",
-            dependencies: ["SKMoleShared"],
-            path: "Sources/SKMolePrivilegedHelper"
+            dependencies: [
+                "SKMoleShared",
+                .product(name: "PeelPrivileged", package: "PeelCore")
+            ],
+            path: "Sources/SKMolePrivilegedHelper",
+            linkerSettings: [
+                // The helper's signature binds this Info.plist, and the app requires a build no older than the helper's.
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
+                    "-Xlinker", "Resources/Bundling/PrivilegedHelper-Info.plist"
+                ])
+            ]
         ),
         .executableTarget(
             name: "SKMoleMenuBarHelper",
@@ -64,6 +78,15 @@ let package = Package(
                 .product(name: "RelayUI", package: "RelayKit")
             ],
             path: "Sources/SKMoleMenuBarHelper"
+        ),
+        .executableTarget(
+            name: "SKMoleWidgets",
+            dependencies: ["SKMoleShared"],
+            path: "Sources/SKMoleWidgets",
+            linkerSettings: [
+                // A widget extension starts in the extension runtime, not in main.
+                .unsafeFlags(["-Xlinker", "-e", "-Xlinker", "_NSExtensionMain"])
+            ]
         ),
         .testTarget(
             name: "SKMoleAppTests",

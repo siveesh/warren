@@ -61,8 +61,3 @@ public enum PrivilegedMaintenanceTask: String, CaseIterable, Identifiable, Senda
         }
     }
 }
-
-@objc public protocol PrivilegedHelperXPCProtocol {
-    func ping(withReply reply: @escaping (String) -> Void)
-    func runTask(identifier: String, withReply reply: @escaping (Bool, String) -> Void)
-}

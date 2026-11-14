@@ -50,5 +50,24 @@ hdiutil create \
     -format UDZO \
     "$DMG_PATH"
 
+# Sign the disk image with the same Developer ID identity the app was signed with.
+SIGN_IDENTITY="$(codesign -dvv "$APP_PATH" 2>&1 | sed -n 's/^Authority=\(Developer ID Application: .*\)$/\1/p' | head -1)"
+if [[ -n "$SIGN_IDENTITY" ]]; then
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp "$DMG_PATH"
+    codesign --verify --verbose=2 "$DMG_PATH"
+    echo "Signed DMG with: $SIGN_IDENTITY"
+
+    # Notarize and staple when a notarytool keychain profile is named (xcrun notarytool store-credentials).
+    if [[ -n "${SKMOLE_NOTARY_PROFILE:-}" ]]; then
+        xcrun notarytool submit "$DMG_PATH" --keychain-profile "$SKMOLE_NOTARY_PROFILE" --wait
+        xcrun stapler staple "$DMG_PATH"
+        xcrun stapler validate "$DMG_PATH"
+    else
+        echo "Not notarized: set SKMOLE_NOTARY_PROFILE to a notarytool keychain profile to notarize and staple."
+    fi
+else
+    echo "Not signed: the app is not signed with a Developer ID Application identity."
+fi
+
 echo "Built DMG at:"
 echo "  $DMG_PATH"

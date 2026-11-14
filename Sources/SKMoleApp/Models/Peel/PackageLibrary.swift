@@ -112,7 +112,9 @@ final class PackageLibrary {
         }
 
         if !privileged.isEmpty, canUseAdministrator {
-            let outcome = await AdministratorRemoval.moveToTrash(privileged, engine: removal.engine)
+            let outcome = await AdministratorRemoval.moveToTrash(privileged, engine: removal.engine) { [removal] result in
+                await removal.record(result, source: "Package files (administrator)", tool: "packages")
+            }
             moved += outcome.moved.count
             lines += outcome.failures.prefix(4).map { "\($0.url.lastPathComponent): \($0.reason)" }
             if outcome.cancelled { lines.append("Administrator approval was cancelled, so system-owned items stayed.") }
@@ -147,7 +149,9 @@ final class PackageLibrary {
                 let files = ["bom", "plist"]
                     .map { folder.appendingPathComponent("\(receipt.identifier).\($0)") }
                     .filter { FileManager.default.fileExists(atPath: $0.path) }
-                let outcome = await AdministratorRemoval.moveToTrash(files, engine: removal.engine)
+                let outcome = await AdministratorRemoval.moveToTrash(files, engine: removal.engine) { [removal] result in
+                    await removal.record(result, source: "Forget receipt \(receipt.name ?? receipt.identifier) (administrator)", tool: "packages")
+                }
                 moved += outcome.moved.count
                 lines += outcome.failures.prefix(4).map { "\($0.url.lastPathComponent): \($0.reason)" }
                 if outcome.cancelled { lines.append("Administrator approval was cancelled.") }

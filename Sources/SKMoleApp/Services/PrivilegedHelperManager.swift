@@ -1,4 +1,5 @@
 import Foundation
+import PeelCore
 import ServiceManagement
 import SKMoleShared
 
@@ -168,138 +169,25 @@ struct PrivilegedHelperManager: Sendable {
     }
 
     nonisolated func ping() async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            let bridge = XPCReplyBridge<String>(continuation: continuation)
-            let connection = configuredConnection()
-            bridge.connection = connection
-            bridge.startTimeout(seconds: 5)
-            connection.invalidationHandler = { [weak bridge] in
-                bridge?.fail(PrivilegedHelperError.connectionInvalidated)
-            }
-            connection.interruptionHandler = { [weak bridge] in
-                bridge?.fail(PrivilegedHelperError.connectionInterrupted)
-            }
-
-            connection.resume()
-
-            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
-                bridge.fail(error)
-            }) as? PrivilegedHelperXPCProtocol else {
-                bridge.fail(PrivilegedHelperError.invalidProxy)
-                return
-            }
-
-            proxy.ping { reply in
-                bridge.succeed(reply)
-            }
-        }
+        guard await PrivilegedHelper.isResponding() else { throw PrivilegedHelperError.notAnswering }
+        return "ready"
     }
 
     nonisolated func run(_ task: PrivilegedMaintenanceTask) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            let bridge = XPCReplyBridge<String>(continuation: continuation)
-            let connection = configuredConnection()
-            bridge.connection = connection
-            bridge.startTimeout(seconds: 10)
-            connection.invalidationHandler = { [weak bridge] in
-                bridge?.fail(PrivilegedHelperError.connectionInvalidated)
-            }
-            connection.interruptionHandler = { [weak bridge] in
-                bridge?.fail(PrivilegedHelperError.connectionInterrupted)
-            }
-
-            connection.resume()
-
-            guard let proxy = connection.remoteObjectProxyWithErrorHandler({ error in
-                bridge.fail(error)
-            }) as? PrivilegedHelperXPCProtocol else {
-                bridge.fail(PrivilegedHelperError.invalidProxy)
-                return
-            }
-
-            proxy.runTask(identifier: task.rawValue) { succeeded, output in
-                if succeeded {
-                    bridge.succeed(output)
-                } else {
-                    bridge.fail(PrivilegedHelperError.remoteFailure(output))
-                }
-            }
-        }
-    }
-
-    nonisolated private func configuredConnection() -> NSXPCConnection {
-        let connection = NSXPCConnection(
-            machServiceName: PrivilegedHelperConstants.daemonLabel,
-            options: .privileged
-        )
-        connection.remoteObjectInterface = NSXPCInterface(with: PrivilegedHelperXPCProtocol.self)
-        return connection
-    }
-}
-
-private final class XPCReplyBridge<Value: Sendable> {
-    private let lock = NSLock()
-    private var resumed = false
-    private let continuation: CheckedContinuation<Value, Error>
-    private var timeoutWorkItem: DispatchWorkItem?
-    var connection: NSXPCConnection?
-
-    init(continuation: CheckedContinuation<Value, Error>) {
-        self.continuation = continuation
-    }
-
-    func startTimeout(seconds: TimeInterval) {
-        timeoutWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.fail(PrivilegedHelperError.timeout)
-        }
-        timeoutWorkItem = workItem
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + max(seconds, 1), execute: workItem)
-    }
-
-    func succeed(_ value: Value) {
-        resolve {
-            continuation.resume(returning: value)
-        }
-    }
-
-    func fail(_ error: Error) {
-        resolve {
-            continuation.resume(throwing: error)
-        }
-    }
-
-    private func resolve(_ body: () -> Void) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard !resumed else { return }
-        resumed = true
-        timeoutWorkItem?.cancel()
-        connection?.invalidate()
-        body()
+        let answer = await PrivilegedHelper.runMaintenanceTask(task.rawValue)
+        guard answer.succeeded else { throw PrivilegedHelperError.remoteFailure(answer.message) }
+        return answer.message
     }
 }
 
 private enum PrivilegedHelperError: LocalizedError {
-    case invalidProxy
     case remoteFailure(String)
-    case timeout
-    case connectionInterrupted
-    case connectionInvalidated
+    case notAnswering
 
     var errorDescription: String? {
         switch self {
-        case .invalidProxy:
-            "The privileged helper connection could not be created."
-        case let .remoteFailure(message):
-            message
-        case .timeout:
-            "The privileged helper did not respond in time."
-        case .connectionInterrupted:
-            "The privileged helper connection was interrupted."
-        case .connectionInvalidated:
-            "The privileged helper connection was invalidated."
+        case let .remoteFailure(message): message
+        case .notAnswering: "The privileged helper did not answer. Reinstall it from Optimize."
         }
     }
 }

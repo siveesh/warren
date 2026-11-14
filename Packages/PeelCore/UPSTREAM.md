@@ -23,3 +23,6 @@ a test file that needs the CLI target).
 Also removed (depended on removed tests): SystemSettingsStep, TargetSize, TerminalThemeLedger, PrivateDatabase, InflectionMarkup, LinkedText tests.
 - `Support/PeelFolder.swift`: data folder is `Library/Application Support/SK Mole/Engine` instead of `.../Peel`.
 - `Sources/PeelPrivileged/ProtectedData.swift`: `aiModelFolders` (local AI model folders) added to `homeTrees`, so every removal path refuses them.
+- `Sources/PeelPrivileged/HelperInterface.swift`: Warren's identifiers (`com.siveesh.skmole`, `com.siveesh.skmole.privilegedhelper`), protocol version 24, and `runMaintenanceTask` (DNS flush, local snapshot thinning, daily periodic).
+- `Sources/PeelCore/Removal/PrivilegedHelper.swift`: `runMaintenanceTask(_:)` for those tasks.
+- `Homebrew/Homebrew.swift`: `install(_:adopting:onOutput:)` (brew install --cask, optionally `--adopt`). `Homebrew/CaskEvidence.swift`: `cask(for:in:)` is public.

@@ -99,7 +99,7 @@ struct OptimizeView: View {
     private var helperSection: some View {
         SectionCard(
             title: "Privileged helper",
-            subtitle: "Admin-only maintenance is isolated into a narrow launch daemon with a fixed task allow-list and no arbitrary command execution.",
+            subtitle: "A narrow launch daemon for the two things that need root: a fixed list of maintenance tasks, and moving root-owned items to your Trash (apps, leftovers, receipts) after you approve them. It runs no arbitrary command and answers only Warren itself, checked by its code signature.",
             symbol: "lock.shield"
         ) {
             VStack(alignment: .leading, spacing: 14) {
@@ -154,7 +154,7 @@ struct OptimizeView: View {
             return model.privilegedHelperReachability == "Unavailable" ? "Reinstall Helper" : "Re-check Helper"
         }
 
-        return "Register Helper"
+        return model.privilegedHelperState.requiresApproval ? "Open Login Items" : "Register Helper"
     }
 
     private func adminTaskCard(_ task: PrivilegedMaintenanceTask) -> some View {

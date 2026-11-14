@@ -4,12 +4,12 @@ import ServiceManagement
 import Synchronization
 
 public enum PrivilegedHelper {
-    static let unavailable = "Peel’s helper isn’t answering. Repair it in Peel’s Settings."
+    static let unavailable = "Warren’s helper isn’t answering. Repair it in Warren’s Optimize page."
     /// What is said of an item a helper's answer leaves out, which is no sign the helper didn't answer.
-    static let saidNothing = "Peel’s helper said nothing about this one, so Peel doesn’t know what became of it."
+    static let saidNothing = "Warren’s helper said nothing about this one, so Peel doesn’t know what became of it."
     /// What is said of an item still in its place when the helper's answer never came: a helper held up in a move
     /// may still take it, and a line written before the request brings it into History once Peel opens again.
-    static let mayStillMove = "Peel’s helper didn’t answer in time, so whether it moved this isn’t known. If it did, History lists it the next time Peel opens."
+    static let mayStillMove = "Warren’s helper didn’t answer in time, so whether it moved this isn’t known. If it did, History lists it the next time Peel opens."
 
     public enum Status: Sendable, Equatable {
         case notRegistered
@@ -360,6 +360,22 @@ public enum PrivilegedHelper {
         }
     }
 
+    /// Runs one of Warren's fixed maintenance tasks as root. Replies with whether it worked, and what it said.
+    @concurrent
+    public static func runMaintenanceTask(_ identifier: String) async -> (succeeded: Bool, message: String) {
+        let answer: HelperTaskReply = await withHelper(
+            fallback: HelperTaskReply(succeeded: false, message: Self.unavailable),
+            refused: HelperTaskReply(succeeded: false, message: HelperRefusal.notAuthorized.rawValue)
+        ) { helper, approval, finish in
+            helper.runMaintenanceTask(
+                version: HelperIdentity.protocolVersion, approval: approval, identifier: identifier
+            ) { succeeded, message in
+                finish(HelperTaskReply(succeeded: succeeded, message: message))
+            }
+        }
+        return (answer.succeeded, answer.message)
+    }
+
     /// The folder the helper keeps its ledger in: root's, so only the helper can move it.
     public static var ledgerFolder: URL {
         URL(filePath: HelperLedger.defaultFolder, directoryHint: .isDirectory)
@@ -525,6 +541,11 @@ public enum PrivilegedHelper {
     }
 }
 
+struct HelperTaskReply: Sendable {
+    let succeeded: Bool
+    let message: String
+}
+
 struct HelperTrashReply: Sendable {
     let moved: [String: String]
     let failed: [String: String]
@@ -538,5 +559,12 @@ private final class ResumeOnce: Sendable {
             defer { hasResumed = true }
             return !hasResumed
         }
+    }
+}
+
+extension TrashedItem {
+    /// An item moved to the Trash by something other than the engine, such as an administrator's `mv`, as History keeps it.
+    public static func moved(from original: URL, to trashed: URL) -> TrashedItem {
+        TrashedItem(originalURL: original, trashedURL: trashed, date: .now, identity: .init(ofItemAt: trashed))
     }
 }

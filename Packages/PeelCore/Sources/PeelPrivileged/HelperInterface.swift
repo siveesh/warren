@@ -1,13 +1,13 @@
 public import Foundation
 
 public enum HelperIdentity {
-    public static let appIdentifier = "com.tuguidragos.Peel"
-    public static let helperIdentifier = "com.tuguidragos.Peel.Helper"
-    public static let machServiceName = "com.tuguidragos.Peel.Helper"
-    public static let launchdPlistName = "com.tuguidragos.Peel.Helper.plist"
+    public static let appIdentifier = "com.siveesh.skmole"
+    public static let helperIdentifier = "com.siveesh.skmole.privilegedhelper"
+    public static let machServiceName = "com.siveesh.skmole.privilegedhelper"
+    public static let launchdPlistName = "com.siveesh.skmole.privilegedhelper.plist"
     /// Raise it whenever the helper changes, so Peel never works with a helper of another version. The helper
     /// refuses requests that carry any other version.
-    public static let protocolVersion = 23
+    public static let protocolVersion = 24
 }
 
 /// The complete set of privileged operations. The helper validates every argument itself.
@@ -47,6 +47,15 @@ public enum HelperIdentity {
         fromTrashPath trashPath: String,
         toPath destination: String,
         withReply reply: @escaping @Sendable (String?) -> Void
+    )
+
+    /// Runs one of Warren's fixed maintenance tasks (`PrivilegedMaintenanceTask`) by its identifier. Replies with
+    /// whether it worked and what it printed, or why it did not.
+    func runMaintenanceTask(
+        version: Int,
+        approval: Data,
+        identifier: String,
+        withReply reply: @escaping @Sendable (Bool, String) -> Void
     )
 
     /// Moves the helper's own ledger to the user's Trash, for Remove Peel just before it unregisters the helper, which

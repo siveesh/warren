@@ -102,6 +102,9 @@ final class MenuBarCompanionManager {
     }
 
     func registerForLaunchAtLogin() throws {
+        // A registration macOS already holds, waiting for the person's approval, answers "Operation not permitted" to
+        // another one. The status line says approval is needed, and Login Items is where it is given.
+        guard loginItemService.status != .requiresApproval else { return }
         try loginItemService.register()
     }
 
