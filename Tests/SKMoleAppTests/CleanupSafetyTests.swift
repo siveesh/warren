@@ -401,3 +401,52 @@ private let sparkleFixture = """
     #expect(ids.fileExtension.isEmpty)
     #expect(ids.suggestedBaseName == "Brewfile")
 }
+
+// MARK: Developer Cleanup
+
+@Test func simulatorRuntimeListIsParsedFromSimctlOutput() {
+    let output = """
+    == Disk Images ==
+    -- iOS --
+    iOS 17.5 (21F79) - 3F9A1C2E-7B6D-4E5A-9C1D-2A8B4D6E7F10
+      State: Ready
+      Size: 7.2G
+      Last Used At: 2026-05-01
+    watchOS 10.4 (21T198) - 9A8B7C6D-5E4F-3A2B-1C0D-E9F8A7B6C5D4
+      State: Ready
+      Size: 1.1G
+    """
+    let runtimes = SimulatorRuntimeParser.parse(output)
+    #expect(runtimes.count == 2)
+    #expect(runtimes[0].title == "iOS 17.5 (21F79)")
+    #expect(runtimes[0].size == "7.2G")
+    #expect(runtimes[0].lastUsed == "2026-05-01")
+    #expect(runtimes[1].platform == "watchOS")
+    #expect(runtimes[1].lastUsed == "Never")
+}
+
+@Test func developerCleanupSectionIsWiredIntoTheDeveloperGroup() {
+    #expect(SidebarSection.developerCleanup.group == .developer)
+    #expect(SidebarGroup.developer.sections.contains(.developerCleanup))
+    #expect(SidebarSection(urlSlug: "xcode") == .developerCleanup)
+    #expect(!SidebarSection.developerCleanup.title.isEmpty)
+}
+
+@Test @MainActor func developerCleanupLeavesOutModelsAndEditorState() {
+    let shown = DeveloperCleanupLibrary.shownKinds
+    #expect(shown.contains(.deviceSupport) && shown.contains(.archives) && shown.contains(.buildData))
+    #expect(!shown.contains(.models))
+    #expect(!shown.contains(.projectState))
+    #expect(!shown.contains(.environments))
+}
+
+@Test @MainActor func developerCleanupRemembersProjectFolders() {
+    let suite = "warren-dev-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set(["/Users/test/Code"], forKey: "developerCleanup.projectFolders")
+
+    let library = DeveloperCleanupLibrary(removal: RemovalService(), exclusions: ExclusionsLibrary(), defaults: defaults)
+    #expect(library.projectFolders.map(\.path) == ["/Users/test/Code"])
+    #expect(library.selected.isEmpty)
+}

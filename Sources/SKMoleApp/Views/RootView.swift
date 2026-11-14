@@ -170,6 +170,8 @@ struct RootView: View {
             OptimizeView(model: model)
         case .history:
             RemovalHistoryView(model: model)
+        case .developerCleanup:
+            DeveloperCleanupView(model: model)
         }
     }
 

@@ -19,6 +19,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
     case storage
     case optimize
     case history
+    case developerCleanup
 
     var id: String { rawValue }
 
@@ -42,6 +43,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .storage: "Storage"
         case .optimize: "Optimize"
         case .history: "History"
+        case .developerCleanup: "Developer Cleanup"
         }
     }
 
@@ -65,6 +67,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .storage: "internaldrive"
         case .optimize: "bolt.badge.clock"
         case .history: "clock.arrow.circlepath"
+        case .developerCleanup: "hammer"
         }
     }
 
@@ -88,6 +91,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .storage: "Surface heavy folders and large files"
         case .optimize: "Refresh caches and user-facing system services"
         case .history: "Everything Warren moved to the Trash, with a way back"
+        case .developerCleanup: "Xcode DerivedData, archives, Device Support, simulators and build folders, one item at a time"
         }
     }
 
@@ -111,6 +115,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .storage: "9"
         case .optimize: "0"
         case .history: "h"
+        case .developerCleanup: "j"
         }
     }
 
@@ -152,6 +157,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
             self = .optimize
         case "history", "removals", "undo":
             self = .history
+        case "developer-cleanup", "developer", "xcode", "derived-data":
+            self = .developerCleanup
         default:
             return nil
         }
@@ -184,7 +191,7 @@ enum SidebarGroup: String, CaseIterable, Hashable, Identifiable {
         case .overview: [.dashboard, .smartCare, .updates]
         case .apps: [.uninstall, .orphans, .intel, .packages, .quarantine]
         case .storage: [.cleanup, .storage, .fileIntelligence]
-        case .developer: [.homebrew, .github, .relay]
+        case .developer: [.developerCleanup, .homebrew, .github, .relay]
         case .system: [.network, .processes, .optimize, .history]
         }
     }
