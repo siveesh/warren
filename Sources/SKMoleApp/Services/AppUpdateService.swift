@@ -7,7 +7,7 @@ actor AppUpdateService {
 
     private static let selfBundleIdentifier = "com.siveesh.skmole"
     private static let selfRepositoryOwner = "siveesh"
-    private static let selfRepositoryName = "sk-mole"
+    private static let selfRepositoryName = "warren"
     private static let selfRepositoryPath = "\(selfRepositoryOwner)/\(selfRepositoryName)"
 
     private let fileManager = FileManager.default
