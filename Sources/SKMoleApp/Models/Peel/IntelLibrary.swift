@@ -12,8 +12,10 @@ final class IntelLibrary {
     private(set) var isScanning = false
 
     private let apps: AppLibrary
+    private let removal: RemovalService
 
-    init(apps: AppLibrary) {
+    init(apps: AppLibrary, removal: RemovalService) {
+        self.removal = removal
         self.apps = apps
     }
 
@@ -36,9 +38,10 @@ final class IntelLibrary {
 
         if apps.apps.isEmpty { await apps.rescan() }
         let installed = apps.apps
+        let exclusions = removal.exclusions
 
-        async let backgroundItems = BackgroundItems.scan(installedApps: installed)
-        scan = await IntelInspector.scan(installedApps: installed, backgroundItems: backgroundItems)
+        async let backgroundItems = BackgroundItems.scan(installedApps: installed, exclusions: exclusions)
+        scan = await IntelInspector.scan(installedApps: installed, backgroundItems: backgroundItems, exclusions: exclusions)
         isScanning = false
     }
 }

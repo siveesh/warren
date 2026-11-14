@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import PeelCore
 import RelayAppSupport
 import SKMoleShared
 import UniformTypeIdentifiers
@@ -263,7 +264,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private let guardService = RemovalService()
+    private let guardService: RemovalService = {
+        let service = RemovalService()
+        // Nothing is moved until the saved exclusions have been read.
+        service.setExclusions(.notYetRead)
+        return service
+    }()
+    private(set) lazy var exclusionsLibrary: ExclusionsLibrary = {
+        let library = ExclusionsLibrary()
+        library.onChange = { [guardService] list in guardService.setExclusions(list) }
+        return library
+    }()
     lazy var relayEnvironment = RelayEnvironment()
     private let sizer = DirectorySizer()
     private lazy var cleanupScanner = CleanupScanner(guardService: guardService, sizer: sizer)
@@ -718,6 +729,7 @@ final class AppModel: ObservableObject {
     }
 
     func prepareMainWindow() async {
+        await exclusionsLibrary.loadIfNeeded()
         SKMoleLog.lifecycle.info("Preparing main window")
         syncMenuBarCompanion(launchIfEnabled: menuBarCompanionEnabled)
         refreshFullDiskAccessStatus()
@@ -990,7 +1002,7 @@ final class AppModel: ObservableObject {
 
     /// Refreshes what a removal can change elsewhere in Warren.
     private(set) lazy var historyLibrary: HistoryLibrary = makeHistoryLibrary()
-    private(set) lazy var intelLibrary = IntelLibrary(apps: appLibrary)
+    private(set) lazy var intelLibrary = IntelLibrary(apps: appLibrary, removal: guardService)
     private(set) lazy var homebrewTools = HomebrewToolsLibrary()
     private(set) lazy var packageLibrary = PackageLibrary(removal: guardService)
 
@@ -2200,13 +2212,19 @@ final class AppModel: ObservableObject {
     }
 
     func export(using pluginID: MaintenanceExportPluginID, storageNodeOverride: StorageNode? = nil) async {
-        let context = exportContext(storageNodeOverride: storageNodeOverride)
+        var context = exportContext(storageNodeOverride: storageNodeOverride)
+        if let format = pluginID.inventoryFormat {
+            context.inventory = await buildInventory(for: format)
+        }
 
         do {
             let document = try exportRegistry.export(plugin: pluginID, context: context)
             let formatter = ISO8601DateFormatter()
             let timestamp = formatter.string(from: context.maintenanceReport.createdAt).replacingOccurrences(of: ":", with: "-")
-            let fileName = "\(document.descriptor.suggestedBaseName)-\(timestamp).\(document.descriptor.fileExtension)"
+            // A Brewfile is named just that: `brew bundle` looks for the name, and it has no extension.
+            let fileName = document.descriptor.fileExtension.isEmpty
+                ? document.descriptor.suggestedBaseName
+                : "\(document.descriptor.suggestedBaseName)-\(timestamp).\(document.descriptor.fileExtension)"
 
             let panel = NSSavePanel()
             panel.canCreateDirectories = true
@@ -2437,6 +2455,7 @@ final class AppModel: ObservableObject {
     }
 
     private func loadData(for section: SidebarSection, force: Bool) async {
+        await exclusionsLibrary.loadIfNeeded()
         switch section {
         case .dashboard:
             if force || !hasLoadedCleanup {
@@ -3429,6 +3448,14 @@ final class AppModel: ObservableObject {
             trashedApps: trashedAppSummary,
             menuBarAlerts: alertSummary
         )
+    }
+
+    /// This Mac's apps with where each came from. The Brewfile is Homebrew's own and is asked for only when wanted.
+    private func buildInventory(for format: Inventory.Format) async -> Inventory {
+        if appLibrary.apps.isEmpty { await appLibrary.rescan() }
+        let casks = (try? await Homebrew.installedPackages()) ?? []
+        let brewfile = format == .brewfile ? await homebrewTools.brewfile() : nil
+        return await InventoryBuilder.build(apps: appLibrary.apps, casks: casks, brewfile: brewfile)
     }
 
     private func exportContext(storageNodeOverride: StorageNode? = nil) -> MaintenanceExportContext {

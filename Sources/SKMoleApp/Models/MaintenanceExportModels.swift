@@ -1,4 +1,5 @@
 import Foundation
+import PeelCore
 import UniformTypeIdentifiers
 
 enum MaintenanceExportPluginID: String, CaseIterable, Identifiable, Hashable {
@@ -7,6 +8,10 @@ enum MaintenanceExportPluginID: String, CaseIterable, Identifiable, Hashable {
     case overviewText
     case focusedStorageJSON
     case networkSnapshotJSON
+    case inventoryJSON
+    case inventoryCSV
+    case inventoryText
+    case inventoryBrewfile
 
     var id: String { rawValue }
 }
@@ -31,6 +36,10 @@ struct MaintenanceExportPluginDescriptor: Identifiable, Hashable {
             return "Warren-Storage-Focus"
         case .networkSnapshotJSON:
             return "Warren-Network-Snapshot"
+        case .inventoryJSON, .inventoryCSV, .inventoryText:
+            return "Warren-App-Inventory"
+        case .inventoryBrewfile:
+            return "Brewfile"
         }
     }
 }
@@ -41,6 +50,7 @@ struct MaintenanceExportContext {
     let storageFocusConfiguration: StorageFocusConfiguration
     let networkReport: NetworkInspectorReport?
     let metrics: SystemMetricSnapshot
+    var inventory: Inventory?
 }
 
 struct MaintenanceExportDocument {

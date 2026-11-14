@@ -127,12 +127,12 @@ final class AppLibrary {
         let installed = apps
         switch mode {
         case .uninstall:
-            let plan = await Uninstallation.prepare(app, installedApps: installed)
+            let plan = await Uninstallation.prepare(app, installedApps: installed, exclusions: removal.exclusions)
             guard selectedURL == url, mode == .uninstall else { return }
             uninstallation = plan
             selection = plan.suggestedSelection(canUseHelper: canUseHelper)
         case .reset:
-            let plan = await AppReset.prepare(app, installedApps: installed)
+            let plan = await AppReset.prepare(app, installedApps: installed, exclusions: removal.exclusions)
             guard selectedURL == url, mode == .reset else { return }
             reset = plan
             selection = plan.suggestedSelection
@@ -246,7 +246,7 @@ final class AppLibrary {
             report(result, appName: app.name, adminMoved: adminMoved.count, adminFailures: adminFailures, adminLines: adminLines)
         case .reset:
             guard let plan = reset else { break }
-            let outcome = await plan.run(selection, resettingPrivacy: resetPrivacy, exclusions: .none, isOpen: { false })
+            let outcome = await plan.run(selection, resettingPrivacy: resetPrivacy, exclusions: removal.exclusions, isOpen: { false })
             await removal.record(outcome.result, source: "Reset \(app.name)", tool: "uninstaller", sizes: [:])
             report(outcome.result, appName: app.name, stop: outcome.stop.map { "\($0)" })
         }
@@ -323,7 +323,7 @@ extension AppLibrary {
                 instance.terminate()
             }
 
-            let plan = await Uninstallation.prepare(app, installedApps: apps)
+            let plan = await Uninstallation.prepare(app, installedApps: apps, exclusions: removal.exclusions)
             let selection = plan.suggestedSelection(canUseHelper: false)  // bulk never asks for administrator rights
             guard !selection.isEmpty else {
                 failures.append("\(app.name): nothing could be removed.")

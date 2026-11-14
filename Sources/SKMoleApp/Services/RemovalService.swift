@@ -12,13 +12,27 @@ struct GuardedFileIdentity: Equatable, Sendable {
 /// guard: it decides what is never removed, journals every move for History and Put Back, and checks each item again
 /// right before it moves. `RemovalScope` only limits where a feature may look.
 final class RemovalService: Sendable {
-    let engine: TrashService
+    private let baseEngine: TrashService
+    private let current: Mutex<(engine: TrashService, exclusions: Exclusions)>
     private let scope: RemovalScope
     private let profile = Mutex<CleanupSafetyProfile>(.balanced)
 
     init(engine: TrashService = TrashService(), scope: RemovalScope = RemovalScope()) {
-        self.engine = engine
+        self.baseEngine = engine
+        self.current = Mutex((engine, .none))
         self.scope = scope
+    }
+
+    /// The engine, judging by the exclusions as they stand.
+    var engine: TrashService { current.withLock { $0.engine } }
+
+    /// What the user told Warren to leave alone. Until the saved list has been read (`.notYetRead`) or when it cannot
+    /// be read, the engine refuses every move.
+    var exclusions: Exclusions { current.withLock { $0.exclusions } }
+
+    func setExclusions(_ exclusions: Exclusions) {
+        let engine = baseEngine.excluding(exclusions)
+        current.withLock { $0 = (engine, exclusions) }
     }
 
     private let history = RemovalLog()

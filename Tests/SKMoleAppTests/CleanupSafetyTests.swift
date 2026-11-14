@@ -313,3 +313,91 @@ private let sparkleFixture = """
         #expect(service.refusal(of: url) != nil, "\(path) must be refused by the removal guard")
     }
 }
+
+// MARK: Exclusions and inventory
+
+@Test func excludedFoldersAreRefusedByTheRemovalEngine() throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let excluded = home.appending(path: "Library/Caches/com.example.keepme")
+    let other = home.appending(path: "Library/Caches/com.example.other")
+    let service = RemovalService()
+
+    var list = Exclusions.none
+    list.add([excluded])
+    service.setExclusions(list)
+
+    #expect(service.refusal(of: excluded) != nil)
+    #expect(service.refusal(of: excluded.appending(path: "inside.db")) != nil)
+    #expect(service.refusal(of: other) == nil)
+    #expect(service.exclusions.paths.map(\.path) == [excluded.path])
+}
+
+@Test func nothingMovesWhileTheExclusionsAreUnread() {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let target = home.appending(path: "Library/Caches/com.example.anything")
+    let service = RemovalService()
+
+    service.setExclusions(.notYetRead)
+    #expect(service.refusal(of: target) != nil)
+
+    service.setExclusions(.none)
+    #expect(service.refusal(of: target) == nil)
+}
+
+@Test @MainActor func exclusionsLibrarySavesAndReloadsTheList() async throws {
+    let folder = FileManager.default.temporaryDirectory.appending(path: "warren-exclusions-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appending(path: "exclusions.json")
+    let kept = folder.appending(path: "Keep")
+    try FileManager.default.createDirectory(at: kept, withIntermediateDirectories: true)
+
+    let library = ExclusionsLibrary(store: ExclusionStore(url: file))
+    #expect(!library.hasLoaded)
+    await library.load()
+    #expect(library.hasLoaded)
+    #expect(library.paths.isEmpty)
+
+    await library.add(paths: [kept])
+    await library.add(bundleIdentifier: "com.example.app")
+    #expect(library.exclusions.excludes(bundleIdentifier: "com.example.app"))
+    #expect(library.exclusions.excludes(kept.appending(path: "x.txt")))
+
+    let again = ExclusionsLibrary(store: ExclusionStore(url: file))
+    await again.load()
+    #expect(again.appIdentifiers == ["com.example.app"])
+    #expect(again.paths.map(\.path) == [kept.resolvingSymlinksInPath().path] || again.paths.map(\.path) == [kept.path])
+
+    await again.remove(bundleIdentifiers: ["com.example.app"])
+    #expect(again.appIdentifiers.isEmpty)
+}
+
+@Test @MainActor func exclusionsLibraryTellsTheEngineWhenTheListChanges() async throws {
+    let folder = FileManager.default.temporaryDirectory.appending(path: "warren-exclusions-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+
+    let library = ExclusionsLibrary(store: ExclusionStore(url: folder.appending(path: "exclusions.json")))
+    var seen: [Exclusions] = []
+    library.onChange = { seen.append($0) }
+    await library.load()
+    await library.add(bundleIdentifier: "com.example.one")
+    #expect(seen.count == 2)
+    #expect(seen.last?.excludes(bundleIdentifier: "com.example.one") == true)
+}
+
+@Test func inventoryExportsEveryFormatFromTheEngine() throws {
+    #expect(MaintenanceExportPluginID.inventoryJSON.inventoryFormat == .json)
+    #expect(MaintenanceExportPluginID.inventoryCSV.inventoryFormat == .csv)
+    #expect(MaintenanceExportPluginID.inventoryText.inventoryFormat == .text)
+    #expect(MaintenanceExportPluginID.inventoryBrewfile.inventoryFormat == .brewfile)
+    #expect(MaintenanceExportPluginID.dryRunJSON.inventoryFormat == nil)
+
+    let registry = MaintenanceExportRegistry()
+    let empty = Inventory.build(apps: [])
+    #expect(try empty.written(as: .csv).hasPrefix("Name,Bundle Identifier"))
+
+    let ids = registry.descriptor(for: .inventoryBrewfile)
+    #expect(ids.fileExtension.isEmpty)
+    #expect(ids.suggestedBaseName == "Brewfile")
+}

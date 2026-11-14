@@ -41,7 +41,7 @@ final class OrphanLibrary {
         let installed = apps.apps
 
         let remembered = await AppMemory().remember(installed)
-        let result = await OrphanScanner().scan(installedApps: installed, remembered: remembered)
+        let result = await OrphanScanner(exclusions: removal.exclusions).scan(installedApps: installed, remembered: remembered)
         await AppMemory().remember(result.appsOnOtherDisks)
 
         scan = result
@@ -119,7 +119,7 @@ final class OrphanLibrary {
 
         let installed = apps.apps
         let remembered = await AppMemory().load()
-        let scanner = OrphanScanner()
+        let scanner = OrphanScanner(exclusions: removal.exclusions)
         let own = items.filter { !$0.requiresPrivileges }
         let privileged = items.filter(\.requiresPrivileges)
 

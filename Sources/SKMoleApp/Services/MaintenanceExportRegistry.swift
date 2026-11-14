@@ -1,4 +1,6 @@
 import Foundation
+import PeelCore
+import UniformTypeIdentifiers
 
 final class MaintenanceExportRegistry {
     private struct CodableStorageNode: Codable {
@@ -41,6 +43,8 @@ final class MaintenanceExportRegistry {
         if context.networkReport != nil {
             plugins.append(descriptor(for: .networkSnapshotJSON))
         }
+
+        plugins.append(contentsOf: [.inventoryJSON, .inventoryCSV, .inventoryText, .inventoryBrewfile].map { descriptor(for: $0) })
 
         return plugins
     }
@@ -101,6 +105,15 @@ final class MaintenanceExportRegistry {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
             return MaintenanceExportDocument(descriptor: descriptor, data: try encoder.encode(networkReport))
+        case .inventoryJSON, .inventoryCSV, .inventoryText, .inventoryBrewfile:
+            guard let inventory = context.inventory, let format = id.inventoryFormat else {
+                throw NSError(domain: "SKMole.Export", code: 4, userInfo: [NSLocalizedDescriptionKey: "The inventory could not be built."])
+            }
+            do {
+                return MaintenanceExportDocument(descriptor: descriptor, data: Data(try inventory.written(as: format).utf8))
+            } catch is Inventory.HomebrewDidNotAnswer {
+                throw NSError(domain: "SKMole.Export", code: 5, userInfo: [NSLocalizedDescriptionKey: "Homebrew did not answer, so there is no Brewfile to write. An empty one would read as a Mac with nothing to install."])
+            }
         }
     }
 
@@ -151,6 +164,14 @@ final class MaintenanceExportRegistry {
                 fileExtension: "json",
                 contentType: .json
             )
+        case .inventoryJSON:
+            return MaintenanceExportPluginDescriptor(id: id, title: "App Inventory (JSON)", subtitle: "Every installed app with version, where it came from, architectures and dates, for a record or to set up a new Mac.", icon: "square.stack.3d.up", fileExtension: "json", contentType: .json)
+        case .inventoryCSV:
+            return MaintenanceExportPluginDescriptor(id: id, title: "App Inventory (CSV)", subtitle: "The same inventory as a spreadsheet, with formula-looking names made safe.", icon: "tablecells", fileExtension: "csv", contentType: .commaSeparatedText)
+        case .inventoryText:
+            return MaintenanceExportPluginDescriptor(id: id, title: "App Inventory (Text)", subtitle: "One line per app: name, version and source.", icon: "list.bullet.rectangle", fileExtension: "txt", contentType: .plainText)
+        case .inventoryBrewfile:
+            return MaintenanceExportPluginDescriptor(id: id, title: "Brewfile", subtitle: "Homebrew's own list of taps, formulae and casks, to rebuild this Mac with brew bundle.", icon: "mug", fileExtension: "", contentType: .data)
         }
     }
 

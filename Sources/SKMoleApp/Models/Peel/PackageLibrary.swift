@@ -43,7 +43,7 @@ final class PackageLibrary {
     func refresh() async {
         guard !isScanning else { return }
         isScanning = true
-        let scan = await PackageReceipts.list()
+        let scan = await PackageReceipts.list(exclusions: removal.exclusions)
         receipts = scan.receipts
         couldNotAsk = scan.couldNotAsk
         if let selectedID, !scan.receipts.contains(where: { $0.id == selectedID }) {
@@ -155,7 +155,7 @@ final class PackageLibrary {
                 lines.append("Forgetting this receipt needs administrator rights, which are turned off in Settings.")
             }
         } else {
-            let result = await PackageActions.forget(receipt)
+            let result = await PackageActions.forget(receipt, exclusions: removal.exclusions)
             await removal.record(result, source: "Forget receipt \(receipt.name ?? receipt.identifier)", tool: "packages")
             moved += result.trashed.count
             lines += result.failures.prefix(4).map { "\($0.url.lastPathComponent): \(RemovalFailureText.describe($0.reason))" }

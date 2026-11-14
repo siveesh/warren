@@ -504,6 +504,8 @@ struct SettingsView: View {
                     }
                 }
 
+                ExclusionsCard(library: model.exclusionsLibrary, apps: model.appLibrary)
+
                 SectionCard(
                     title: "Export Plugins",
                     subtitle: "Exporters are loaded only when you use them, so Warren can stay richer without paying the startup cost every time.",
