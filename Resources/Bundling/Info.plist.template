@@ -10,6 +10,8 @@
     <string>Warren</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>Warren</string>
     <key>CFBundleIdentifier</key>
     <string>com.siveesh.skmole</string>
     <key>CFBundleInfoDictionaryVersion</key>

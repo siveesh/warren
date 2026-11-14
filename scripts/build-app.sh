@@ -45,7 +45,18 @@ APP_BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$INFO_TEMPLATE
 
 mkdir -p "$DIST_DIR"
 
-if [[ -f "$SOURCE_ICON" ]]; then
+# The app icon is an Icon Composer document (layers, dark and tinted appearances, Liquid Glass). actool compiles it to
+# Assets.car, which macOS 26 reads, and an .icns for the DMG and older readers.
+ICON_DOCUMENT="$ROOT_DIR/Warren.icon"
+ICON_BUILD_DIR="$DIST_DIR/icon-build"
+ASSET_CATALOG=""
+if [[ -d "$ICON_DOCUMENT" ]]; then
+    rm -rf "$ICON_BUILD_DIR" && mkdir -p "$ICON_BUILD_DIR"
+    xcrun actool "$ICON_DOCUMENT" --compile "$ICON_BUILD_DIR" --platform macosx --minimum-deployment-target 26.0 \
+        --app-icon Warren --output-partial-info-plist "$ICON_BUILD_DIR/partial.plist" >/dev/null
+    cp "$ICON_BUILD_DIR/Warren.icns" "$ICON_PATH"
+    ASSET_CATALOG="$ICON_BUILD_DIR/Assets.car"
+elif [[ -f "$SOURCE_ICON" ]]; then
     "$ROOT_DIR/scripts/build-icon.sh" "$SOURCE_ICON"
 fi
 
@@ -115,12 +126,20 @@ if [[ -s "$CONST_LIST" ]] && xcrun --find appintentsmetadataprocessor >/dev/null
 fi
 rm -rf "$INTENTS_TMP"
 
+# About window marks and the user guide shown by Help > Warren Help.
+cp "$ROOT_DIR/Resources/About/Logo1.png" "$ROOT_DIR/Resources/About/Logo2.png" "$RESOURCES_DIR/"
+cp "$ROOT_DIR/Help.md" "$RESOURCES_DIR/Help.md"
+
 mkdir -p "$RESOURCES_DIR/Licenses"
 cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/NOTICE.md" "$RESOURCES_DIR/Licenses/"
 
 if [[ -f "$ICON_PATH" ]]; then
     cp "$ICON_PATH" "$RESOURCES_DIR/AppIcon.icns"
     cp "$ICON_PATH" "$MENU_BAR_HELPER_RESOURCES_DIR/AppIcon.icns"
+    if [[ -n "$ASSET_CATALOG" ]]; then
+        cp "$ASSET_CATALOG" "$RESOURCES_DIR/Assets.car"
+        cp "$ASSET_CATALOG" "$MENU_BAR_HELPER_RESOURCES_DIR/Assets.car"
+    fi
 fi
 
 if [[ -d "$LOCALIZATION_DIR" ]]; then

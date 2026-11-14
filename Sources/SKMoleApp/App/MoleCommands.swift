@@ -13,6 +13,14 @@ struct MoleCommands: Commands {
             }
         }
 
+        CommandGroup(replacing: .help) {
+            Button("Warren Help") {
+                openWindow(id: "help-window")
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            .keyboardShortcut("?", modifiers: .command)
+        }
+
         CommandMenu("Sections") {
             ForEach(SidebarSection.allCases) { section in
                 Button(section.title) {

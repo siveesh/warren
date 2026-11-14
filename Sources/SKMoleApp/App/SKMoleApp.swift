@@ -25,6 +25,10 @@ struct SKMoleApp: App {
             AboutView()
         }
         .windowResizability(.contentSize)
-        .defaultSize(width: 440, height: 420)
+
+        Window("Warren Help", id: "help-window") {
+            HelpView()
+        }
+        .defaultSize(width: 720, height: 680)
     }
 }

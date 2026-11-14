@@ -1,56 +1,75 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
 import SwiftUI
 
+/// The About window: the maker's two marks, the app icon, version, credits and contact links.
 struct AboutView: View {
+    @Environment(\.colorScheme) private var colorScheme
+
     private var versionLabel: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
-        return "Version \(version) (\(build))"
+        return "Version \(version) (Build \(build))"
     }
 
     var body: some View {
-        VStack(spacing: 20) {
-            Image(nsImage: NSApp.applicationIconImage)
-                .resizable()
-                .interpolation(.high)
-                .frame(width: 96, height: 96)
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        ZStack {
+            Rectangle().fill(.ultraThinMaterial).ignoresSafeArea()
+            VStack(spacing: 22) {
+                HStack(spacing: 32) {
+                    logo("Logo1", inverted: false)
+                    Divider().frame(height: 74).opacity(0.3)
+                    // The portrait is black line art, so it is inverted in dark mode to stay visible.
+                    logo("Logo2", inverted: colorScheme == .dark)
+                }
+                .accessibilityHidden(true)
 
-            VStack(spacing: 8) {
-                Text("Warren")
-                    .font(.system(size: 30, weight: .bold, design: .rounded))
+                VStack(spacing: 6) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFit()
+                        .frame(width: 64, height: 64)
+                        .accessibilityHidden(true)
+                    Text("Warren")
+                        .font(.system(size: 28, weight: .bold, design: .rounded))
+                    Text("Maintenance, cleanup, uninstall and system insight for your Mac.")
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    Text(versionLabel)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
 
-                Text("Native macOS maintenance, cleanup, uninstall, storage insight, and live system monitoring.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-
-                Text(versionLabel)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                VStack(spacing: 8) {
+                    Text("© 2026 Siveesh Kodapully")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 14) {
+                        Link("www.siveesh.com", destination: URL(string: "https://www.siveesh.com")!)
+                        Text("•").foregroundStyle(.tertiary)
+                        Link("siveesh@learnwithsk.com", destination: URL(string: "mailto:siveesh@learnwithsk.com")!)
+                    }
+                    .font(.callout)
+                    Text("Free software under the GNU GPL, version 3 or later. Includes code from Peel by Țugui Dragoș-Constantin.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 4)
+                }
             }
-
-            Divider()
-
-            VStack(alignment: .leading, spacing: 10) {
-                aboutRow(title: "Developer", value: "Siveesh Kodapully")
-                aboutRow(title: "Focus", value: "Safe previews, Trash-first actions, and efficient native performance")
-                aboutRow(title: "Appearance", value: "Supports system-wide light and dark mode")
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(36)
         }
-        .padding(28)
-        .frame(width: 440)
-        .background(AppPalette.canvas)
+        .frame(width: 480, height: 500)
     }
 
-    private func aboutRow(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title.uppercased())
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.headline)
+    @ViewBuilder
+    private func logo(_ name: String, inverted: Bool) -> some View {
+        if let url = Bundle.main.url(forResource: name, withExtension: "png"), let image = NSImage(contentsOf: url) {
+            let view = Image(nsImage: image).resizable().scaledToFit().frame(width: 100, height: 100)
+            if inverted { view.colorInvert() } else { view }
+        } else {
+            Color.clear.frame(width: 100, height: 100)
         }
     }
 }
