@@ -12,14 +12,14 @@ actor CleanupScanner {
         let roots: [URL]
     }
 
-    private let guardService: SystemGuard
+    private let guardService: RemovalService
     private let sizer: DirectorySizer
     private let fileManager = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser
     private let installerExtensions: Set<String> = ["dmg", "pkg", "xip", "iso"]
     private var profile: CleanupSafetyProfile = .balanced
 
-    init(guardService: SystemGuard, sizer: DirectorySizer) {
+    init(guardService: RemovalService, sizer: DirectorySizer) {
         self.guardService = guardService
         self.sizer = sizer
     }
@@ -29,7 +29,7 @@ actor CleanupScanner {
         progress: @escaping @Sendable (ScanProgress) async -> Void = { _ in }
     ) async -> [CleanupCategorySummary] {
         self.profile = profile
-        await guardService.setCleanupProfile(profile)
+        guardService.setCleanupProfile(profile)
         await sizer.pruneMissingEntries()
 
         var rules = [

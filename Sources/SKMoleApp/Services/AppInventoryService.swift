@@ -3,11 +3,11 @@ import Foundation
 
 actor AppInventoryService {
     private let fileManager = FileManager.default
-    private let guardService: SystemGuard
+    private let guardService: RemovalService
     private let sizer: DirectorySizer
     private let home = FileManager.default.homeDirectoryForCurrentUser
 
-    init(guardService: SystemGuard, sizer: DirectorySizer) {
+    init(guardService: RemovalService, sizer: DirectorySizer) {
         self.guardService = guardService
         self.sizer = sizer
     }
@@ -75,7 +75,7 @@ actor AppInventoryService {
             ?? normalized.deletingPathExtension().lastPathComponent
         let size = await sizer.size(of: normalized)
         let running = bundleIdentifier.flatMap { !NSRunningApplication.runningApplications(withBundleIdentifier: $0).isEmpty } ?? false
-        let protected = await guardService.isProtectedApplication(normalized, bundleIdentifier: bundleIdentifier)
+        let protected = SystemProtection.isProtectedApplication(normalized, bundleIdentifier: bundleIdentifier)
 
         return InstalledApp(
             name: name,

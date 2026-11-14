@@ -18,7 +18,7 @@ actor StorageAnalyzer {
         let requiresAdminContext: Bool
     }
 
-    private let guardService: SystemGuard
+    private let guardService: RemovalService
     private let sizer: DirectorySizer
     private let fileManager = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser
@@ -28,7 +28,7 @@ actor StorageAnalyzer {
     private let maxChildrenPerNode = 8
     private let minimumExplorerNodeSize: UInt64 = 64 * 1_024 * 1_024
 
-    init(guardService: SystemGuard, sizer: DirectorySizer) {
+    init(guardService: RemovalService, sizer: DirectorySizer) {
         self.guardService = guardService
         self.sizer = sizer
     }

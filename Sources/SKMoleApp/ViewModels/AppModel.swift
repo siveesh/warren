@@ -278,7 +278,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private let guardService = SystemGuard()
+    private let guardService = RemovalService()
     lazy var relayEnvironment = RelayEnvironment()
     private let sizer = DirectorySizer()
     private lazy var cleanupScanner = CleanupScanner(guardService: guardService, sizer: sizer)
@@ -690,7 +690,6 @@ final class AppModel: ObservableObject {
     }
 
     init() {
-        PeelRemovalGate.install()
         let defaults = UserDefaults.standard
         let lastSelection = defaults.string(forKey: PreferenceKey.lastSelectedSection).flatMap(SidebarSection.init(rawValue:))
         let startupPreference = defaults.string(forKey: PreferenceKey.startupPreference).flatMap(StartupPreference.init(rawValue:)) ?? .rememberLast
@@ -869,13 +868,13 @@ final class AppModel: ObservableObject {
         cleanupBusy = true
         cleanupError = nil
         let profile = cleanupSafetyProfile
-        await guardService.setCleanupProfile(profile)
+        guardService.setCleanupProfile(profile)
 
         var failures: [String] = []
         for candidate in candidates {
             do {
                 if profile.removesPermanently(candidate) {
-                    try await guardService.removePermanently(candidate.url, purpose: .cleanup)
+                    try guardService.removePermanently(candidate.url, purpose: .cleanup)
                 } else {
                     try await guardService.moveToTrash(candidate.url, purpose: .cleanup)
                 }
@@ -1946,7 +1945,7 @@ final class AppModel: ObservableObject {
         homebrewError = nil
 
         do {
-            try await guardService.removePermanently(URL(fileURLWithPath: path.path), purpose: .developerTooling)
+            try guardService.removePermanently(URL(fileURLWithPath: path.path), purpose: .developerTooling)
 
             homebrewLogs.insert(
                 OptimizationLog(

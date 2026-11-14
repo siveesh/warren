@@ -4,9 +4,9 @@ import SKMoleShared
 
 actor ProcessInspectorService {
     private let sampler = NativeProcessSampler()
-    private let guardService: SystemGuard
+    private let guardService: RemovalService
 
-    init(guardService: SystemGuard) {
+    init(guardService: RemovalService) {
         self.guardService = guardService
     }
 
@@ -15,7 +15,7 @@ actor ProcessInspectorService {
     }
 
     func terminate(_ process: NativeProcessActivity) async throws -> ProcessTerminationResult {
-        guard await guardService.canTerminate(process: process) else {
+        guard SystemProtection.canTerminateSnapshot(process) else {
             throw NSError(
                 domain: "SKMole.Processes",
                 code: 1,
@@ -33,7 +33,7 @@ actor ProcessInspectorService {
         }
 
         guard matchesSelectedProcess(liveProcess, selected: process),
-              await guardService.canTerminate(process: liveProcess) else {
+              SystemProtection.canTerminateSnapshot(liveProcess) else {
             throw NSError(
                 domain: "SKMole.Processes",
                 code: 2,

@@ -56,7 +56,7 @@ struct CleanupCategorySummary: Identifiable, Hashable {
 
 /// User-selectable trade-off between cleanup convenience and caution.
 /// Hard limits (system roots, Keychains, Mail, `.ssh`, symlinks, ...) are enforced by
-/// `SystemGuard` regardless of the profile.
+/// `RemovalService` regardless of the profile.
 enum CleanupSafetyProfile: String, CaseIterable, Hashable, Identifiable {
     case cautious
     case balanced

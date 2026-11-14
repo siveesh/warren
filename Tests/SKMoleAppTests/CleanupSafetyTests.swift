@@ -61,7 +61,7 @@ private func candidate(_ path: String, safety: SafetyLevel) -> CleanupCandidate 
 @Test func extendedCleanupRootsOnlyApplyToRelaxedProfiles() async {
     let home = FileManager.default.homeDirectoryForCurrentUser
     let cargo = home.appendingPathComponent(".cargo/registry/cache/index.crate")
-    let guardService = SystemGuard()
+    let guardService = RemovalService()
 
     await guardService.setCleanupProfile(.cautious)
     #expect(await guardService.canOperate(on: cargo, purpose: .cleanup) == false)
@@ -78,7 +78,7 @@ private func candidate(_ path: String, safety: SafetyLevel) -> CleanupCandidate 
         home.appendingPathComponent("Library/Keychains/login.keychain-db"),
         home.appendingPathComponent("Library/Mail/V10/x")
     ]
-    let guardService = SystemGuard()
+    let guardService = RemovalService()
 
     for profile in CleanupSafetyProfile.allCases {
         await guardService.setCleanupProfile(profile)
@@ -197,12 +197,4 @@ private let sparkleFixture = """
     #expect(restored.isExpanded(.apps))
     #expect(!restored.visibleSections(in: .storage, selection: .dashboard).contains(.cleanup))
     #expect(restored.visibleSections(in: .storage, selection: .cleanup).contains(.cleanup))
-}
-
-@Test func systemGuardNeverTouchRulesAreSharedWithThePeelGate() {
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    #expect(SystemGuard.isNeverTouched(home.appendingPathComponent(".ssh/id_ed25519")))
-    #expect(SystemGuard.isNeverTouched(home.appendingPathComponent("Library/Keychains/login.keychain-db")))
-    #expect(SystemGuard.isNeverTouched(URL(fileURLWithPath: "/System/Library/CoreServices")))
-    #expect(!SystemGuard.isNeverTouched(home.appendingPathComponent("Library/Caches/com.example.app")))
 }

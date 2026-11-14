@@ -10,7 +10,7 @@ public enum PeelFolder {
     }
 
     static func url(inHome home: URL) -> URL {
-        home.appending(path: "Library/Application Support/Peel", directoryHint: .isDirectory)
+        home.appending(path: "Library/Application Support/SK Mole/Engine", directoryHint: .isDirectory)
     }
 
     /// The folders Remove Peel has taken. Holding this lock across each write lets a write under way finish first.

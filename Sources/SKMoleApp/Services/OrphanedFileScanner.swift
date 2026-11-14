@@ -7,12 +7,12 @@ actor OrphanedFileScanner {
         let minimumSize: UInt64
     }
 
-    private let guardService: SystemGuard
+    private let guardService: RemovalService
     private let sizer: DirectorySizer
     private let fileManager = FileManager.default
     private let home = FileManager.default.homeDirectoryForCurrentUser
 
-    init(guardService: SystemGuard, sizer: DirectorySizer) {
+    init(guardService: RemovalService, sizer: DirectorySizer) {
         self.guardService = guardService
         self.sizer = sizer
     }

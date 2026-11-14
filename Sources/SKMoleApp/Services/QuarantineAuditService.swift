@@ -6,12 +6,12 @@ import SKMoleShared
 
 actor QuarantineAuditService {
     private let fileManager = FileManager.default
-    private let guardService: SystemGuard
+    private let guardService: RemovalService
     private let sizer: DirectorySizer
     private let home = FileManager.default.homeDirectoryForCurrentUser
     private let maxDiscoveredApplications = 2_000
 
-    init(guardService: SystemGuard, sizer: DirectorySizer) {
+    init(guardService: RemovalService, sizer: DirectorySizer) {
         self.guardService = guardService
         self.sizer = sizer
     }

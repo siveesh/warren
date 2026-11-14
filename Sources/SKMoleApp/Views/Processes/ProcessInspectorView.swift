@@ -60,7 +60,7 @@ struct ProcessInspectorView: View {
                             )
                             processMetric(
                                 title: "Terminable",
-                                value: "\(model.processInspectorItems.filter(SystemGuard.canTerminateSnapshot).count)",
+                                value: "\(model.processInspectorItems.filter(SystemProtection.canTerminateSnapshot).count)",
                                 detail: "user-owned and non-system"
                             )
                             if let top = model.filteredProcessInspectorItems.first {
@@ -140,7 +140,7 @@ private struct ProcessInspectorRow: View {
                     Text(process.name)
                         .font(.headline)
 
-                    if SystemGuard.canTerminateSnapshot(process) {
+                    if SystemProtection.canTerminateSnapshot(process) {
                         Pill(title: "Terminable", tint: AppPalette.accent)
                     } else {
                         Pill(title: "Protected", tint: AppPalette.amber)
@@ -180,7 +180,7 @@ private struct ProcessInspectorRow: View {
             ) {
                 Task { await model.terminateProcess(process) }
             }
-            .disabled(!SystemGuard.canTerminateSnapshot(process) || model.processTerminationBusyPID == process.pid)
+            .disabled(!SystemProtection.canTerminateSnapshot(process) || model.processTerminationBusyPID == process.pid)
         }
         .padding(14)
         .background(

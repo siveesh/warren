@@ -11,7 +11,7 @@ Keep edits to vendored files small and listed here so later syncs are a diff
 against the commit above.
 
 ## Local changes
-- `Sources/PeelCore/Removal/ExternalRemovalGate.swift` (new) and one line in `RemovalGuard.judgement(of:typeOf:)` that consults it.
+- `Sources/PeelCore/Removal/RemovalGuard.swift`: refuses anything inside `.git`, `.svn` or `.hg` folders (`isInsideVersionControl`).
 
 Tests removed because they read Peel's repository files (app sources, docs, string
 catalogs, helper plist) that do not exist here: AlertDefaultButton, DebugBuild,
@@ -21,3 +21,4 @@ TerminalTheme, and `safetyMDCountsEveryPlace` in DesktopWalletTests.
 `launchdHasEveryJob` trait copied into `LaunchdJobsTrait.swift` (original lives in
 a test file that needs the CLI target).
 Also removed (depended on removed tests): SystemSettingsStep, TargetSize, TerminalThemeLedger, PrivateDatabase, InflectionMarkup, LinkedText tests.
+- `Support/PeelFolder.swift`: data folder is `Library/Application Support/SK Mole/Engine` instead of `.../Peel`.

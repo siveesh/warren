@@ -351,7 +351,7 @@ struct DashboardView: View {
                     statHeader("Snapshot", "\(model.processInspectorItems.count)", AppPalette.accent)
                     Text(model.processInspectorItems.isEmpty
                         ? "No process snapshot yet."
-                        : "\(model.processInspectorItems.filter(SystemGuard.canTerminateSnapshot).count) processes are safe to terminate from Warren.")
+                        : "\(model.processInspectorItems.filter(SystemProtection.canTerminateSnapshot).count) processes are safe to terminate from Warren.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 

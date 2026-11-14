@@ -193,10 +193,16 @@ struct RemovalGuard: Sendable {
         autoreleasepool { judgement(of: url, typeOf: item) }
     }
 
+    private static let versionControlFolders: Set<String> = [".git", ".svn", ".hg"]
+
+    private static func isInsideVersionControl(_ url: URL) -> Bool {
+        url.pathComponents.contains { versionControlFolders.contains($0.lowercased()) }
+    }
+
     private func judgement(of url: URL, typeOf item: URL?) -> GuardRefusal? {
         guard url.isFileURL else { return .protectedLocation }
-        // Warren: the host app's own veto (see `ExternalRemovalGate`).
-        guard ExternalRemovalGate.allows(url) else { return .protectedLocation }
+        // Warren: nothing inside a version-control directory goes, whatever else allows it.
+        guard !Self.isInsideVersionControl(url) else { return .protectedLocation }
         guard exclusions.isKnown else { return .exclusionsNotKnown }
         let path = Self.normalized(url.path(percentEncoded: false))
         // A path can be written several ways (`/var` for `/private/var`, a different case), and a Put Back
