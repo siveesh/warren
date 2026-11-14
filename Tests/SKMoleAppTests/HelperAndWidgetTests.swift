@@ -3,6 +3,7 @@ import Foundation
 import PeelPrivileged
 import SKMoleShared
 import Testing
+@testable import SKMoleApp
 
 @Suite("Privileged helper and widgets")
 struct HelperAndWidgetTests {
@@ -61,5 +62,36 @@ struct HelperAndWidgetTests {
             let groups = plist?["com.apple.security.application-groups"] as? [String]
             #expect(groups == [WidgetSnapshotStore.appGroup])
         }
+    }
+}
+
+@Suite("Homebrew taps")
+@MainActor
+struct HomebrewTapsTests {
+    @Test func tapNamesAndRemotesAreValidated() {
+        #expect(HomebrewTapsLibrary.isValidName("siveesh/tap"))
+        #expect(HomebrewTapsLibrary.isValidName("homebrew/cask-fonts"))
+        #expect(!HomebrewTapsLibrary.isValidName("--force/tap"))
+        #expect(!HomebrewTapsLibrary.isValidName("one"))
+        #expect(!HomebrewTapsLibrary.isValidName("a/b/c"))
+        #expect(!HomebrewTapsLibrary.isValidName("a b/c"))
+        #expect(HomebrewTapsLibrary.isValidRemote("https://github.com/siveesh/homebrew-tap"))
+        #expect(HomebrewTapsLibrary.isValidRemote("git@github.com:siveesh/homebrew-tap.git"))
+        #expect(!HomebrewTapsLibrary.isValidRemote("--upload-pack=evil"))
+        #expect(!HomebrewTapsLibrary.isValidRemote("file:///etc"))
+        #expect(!HomebrewTapsLibrary.isValidRemote("https://x y"))
+    }
+
+    @Test func tapInfoIsReadThroughWarnings() {
+        let output = """
+        Warning: something
+        [{"name":"amir1376/tap","official":false,"trusted":true,"remote":"https://github.com/amir1376/homebrew-tap",
+        "custom_remote":false,"private":false,"formula_names":[],"cask_tokens":["amir1376/tap/ab-download-manager"],
+        "branch":"master","last_commit":"3 weeks ago"},{"name":"homebrew/core","official":true}]
+        """
+        let taps = HomebrewTapsLibrary.parse(output)
+        #expect(taps.count == 2)
+        #expect(taps[0].trusted && taps[0].packageCount == 1)
+        #expect(taps[1].official && !taps[1].trusted && taps[1].remote == nil)
     }
 }

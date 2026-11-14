@@ -16,6 +16,7 @@ struct HomebrewView: View {
                 maintenanceSection
                 doctorSection
                 HomebrewToolsView(model: model)
+                HomebrewTapsView(model: model)
                 HomebrewAppsView(model: model)
 
                 HStack(alignment: .top, spacing: 22) {

@@ -264,7 +264,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private let guardService: RemovalService = {
+    let guardService: RemovalService = {
         let service = RemovalService()
         // Nothing is moved until the saved exclusions have been read.
         service.setExclusions(.notYetRead)
@@ -288,8 +288,8 @@ final class AppModel: ObservableObject {
     private lazy var networkInspector = NetworkInspectorService()
     private lazy var processInspector = ProcessInspectorService(guardService: guardService)
     private lazy var quarantineAudit = QuarantineAuditService(guardService: guardService, sizer: sizer)
-    private lazy var homebrewService = HomebrewService()
-    private lazy var gitHubCLIService = GitHubCLIService()
+    lazy var homebrewService = HomebrewService()
+    lazy var gitHubCLIService = GitHubCLIService()
     private let updateService = AppUpdateService()
     private let updateStatusStore = AppUpdateStatusStore()
     private let magikaService = MagikaService()
@@ -329,7 +329,7 @@ final class AppModel: ObservableObject {
     private var processRequestID = UUID()
     private var quarantineRequestID = UUID()
     private var homebrewRequestID = UUID()
-    private var homebrewSearchRequestID = UUID()
+    var homebrewSearchRequestID = UUID()
     private var gitHubCLIRequestID = UUID()
     private var magikaRequestID = UUID()
     private var startupItemsRequestID = UUID()
@@ -342,7 +342,7 @@ final class AppModel: ObservableObject {
     private var processTask: Task<[NativeProcessActivity], Never>?
     private var quarantineTask: Task<[QuarantinedApplication], Never>?
     private var homebrewTask: Task<HomebrewInventory, Never>?
-    private var homebrewSearchTask: Task<[HomebrewPackageSearchResult], Never>?
+    var homebrewSearchTask: Task<[HomebrewPackageSearchResult], Never>?
     private var gitHubCLITask: Task<GitHubCLIInventory, Never>?
     private var magikaTask: Task<MagikaScanReport?, Never>?
     private var startupItemsTask: Task<[StartupItem], Never>?
@@ -1024,6 +1024,7 @@ final class AppModel: ObservableObject {
     }()
     private(set) lazy var intelLibrary = IntelLibrary(apps: appLibrary, removal: guardService)
     private(set) lazy var homebrewTools = HomebrewToolsLibrary(removal: guardService)
+    private(set) lazy var homebrewTaps = HomebrewTapsLibrary()
     private(set) lazy var caskReplacement: CaskReplacementLibrary = {
         let library = CaskReplacementLibrary(removal: guardService)
         library.onChanged = { [weak self] in
@@ -1594,284 +1595,6 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.open(MagikaStatus.repositoryURL)
     }
 
-    func openMagikaInHomebrew() async {
-        let magikaResult = HomebrewPackageSearchResult.featured.first(where: { $0.reference == MagikaStatus.homebrewReference })
-            ?? HomebrewPackageSearchResult(
-                reference: MagikaStatus.homebrewReference,
-                displayName: "Magika",
-                description: "AI-powered file content type detection",
-                source: "Recommended formula",
-                bundleIdentifier: nil
-            )
-
-        await selectHomebrewSearchResult(magikaResult)
-    }
-
-    func searchHomebrewPackages() async {
-        homebrewSearchTask?.cancel()
-        let requestID = UUID()
-        homebrewSearchRequestID = requestID
-        homebrewSearchBusy = true
-        homebrewError = nil
-
-        let query = homebrewSearchQuery
-        let service = homebrewService
-        let task = Task { [requestID] in
-            do {
-                return try await service.searchPackages(query: query)
-            } catch {
-                await MainActor.run {
-                    guard self.homebrewSearchRequestID == requestID else { return }
-                    self.homebrewError = error.localizedDescription
-                }
-
-                return HomebrewPackageSearchResult.featured
-            }
-        }
-        homebrewSearchTask = task
-
-        let results = await task.value
-        guard homebrewSearchRequestID == requestID else { return }
-
-        homebrewSearchResults = results
-        homebrewSearchBusy = false
-        homebrewSearchTask = nil
-    }
-
-    /// `navigate: false` pre-selects the package without switching sections, for background loads
-    /// (for example while the Updates tab refreshes Homebrew).
-    func selectHomebrewInstalledPackage(_ package: HomebrewInstalledPackage, navigate: Bool = true) async {
-        if navigate {
-            selection = .homebrew
-        }
-        homebrewSelectedPackageDetail = nil
-        homebrewSelectedFallbackResult = HomebrewPackageSearchResult(
-            reference: package.reference,
-            displayName: package.displayName,
-            description: package.description,
-            source: "Installed package",
-            bundleIdentifier: nil
-        )
-        await loadHomebrewPackageDetail(for: package.reference)
-    }
-
-    func selectHomebrewSearchResult(_ result: HomebrewPackageSearchResult) async {
-        selection = .homebrew
-        homebrewSelectedPackageDetail = nil
-        homebrewSelectedFallbackResult = result
-        await loadHomebrewPackageDetail(for: result.reference)
-    }
-
-    func openHomebrewInstallGuide() {
-        NSWorkspace.shared.open(HomebrewStatus.installGuideURL)
-    }
-
-    func launchHomebrewInstallerInTerminal() {
-        homebrewError = nil
-        launchTerminalCommand(HomebrewStatus.installCommand) { [weak self] message in
-            self?.homebrewError = message
-        }
-    }
-
-    func openHomebrewHomepage() {
-        guard let url = selectedHomebrewDetail?.homepage else {
-            return
-        }
-
-        NSWorkspace.shared.open(url)
-    }
-
-    func refreshGitHubCLI() async {
-        await loadGitHubCLI(force: true)
-    }
-
-    func installGitHubCLI() async {
-        guard homebrewStatus.isInstalled else {
-            gitHubCLIError = "Install Homebrew first, then Warren can install GitHub CLI with brew."
-            return
-        }
-
-        let log = await executeHomebrewCommand(
-            arguments: ["install", "gh"],
-            actionTitle: "Install GitHub CLI",
-            actionID: "install:gh-cli"
-        )
-
-        if log.succeeded {
-            await loadGitHubCLI(force: true)
-        }
-    }
-
-    /// Saves a new personal access token to the Keychain via `gh`, then refreshes the account status.
-    func updateGitHubToken(_ token: String) async -> Bool {
-        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            gitHubCLIError = "Paste a token first."
-            return false
-        }
-
-        gitHubCLIError = nil
-        gitHubCLIBusy = true
-        let log = await gitHubCLIService.storeToken(trimmed)
-        gitHubCLIBusy = false
-
-        guard log.succeeded else {
-            gitHubCLIError = log.output
-            return false
-        }
-
-        await loadGitHubCLI(force: true)
-        return true
-    }
-
-    func launchGitHubCLILoginInTerminal() {
-        gitHubCLIError = nil
-        launchTerminalCommand(GitHubCLIStatus.authCommand) { [weak self] message in
-            self?.gitHubCLIError = message
-        }
-    }
-
-    func openGitHubCLIHomepage() {
-        NSWorkspace.shared.open(GitHubCLIStatus.homepageURL)
-    }
-
-    func openGitHubCLILoginGuide() {
-        NSWorkspace.shared.open(GitHubCLIStatus.authGuideURL)
-    }
-
-    func openGitHubPersonalAccessTokenPage() {
-        NSWorkspace.shared.open(GitHubCLIStatus.personalAccessTokenURL)
-    }
-
-    func openGitHubPersonalAccessTokenDocs() {
-        NSWorkspace.shared.open(GitHubCLIStatus.personalAccessTokenDocsURL)
-    }
-
-    /// Relay's palette lives in the menu bar companion, so ask it to open the palette.
-    func openRelayPalette() {
-        RelayShared.requestPalette()
-    }
-
-    func openGitHubRepository(_ repository: GitHubRepositorySummary) {
-        NSWorkspace.shared.open(repository.url)
-    }
-
-    func runHomebrewMaintenance(_ action: HomebrewMaintenanceAction) async {
-        let log = await executeHomebrewCommand(
-            arguments: action.arguments,
-            actionTitle: action.title,
-            actionID: "maintenance:\(action.id)"
-        )
-
-        guard action == .doctor else {
-            return
-        }
-
-        homebrewDoctorLastOutput = log.output
-        homebrewDoctorIssues = HomebrewService.parseDoctorIssues(from: log.output)
-    }
-
-    func installSelectedHomebrewPackage() async {
-        guard let detail = selectedHomebrewDetail else { return }
-        await executeHomebrewCommand(
-            arguments: installationArguments(for: detail.reference),
-            actionTitle: "Install \(detail.displayName)",
-            actionID: "install:\(detail.id)"
-        )
-    }
-
-    func upgradeSelectedHomebrewPackage() async {
-        guard let detail = selectedHomebrewDetail else { return }
-        await executeHomebrewCommand(
-            arguments: upgradeArguments(for: detail.reference),
-            actionTitle: "Upgrade \(detail.displayName)",
-            actionID: "upgrade:\(detail.id)"
-        )
-    }
-
-    func reinstallSelectedHomebrewPackage() async {
-        guard let detail = selectedHomebrewDetail else { return }
-        await executeHomebrewCommand(
-            arguments: reinstallArguments(for: detail.reference),
-            actionTitle: "Reinstall \(detail.displayName)",
-            actionID: "reinstall:\(detail.id)"
-        )
-    }
-
-    func uninstallSelectedHomebrewPackage() async {
-        guard let detail = selectedHomebrewDetail else { return }
-        await executeHomebrewCommand(
-            arguments: uninstallArguments(for: detail.reference),
-            actionTitle: "Uninstall \(detail.displayName)",
-            actionID: "uninstall:\(detail.id)"
-        )
-    }
-
-    func cleanupSelectedHomebrewPackage() async {
-        guard let detail = selectedHomebrewDetail else { return }
-        await executeHomebrewCommand(
-            arguments: ["cleanup", detail.token],
-            actionTitle: "Cleanup \(detail.displayName)",
-            actionID: "cleanup:\(detail.id)"
-        )
-    }
-
-    func runHomebrewServiceAction(_ verb: String, packageToken: String) async {
-        await executeHomebrewCommand(
-            arguments: ["services", verb, packageToken],
-            actionTitle: "brew services \(verb) \(packageToken)",
-            actionID: "service:\(verb):\(packageToken)"
-        )
-    }
-
-    func deleteHomebrewDoctorPath(_ path: HomebrewDoctorIssuePath) async {
-        let actionID = "doctor-delete:\(path.id)"
-        homebrewBusyActionID = actionID
-        homebrewError = nil
-
-        do {
-            try guardService.removePermanently(URL(fileURLWithPath: path.path), purpose: .developerTooling)
-
-            homebrewLogs.insert(
-                OptimizationLog(
-                    actionTitle: "Delete \(path.fileName)",
-                    output: "Removed \(path.path)",
-                    succeeded: true,
-                    timestamp: .now
-                ),
-                at: 0
-            )
-
-            homebrewDoctorIssues = homebrewDoctorIssues.compactMap { issue in
-                let remainingPaths = issue.paths.filter { $0.path != path.path }
-                if issue.paths.isEmpty || remainingPaths.isEmpty {
-                    return nil
-                }
-
-                return HomebrewDoctorIssue(
-                    title: issue.title,
-                    summary: issue.summary,
-                    paths: remainingPaths,
-                    supportingLines: issue.supportingLines
-                )
-            }
-
-            await runHomebrewMaintenance(.doctor)
-        } catch {
-            homebrewError = error.localizedDescription
-            homebrewLogs.insert(
-                OptimizationLog(
-                    actionTitle: "Delete \(path.fileName)",
-                    output: error.localizedDescription,
-                    succeeded: false,
-                    timestamp: .now
-                ),
-                at: 0
-            )
-        }
-
-        homebrewBusyActionID = nil
-    }
 
     func focusStorageVolume(_ volume: StorageVolume) {
         selectedStorageVolumeID = volume.id
@@ -3043,7 +2766,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func loadGitHubCLI(force: Bool) async {
+    func loadGitHubCLI(force: Bool) async {
         if !force {
             guard !hasLoadedGitHubCLI else {
                 return
@@ -3214,7 +2937,7 @@ final class AppModel: ObservableObject {
         return false
     }
 
-    private func loadHomebrewPackageDetail(for reference: HomebrewPackageReference) async {
+    func loadHomebrewPackageDetail(for reference: HomebrewPackageReference) async {
         homebrewSelectedReference = reference
         homebrewDetailBusy = true
 
@@ -3243,7 +2966,7 @@ final class AppModel: ObservableObject {
     }
 
     @discardableResult
-    private func executeHomebrewCommand(
+    func executeHomebrewCommand(
         arguments: [String],
         actionTitle: String,
         actionID: String
@@ -3264,7 +2987,7 @@ final class AppModel: ObservableObject {
         return log
     }
 
-    private func launchTerminalCommand(_ command: String, onError: @escaping (String) -> Void) {
+    func launchTerminalCommand(_ command: String, onError: @escaping (String) -> Void) {
         let tempDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("skmole-terminal", isDirectory: true)
         let scriptURL = tempDirectory.appendingPathComponent("skmole-\(UUID().uuidString).command")
         let script = """
@@ -3312,7 +3035,7 @@ final class AppModel: ObservableObject {
         return MagikaScanTarget(url: normalized, kind: isDirectory.boolValue ? .directory : .file)
     }
 
-    private func installationArguments(for reference: HomebrewPackageReference) -> [String] {
+    func installationArguments(for reference: HomebrewPackageReference) -> [String] {
         switch reference.kind {
         case .formula:
             ["install", reference.token]
@@ -3321,7 +3044,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func upgradeArguments(for reference: HomebrewPackageReference) -> [String] {
+    func upgradeArguments(for reference: HomebrewPackageReference) -> [String] {
         switch reference.kind {
         case .formula:
             ["upgrade", reference.token]
@@ -3330,7 +3053,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func reinstallArguments(for reference: HomebrewPackageReference) -> [String] {
+    func reinstallArguments(for reference: HomebrewPackageReference) -> [String] {
         switch reference.kind {
         case .formula:
             ["reinstall", reference.token]
@@ -3339,7 +3062,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func uninstallArguments(for reference: HomebrewPackageReference) -> [String] {
+    func uninstallArguments(for reference: HomebrewPackageReference) -> [String] {
         switch reference.kind {
         case .formula:
             ["uninstall", reference.token]

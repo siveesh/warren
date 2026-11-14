@@ -49,7 +49,11 @@ if [[ -f "$SOURCE_ICON" ]]; then
     "$ROOT_DIR/scripts/build-icon.sh" "$SOURCE_ICON"
 fi
 
-swift build -c release --package-path "$ROOT_DIR" --product SKMoleApp
+# The const-value output feeds Xcode's App Intents extractor below, which is what makes Shortcuts and Siri see the intents.
+swift build -c release --package-path "$ROOT_DIR" --product SKMoleApp \
+    -Xswiftc -emit-const-values \
+    -Xswiftc -Xfrontend -Xswiftc -const-gather-protocols-file \
+    -Xswiftc -Xfrontend -Xswiftc "$ROOT_DIR/Resources/Bundling/AppIntentsProtocols.json"
 swift build -c release --package-path "$ROOT_DIR" --product SKMolePrivilegedHelper
 swift build -c release --package-path "$ROOT_DIR" --product SKMoleMenuBarHelper
 swift build -c release --package-path "$ROOT_DIR" --product SKMoleWidgets
@@ -88,6 +92,28 @@ cp "$WIDGETS_INFO_TEMPLATE" "$WIDGETS_APPEX_DIR/Contents/Info.plist"
 cp "$MENU_BAR_HELPER_BINARY_PATH" "$MENU_BAR_HELPER_MACOS_DIR/Warren Companion"
 chmod +x "$MENU_BAR_HELPER_MACOS_DIR/Warren Companion"
 cp "$MENU_BAR_HELPER_INFO_TEMPLATE" "$MENU_BAR_HELPER_CONTENTS_DIR/Info.plist"
+
+# App Intents metadata for Shortcuts and Siri.
+INTENTS_TMP="$(mktemp -d)"
+CONST_LIST="$INTENTS_TMP/const.txt"
+find "$ROOT_DIR/.build" -path '*SKMoleApp-p.build*' -name '*.swiftconstvalues' -print > "$CONST_LIST"
+find "$ROOT_DIR/Sources/SKMoleApp" -name '*.swift' -print > "$INTENTS_TMP/sources.txt"
+if [[ -s "$CONST_LIST" ]] && xcrun --find appintentsmetadataprocessor >/dev/null 2>&1; then
+    xcrun appintentsmetadataprocessor \
+        --output "$INTENTS_TMP/out" \
+        --toolchain-dir "$(dirname "$(dirname "$(dirname "$(xcrun --find swiftc)")")")" \
+        --module-name SKMoleApp \
+        --sdk-root "$(xcrun --show-sdk-path)" \
+        --xcode-version "$(xcodebuild -version | tail -1 | awk '{print $3}')" \
+        --platform-family macOS \
+        --deployment-target 26.0 \
+        --target-triple "$(uname -m)-apple-macos26.0" \
+        --source-file-list "$INTENTS_TMP/sources.txt" \
+        --swift-const-vals-list "$CONST_LIST" >/dev/null 2>&1 \
+        && cp -R "$INTENTS_TMP/out/Metadata.appintents" "$RESOURCES_DIR/Metadata.appintents" \
+        || echo "Note: App Intents metadata was not produced; Shortcuts will not list Warren's actions."
+fi
+rm -rf "$INTENTS_TMP"
 
 mkdir -p "$RESOURCES_DIR/Licenses"
 cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/NOTICE.md" "$RESOURCES_DIR/Licenses/"
