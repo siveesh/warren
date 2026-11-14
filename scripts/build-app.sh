@@ -51,6 +51,9 @@ cp "$MENU_BAR_HELPER_BINARY_PATH" "$MENU_BAR_HELPER_MACOS_DIR/Warren Companion"
 chmod +x "$MENU_BAR_HELPER_MACOS_DIR/Warren Companion"
 cp "$MENU_BAR_HELPER_INFO_TEMPLATE" "$MENU_BAR_HELPER_CONTENTS_DIR/Info.plist"
 
+mkdir -p "$RESOURCES_DIR/Licenses"
+cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/NOTICE.md" "$RESOURCES_DIR/Licenses/"
+
 if [[ -f "$ICON_PATH" ]]; then
     cp "$ICON_PATH" "$RESOURCES_DIR/AppIcon.icns"
     cp "$ICON_PATH" "$MENU_BAR_HELPER_RESOURCES_DIR/AppIcon.icns"

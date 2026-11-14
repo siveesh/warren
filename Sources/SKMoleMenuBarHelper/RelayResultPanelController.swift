@@ -91,14 +91,8 @@ private struct RunningView: View {
 }
 
 extension View {
-    /// Liquid Glass on macOS 26 and later, a standard material on earlier releases.
-    @ViewBuilder
+    /// Liquid Glass surface used by Relay's floating panels.
     func relaySurface() -> some View {
-        let shape = RoundedRectangle(cornerRadius: 20, style: .continuous)
-        if #available(macOS 26.0, *) {
-            self.glassEffect(.regular, in: shape)
-        } else {
-            self.background(.ultraThinMaterial, in: shape)
-        }
+        glassEffect(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 }

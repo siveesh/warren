@@ -49,18 +49,10 @@ public struct CommandPaletteView: View {
         .accessibilityLabel("Relay command palette")
     }
 
-    /// Liquid Glass on macOS 26 and later, a standard material on earlier releases.
-    @ViewBuilder
     private var surface: some View {
-        if #available(macOS 26.0, *) {
-            GlassEffectContainer(spacing: 14) { paletteContent }
-                .frame(width: RelayTheme.Metrics.paletteWidth)
-                .glassEffect(.regular.tint(RelayTheme.deepBlue.opacity(0.12)), in: RelayTheme.panelShape)
-        } else {
-            paletteContent
-                .frame(width: RelayTheme.Metrics.paletteWidth)
-                .background(.ultraThinMaterial, in: RelayTheme.panelShape)
-        }
+        GlassEffectContainer(spacing: 14) { paletteContent }
+            .frame(width: RelayTheme.Metrics.paletteWidth)
+            .glassEffect(.regular.tint(RelayTheme.deepBlue.opacity(0.12)), in: RelayTheme.panelShape)
     }
 
     private var paletteContent: some View {

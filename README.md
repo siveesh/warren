@@ -140,3 +140,9 @@ For production helper registration, sign with a real Apple identity:
 ```bash
 SKMOLE_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./scripts/build-app.sh
 ```
+
+## License
+
+Warren is licensed under the GNU General Public License v3.0 or later
+(`LICENSE`). Credits for ported code are in `NOTICE.md`. Warren requires
+macOS 26 or later.

@@ -19,7 +19,7 @@ public struct SudoDetector: Sendable {
 
     public init() {}
 
-    /// The shell snippet a user can run to enable Touch ID for `sudo` (macOS 14+).
+    /// The shell snippet a user can run to enable Touch ID for `sudo`.
     /// Relay shows this as guidance; it never runs it automatically.
     public static let enableGuidanceCommand =
         "echo 'auth       sufficient     pam_tid.so' | sudo tee /etc/pam.d/sudo_local"
