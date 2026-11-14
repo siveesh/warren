@@ -235,3 +235,10 @@ private let sparkleFixture = """
     #expect(HomebrewToolsLibrary.CleanupTier.olderThan30.engine == .olderThan(days: 30))
     #expect(HomebrewToolsLibrary.CleanupTier.everyDownload.engine == .everyDownload)
 }
+
+@Test func historySectionIsWiredIntoTheSystemGroup() {
+    #expect(SidebarSection(urlSlug: "history") == .history)
+    #expect(SidebarSection.history.group == .system)
+    #expect(StartupPreference.history.resolve(lastSelection: nil) == .history)
+    #expect(Set(SidebarSection.allCases.map(\.shortcutKey)).count == SidebarSection.allCases.count)
+}

@@ -168,6 +168,8 @@ struct RootView: View {
             StorageView(model: model)
         case .optimize:
             OptimizeView(model: model)
+        case .history:
+            RemovalHistoryView(model: model)
         }
     }
 

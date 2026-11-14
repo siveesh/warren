@@ -131,6 +131,7 @@ final class OrphanLibrary {
                 own, installedApps: installed, remembered: remembered, scanner: scanner,
                 using: removal.engine, mayUseHelper: false
             )
+            await removal.record(result, source: "Orphaned files", tool: "orphans", sizes: Dictionary(own.compactMap { item in item.size.map { (item.url, $0) } }) { first, _ in first })
             moved += result.trashed.count
             lines += result.failures.prefix(5).map { "\($0.url.lastPathComponent): \(RemovalFailureText.describe($0.reason))" }
         }

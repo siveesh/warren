@@ -21,6 +21,19 @@ final class RemovalService: Sendable {
         self.scope = scope
     }
 
+    private let history = RemovalLog()
+    private let refusalLog = RefusalLog()
+
+    /// Writes what `result` moved into History (the way back) and what it refused into the refusal log. Every
+    /// removal calls this once, with the part of Warren that asked for it.
+    func record(_ result: TrashResult, source: String, tool: String, sizes: [URL: Int64] = [:]) async {
+        let batch = UUID()
+        let part = RemovalPart(source: source, sourceKey: nil, tool: tool)
+        let records = part.records(of: result, sizes: sizes, batch: batch)
+        if !records.isEmpty { _ = await history.add(records) }
+        await refusalLog.add(result.failures, source: source, sourceKey: nil, tool: tool, batch: batch)
+    }
+
     func setCleanupProfile(_ newProfile: CleanupSafetyProfile) {
         profile.withLock { $0 = newProfile }
     }
@@ -39,7 +52,7 @@ final class RemovalService: Sendable {
         return purpose == .analyze || engine.refusal(of: url) == nil
     }
 
-    func moveToTrash(_ url: URL, purpose: GuardPurpose) async throws {
+    func moveToTrash(_ url: URL, purpose: GuardPurpose, size: UInt64? = nil) async throws {
         let normalized = url.standardizedFileURL
         guard scope.allows(normalized, purpose: purpose, profile: currentProfile) else {
             throw RemovalError.outsideScope(normalized.path)
@@ -48,9 +61,25 @@ final class RemovalService: Sendable {
         guard FileManager.default.fileExists(atPath: normalized.path) else { return }
 
         let result = await engine.trash([normalized])
+        await record(result, source: Self.label(for: purpose), tool: Self.tool(for: purpose), sizes: size.map { [normalized: Int64($0)] } ?? [:])
         if let failure = result.failures.first {
             throw RemovalError.refused(RemovalFailureText.describe(failure.reason), normalized.path)
         }
+    }
+
+    static func label(for purpose: GuardPurpose) -> String {
+        switch purpose {
+        case .cleanup: "Cleanup"
+        case .uninstall: "Uninstaller"
+        case .storage: "Storage"
+        case .developerTooling: "Homebrew"
+        case .quarantine: "Quarantine"
+        case .analyze: "Analysis"
+        }
+    }
+
+    static func tool(for purpose: GuardPurpose) -> String {
+        label(for: purpose).lowercased()
     }
 
     /// Deletes for good. Used only where the Trash is no option (emptying the Trash itself, or the profile asks

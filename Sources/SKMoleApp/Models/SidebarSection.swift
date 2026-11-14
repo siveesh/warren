@@ -18,6 +18,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
     case uninstall
     case storage
     case optimize
+    case history
 
     var id: String { rawValue }
 
@@ -40,6 +41,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .uninstall: "Uninstaller"
         case .storage: "Storage"
         case .optimize: "Optimize"
+        case .history: "History"
         }
     }
 
@@ -62,6 +64,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .uninstall: "xmark.app"
         case .storage: "internaldrive"
         case .optimize: "bolt.badge.clock"
+        case .history: "clock.arrow.circlepath"
         }
     }
 
@@ -84,6 +87,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .uninstall: "Remove apps and user-domain remnants safely"
         case .storage: "Surface heavy folders and large files"
         case .optimize: "Refresh caches and user-facing system services"
+        case .history: "Everything Warren moved to the Trash, with a way back"
         }
     }
 
@@ -106,6 +110,7 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .uninstall: "8"
         case .storage: "9"
         case .optimize: "0"
+        case .history: "h"
         }
     }
 
@@ -145,6 +150,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
             self = .storage
         case "optimize":
             self = .optimize
+        case "history", "removals", "undo":
+            self = .history
         default:
             return nil
         }
@@ -178,7 +185,7 @@ enum SidebarGroup: String, CaseIterable, Hashable, Identifiable {
         case .apps: [.uninstall, .orphans, .intel, .packages, .quarantine]
         case .storage: [.cleanup, .storage, .fileIntelligence]
         case .developer: [.homebrew, .github, .relay]
-        case .system: [.network, .processes, .optimize]
+        case .system: [.network, .processes, .optimize, .history]
         }
     }
 }

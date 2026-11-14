@@ -851,7 +851,7 @@ final class AppModel: ObservableObject {
                 if profile.removesPermanently(candidate) {
                     try guardService.removePermanently(candidate.url, purpose: .cleanup)
                 } else {
-                    try await guardService.moveToTrash(candidate.url, purpose: .cleanup)
+                    try await guardService.moveToTrash(candidate.url, purpose: .cleanup, size: candidate.sizeBytes)
                 }
             } catch {
                 failures.append("\(candidate.displayName): \(error.localizedDescription)")
@@ -985,9 +985,16 @@ final class AppModel: ObservableObject {
     }
 
     /// Refreshes what a removal can change elsewhere in Warren.
+    private(set) lazy var historyLibrary: HistoryLibrary = makeHistoryLibrary()
     private(set) lazy var intelLibrary = IntelLibrary(apps: appLibrary)
     private(set) lazy var homebrewTools = HomebrewToolsLibrary()
     private(set) lazy var packageLibrary = PackageLibrary(removal: guardService)
+
+    private func makeHistoryLibrary() -> HistoryLibrary {
+        let library = HistoryLibrary(removal: guardService)
+        library.onRestored = { [weak self] in await self?.refreshAfterAppRemoval() }
+        return library
+    }
 
     private func makeOrphanLibrary() -> OrphanLibrary {
         let library = OrphanLibrary(apps: appLibrary, removal: guardService)
@@ -2464,6 +2471,8 @@ final class AppModel: ObservableObject {
             await loadProcesses(force: force || !hasLoadedProcesses)
         case .quarantine:
             await loadQuarantinedApplications(force: force || !hasLoadedQuarantine)
+        case .history:
+            await historyLibrary.load()
         case .intel:
             await intelLibrary.rescanIfNeeded()
         case .packages:

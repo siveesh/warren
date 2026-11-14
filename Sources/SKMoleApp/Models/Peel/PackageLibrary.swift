@@ -106,6 +106,7 @@ final class PackageLibrary {
 
         if !own.isEmpty {
             let result = await removal.engine.trash(own, usingHelperFor: [])
+            await removal.record(result, source: "Package files", tool: "packages", sizes: Dictionary(items.compactMap { item in item.size.map { (item.url, $0) } }) { first, _ in first })
             moved += result.trashed.count
             lines += result.failures.prefix(5).map { "\($0.url.lastPathComponent): \(RemovalFailureText.describe($0.reason))" }
         }
@@ -155,6 +156,7 @@ final class PackageLibrary {
             }
         } else {
             let result = await PackageActions.forget(receipt)
+            await removal.record(result, source: "Forget receipt \(receipt.name ?? receipt.identifier)", tool: "packages")
             moved += result.trashed.count
             lines += result.failures.prefix(4).map { "\($0.url.lastPathComponent): \(RemovalFailureText.describe($0.reason))" }
         }

@@ -18,6 +18,7 @@ enum StartupPreference: String, CaseIterable, Identifiable {
     case uninstall
     case storage
     case optimize
+    case history
 
     var id: String { rawValue }
 
@@ -40,6 +41,7 @@ enum StartupPreference: String, CaseIterable, Identifiable {
         case .uninstall: "Always open Uninstaller"
         case .storage: "Always open Storage"
         case .optimize: "Always open Optimize"
+        case .history: "Always open History"
         }
     }
 
@@ -79,6 +81,8 @@ enum StartupPreference: String, CaseIterable, Identifiable {
             return .storage
         case .optimize:
             return .optimize
+        case .history:
+            return .history
         }
     }
 }

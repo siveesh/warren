@@ -242,10 +242,12 @@ final class AppLibrary {
                 }
             }
 
+            await removal.record(result, source: "Uninstall \(app.name)", tool: "uninstaller", sizes: sizes(of: plan))
             report(result, appName: app.name, adminMoved: adminMoved.count, adminFailures: adminFailures, adminLines: adminLines)
         case .reset:
             guard let plan = reset else { break }
             let outcome = await plan.run(selection, resettingPrivacy: resetPrivacy, exclusions: .none, isOpen: { false })
+            await removal.record(outcome.result, source: "Reset \(app.name)", tool: "uninstaller", sizes: [:])
             report(outcome.result, appName: app.name, stop: outcome.stop.map { "\($0)" })
         }
 
@@ -290,6 +292,14 @@ final class AppLibrary {
 }
 
 extension AppLibrary {
+    /// Measured sizes of what a plan lists, for History.
+    func sizes(of plan: Uninstallation) -> [URL: Int64] {
+        var sizes: [URL: Int64] = [:]
+        for leftover in plan.scan.leftovers where leftover.isMeasured { sizes[leftover.url] = leftover.size }
+        if plan.isAppMeasured { sizes[plan.app.url] = plan.appSize }
+        return sizes
+    }
+
     /// Whether `app` sits in a Trash folder.
     func isInTrash(_ app: PeelCore.InstalledApp) -> Bool {
         TrashService.isInsideATrash(app.url)
@@ -321,6 +331,7 @@ extension AppLibrary {
             }
 
             let result = await plan.move(selection, using: removalEngine, throughTheHelper: false)
+            await removal.record(result, source: "Uninstall \(app.name)", tool: "uninstaller", sizes: sizes(of: plan))
             movedItems += result.trashed.count
             for failure in result.failures {
                 failures.append("\(app.name) - \(failure.url.lastPathComponent): \(RemovalFailureText.describe(failure.reason))")
