@@ -4,6 +4,15 @@ Warren is a native macOS maintenance toolkit inspired by Mole, CleanMyMac, AppCl
 
 ## Recent release highlights
 
+### v1.2
+
+- Warren is now GPL-3.0-or-later and requires macOS 26. The Uninstaller, Orphans, Intel Software, Package Receipts and Homebrew pages use the engine ported from Peel, with evidence for every leftover, honest sizes, a History page with Put Back, and an Exclusions list
+- New Developer Cleanup page (Xcode, simulators, project build folders) and folder Duplicates in Cleanup
+- Homebrew: taps (add, trust, remove), hand-installed apps can be handed to or replaced by their cask, and casks whose apps are gone can be forgotten
+- One privileged helper now moves root-owned items to the Trash after approval and runs the maintenance tasks; the app, helper, companion and widgets are signed with Developer ID
+- Two widgets (System Pulse, Storage), a Shortcuts and Siri action, a new app icon for Liquid Glass and dark mode, an About window, and a Help guide under Help > Warren Help
+- The sidebar has collapsible groups, and Relay is merged into the menu bar companion
+
 ### v1.1.7
 
 - The menu bar companion now redistributes spare popover height across the metric cards and Top Processes panel, reducing the empty area below the footer

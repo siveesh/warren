@@ -2,71 +2,71 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleDisplayName</key>
-    <string>Warren Companion</string>
-    <key>CFBundleExecutable</key>
-    <string>Warren Companion</string>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>CFBundleIconName</key>
-    <string>Warren</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.siveesh.skmole.menubar</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>Warren Companion</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.1.7</string>
-    <key>CFBundleVersion</key>
-    <string>9</string>
-    <key>LSApplicationCategoryType</key>
-    <string>public.app-category.utilities</string>
-    <key>LSUIElement</key>
-    <true/>
-    <key>LSMinimumSystemVersion</key>
-    <string>26.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Warren Companion reads your Finder selection when a Relay command uses $SelectedFinderFiles or $CurrentFinderFolder.</string>
-    <key>NSServices</key>
-    <array>
-        <dict>
-            <key>NSMenuItem</key>
-            <dict>
-                <key>default</key>
-                <string>Run with Warren Relay…</string>
-            </dict>
-            <key>NSMessage</key>
-            <string>runWithRelay</string>
-            <key>NSPortName</key>
-            <string>Warren Companion</string>
-            <key>NSSendTypes</key>
-            <array>
-                <string>public.file-url</string>
-                <string>public.plain-text</string>
-            </array>
-        </dict>
-        <dict>
-            <key>NSMenuItem</key>
-            <dict>
-                <key>default</key>
-                <string>Open Warren Relay Palette</string>
-            </dict>
-            <key>NSMessage</key>
-            <string>openRelayPalette</string>
-            <key>NSPortName</key>
-            <string>Warren Companion</string>
-        </dict>
-    </array>
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Warren Companion</string>
+	<key>CFBundleExecutable</key>
+	<string>Warren Companion</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>Warren</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.siveesh.skmole.menubar</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Warren Companion</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.2</string>
+	<key>CFBundleVersion</key>
+	<string>10</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Warren Companion reads your Finder selection when a Relay command uses $SelectedFinderFiles or $CurrentFinderFolder.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSServices</key>
+	<array>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Run with Warren Relay…</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>runWithRelay</string>
+			<key>NSPortName</key>
+			<string>Warren Companion</string>
+			<key>NSSendTypes</key>
+			<array>
+				<string>public.file-url</string>
+				<string>public.plain-text</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSMenuItem</key>
+			<dict>
+				<key>default</key>
+				<string>Open Warren Relay Palette</string>
+			</dict>
+			<key>NSMessage</key>
+			<string>openRelayPalette</string>
+			<key>NSPortName</key>
+			<string>Warren Companion</string>
+		</dict>
+	</array>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
 </dict>
 </plist>
