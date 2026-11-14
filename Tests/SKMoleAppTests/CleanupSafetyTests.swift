@@ -228,3 +228,10 @@ private let sparkleFixture = """
     #expect(StartupPreference.intel.resolve(lastSelection: nil) == .intel)
     #expect(IntelFinding.Kind.allCases.allSatisfy { !$0.title.isEmpty && !$0.symbol.isEmpty })
 }
+
+@Test func homebrewCleanupTiersMapToTheEngine() {
+    #expect(HomebrewToolsLibrary.CleanupTier.allCases.count == 3)
+    #expect(HomebrewToolsLibrary.CleanupTier.standard.engine == .standard)
+    #expect(HomebrewToolsLibrary.CleanupTier.olderThan30.engine == .olderThan(days: 30))
+    #expect(HomebrewToolsLibrary.CleanupTier.everyDownload.engine == .everyDownload)
+}

@@ -15,6 +15,7 @@ struct HomebrewView: View {
 
                 maintenanceSection
                 doctorSection
+                HomebrewToolsView(model: model)
 
                 HStack(alignment: .top, spacing: 22) {
                     installedPackagesPane

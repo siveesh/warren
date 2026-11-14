@@ -986,6 +986,7 @@ final class AppModel: ObservableObject {
 
     /// Refreshes what a removal can change elsewhere in Warren.
     private(set) lazy var intelLibrary = IntelLibrary(apps: appLibrary)
+    private(set) lazy var homebrewTools = HomebrewToolsLibrary()
     private(set) lazy var packageLibrary = PackageLibrary(removal: guardService)
 
     private func makeOrphanLibrary() -> OrphanLibrary {

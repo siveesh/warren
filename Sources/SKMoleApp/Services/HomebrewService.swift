@@ -350,6 +350,7 @@ actor HomebrewService {
         environment["PATH"] = Array(NSOrderedSet(array: defaultPathEntries)).compactMap { $0 as? String }.joined(separator: ":")
         environment["HOMEBREW_NO_ANALYTICS"] = "1"
         environment["HOMEBREW_NO_ENV_HINTS"] = "1"
+        environment["NO_COLOR"] = "1"
         return environment
     }
 
