@@ -1,0 +1,118 @@
+public import Observation
+
+/// The one scan a page runs at a time, held by the page's model so that it can be stopped from anywhere: the
+/// toolbar, the View menu, or the page going away.
+///
+/// A new scan stops the one already running, since only the newest answer is wanted. Every scanner behind a
+/// page is tested to return promptly when stopped and to read nothing more (`Unanswered` in the tests), so a
+/// stopped scan does not keep walking the disk.
+@MainActor
+@Observable
+public final class ScanRun {
+    public private(set) var isRunning = false
+    /// True when the last scan was stopped before it finished. The page then shows what the scan before it
+    /// found, or says that nothing was read.
+    public private(set) var wasStopped = false
+    /// True when the page that asked for the running scan went away. The scan may still be waiting on macOS, and
+    /// its answer will be dropped, so a page that comes back starts its own.
+    public private(set) var isAbandoned = false
+    /// True while a scan runs for a page that still waits for its answer.
+    public var isWaitedFor: Bool { isRunning && !isAbandoned }
+    /// What the scan has read so far (`ScanCount`), brought up to date ten times a second while it runs.
+    public private(set) var itemsRead = 0
+    @ObservationIgnored private var newest = 0
+    @ObservationIgnored private var stopNewest: (@Sendable () -> Void)?
+    @ObservationIgnored private let others: RunningScans
+
+    public init(among others: RunningScans = .shared) {
+        self.others = others
+    }
+
+    /// Runs `work` as the page's scan and returns its answer, or nil when it was stopped, replaced by another
+    /// scan, or canceled with its caller.
+    public func run<Answer: Sendable>(_ work: @escaping @MainActor () async -> Answer) async -> Answer? {
+        stopNewest?()
+        newest += 1
+        let asked = newest
+        let count = ScanCount()
+        let task = Task { await ScanCount.$current.withValue(count) { await work() } }
+        stopNewest = { task.cancel() }
+        wasStopped = false
+        isAbandoned = false
+        isRunning = true
+        others.began(self)
+        itemsRead = 0
+        let reading = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard let self, asked == self.newest else { return }
+                self.itemsRead = count.value
+            }
+        }
+        let answer = await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+            Task { @MainActor [weak self] in
+                guard let self, asked == self.newest else { return }
+                self.isAbandoned = true
+            }
+        }
+        reading.cancel()
+        guard asked == newest else { return nil }
+        stopNewest = nil
+        isRunning = false
+        others.ended(self)
+        isAbandoned = false
+        return task.isCancelled ? nil : answer
+    }
+
+    /// Runs `work` as a read the page doesn't show, as when it reads itself again on its own: nothing turns busy, so
+    /// nothing is announced. Nil, without running, while a scan runs, and when a scan starts before it ends.
+    public func runQuietly<Answer: Sendable>(_ work: @escaping @MainActor () async -> Answer) async -> Answer? {
+        guard !isRunning else { return nil }
+        stopNewest?()
+        newest += 1
+        let asked = newest
+        let task = Task { await work() }
+        stopNewest = { task.cancel() }
+        let answer = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        guard asked == newest else { return nil }
+        stopNewest = nil
+        return task.isCancelled ? nil : answer
+    }
+
+    /// Stops the running scan. `isRunning` turns false at once, so the Rescan button comes back; the scan
+    /// itself ends a moment later, and what it found is dropped.
+    public func stop() {
+        guard isRunning else { return }
+        stopNewest?()
+        stopNewest = nil
+        newest += 1
+        isRunning = false
+        others.ended(self)
+        isAbandoned = false
+        wasStopped = true
+    }
+}
+
+/// The scans running on every page, so that Remove Peel can stop them all.
+@MainActor
+public final class RunningScans {
+    public static let shared = RunningScans()
+    private var scans: [ObjectIdentifier: ScanRun] = [:]
+
+    public init() {}
+
+    fileprivate func began(_ scan: ScanRun) {
+        scans[ObjectIdentifier(scan)] = scan
+    }
+
+    fileprivate func ended(_ scan: ScanRun) {
+        scans[ObjectIdentifier(scan)] = nil
+    }
+
+    func stopEvery() {
+        Array(scans.values).forEach { $0.stop() }
+    }
+}

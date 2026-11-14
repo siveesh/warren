@@ -1,0 +1,706 @@
+import Foundation
+internal import PeelPrivileged
+
+public struct LeftoverScanner: Sendable {
+    typealias Measure = @Sendable (URL) async -> FolderContents?
+    /// Whether the guard refuses a path outright, whatever the rest of the scan makes of it.
+    typealias Refuses = @Sendable (_ path: String, _ home: String) -> Bool
+    typealias InstalledByApple = @Sendable (URL) async -> Bool
+
+    public let environment: SearchEnvironment
+    public let exclusions: Exclusions
+    private let measure: Measure
+    /// What the scan reads of the disk, which copies of this scanner share: several apps scanned with one scanner
+    /// read each folder once.
+    private let reads: ScanReads
+    private let installedByApple: InstalledByApple
+    /// The most folders listed per location while searching inside folders the app does not claim.
+    private let nestedFolderLimit: Int
+
+    public init(environment: SearchEnvironment = .current, exclusions: Exclusions = .none) {
+        self.init(environment: environment, exclusions: exclusions, measure: Self.walk)
+    }
+
+    static let walk: Measure = { await FileSize.contents(of: $0) }
+
+    /// For tests, which say how each folder answers and can count what the guard is asked and what is listed.
+    init(
+        environment: SearchEnvironment,
+        exclusions: Exclusions = .none,
+        measure: @escaping Measure,
+        refuses: @escaping Refuses = { ProtectedData.refuses($0, home: $1) },
+        installedByApple: @escaping InstalledByApple = { await PackageReceipts.isInstalledByApple($0) },
+        nestedFolderLimit: Int = NestedSearch.folderLimit,
+        list: @escaping ScanReads.List = ScanReads.listing(of:)
+    ) {
+        self.environment = environment
+        self.exclusions = exclusions
+        self.measure = measure
+        reads = ScanReads(list: list, refuses: refuses)
+        self.installedByApple = installedByApple
+        self.nestedFolderLimit = nestedFolderLimit
+    }
+
+    /// Finds the files `app` keeps outside its bundle. `installedApps` should hold every app on the Mac, so files
+    /// other apps use are marked as shared.
+    @concurrent
+    public func scan(_ app: InstalledApp, installedApps: [InstalledApp]) async -> LeftoverScan {
+        await scan(app, matcher: matcher(for: app, installedApps: installedApps))
+    }
+
+    /// The apps every app's files are weighed against, with where the apps Peel remembers were. They are the same for
+    /// each app of one preparation, so apps chosen together share them.
+    struct Rivals: Sendable {
+        let apps: [InstalledApp]
+        let profiles: [LeftoverMatcher.Profile]
+        let places: [String: URL]
+    }
+
+    /// The apps macOS ships are rivals too: Apple keeps folders under their names (`Application Support/Music`) that
+    /// an app of the same name would otherwise get outright.
+    func rivals(installedApps: [InstalledApp]) async -> Rivals {
+        let known = installedApps + (await AppCatalog.systemApps.value)
+        // An app Peel saw installed is an app of its own once it is gone too, not a helper of this one.
+        let remembered = await AppMemory(url: AppMemory.url(inHome: environment.homeDirectory)).load()
+        let places = Dictionary(
+            remembered.map {
+                ($0.bundleIdentifier.lowercased(), URL(filePath: $0.lastPath, directoryHint: .isDirectory))
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return Rivals(apps: known, profiles: known.map(LeftoverMatcher.Profile.init), places: places)
+    }
+
+    func matcher(for app: InstalledApp, installedApps: [InstalledApp]) async -> LeftoverMatcher {
+        await matcher(for: app, rivals: rivals(installedApps: installedApps))
+    }
+
+    /// What tells `app`'s files from those of every other app: the rivals, and the apps macOS knows outside the list
+    /// that may use the same files (`appsElsewhere`).
+    func matcher(for app: InstalledApp, rivals: Rivals) async -> LeftoverMatcher {
+        let elsewhere = await appsElsewhere(like: app, besides: rivals.apps)
+        let places = rivals.places
+        return LeftoverMatcher(app: app, rivals: rivals.profiles + elsewhere.map(LeftoverMatcher.Profile.init)) {
+            AppInspector.applicationURL(forBundleIdentifier: $0) ?? places[$0.lowercased()]
+        }
+    }
+
+    /// The apps macOS knows, outside `known`, that may use `app`'s files: every other copy of it, such as an older one
+    /// kept in Downloads or one on another disk, and the apps of the same maker, such as a Nightly build beside it.
+    /// Spotlight names the maker's apps and Launch Services says where each is installed, so a copy inside a backup
+    /// never counts.
+    private func appsElsewhere(like app: InstalledApp, besides known: [InstalledApp]) async -> [InstalledApp] {
+        guard let identifier = app.bundleIdentifier else { return [] }
+        let own = identifier.lowercased()
+        let makers = await AppInspector.indexedIdentifiers(beginningWith: Self.makersPrefixes(of: identifier))
+        let identifiers = [identifier] + makers.filter { $0.lowercased() != own }.sorted()
+        let wanted = Set(identifiers.map { $0.lowercased() })
+        let bundle = PathPattern.comparablePath(of: PathPattern.canonical(app.url))
+        let listed = Set(
+            known.filter { $0.bundleIdentifier.map { wanted.contains($0.lowercased()) } ?? false }
+                .map { PathPattern.comparablePath(of: PathPattern.canonical($0.url)) }
+        )
+        return identifiers.flatMap(AppInspector.applicationURLs).filter { url in
+            let path = PathPattern.comparablePath(of: PathPattern.canonical(url))
+            return !listed.contains(path) && !PathComponents.isPath(path, atOrInside: bundle)
+                && environment.keepsOnItsOwn(appAt: path)
+        }.compactMap(AppInspector.inspect)
+    }
+
+    /// How the identifiers of the maker's apps begin, its Mac Catalyst builds' included. None for Apple's own apps:
+    /// the list of what macOS ships holds them, and Spotlight would name them whole.
+    static func makersPrefixes(of identifier: String) -> [String] {
+        guard
+            let vendor = Identifier.vendor(of: identifier),
+            !ProtectedData.isApplesName(vendor + ".")
+        else { return [] }
+        return [vendor + ".", Identifier.catalystPrefix + vendor + "."]
+    }
+
+    @concurrent
+    func scan(_ app: InstalledApp, matcher: LeftoverMatcher) async -> LeftoverScan {
+        // Spelled as on disk, as the end of a link is, so the two compare.
+        let bundle = PathPattern.comparablePath(of: PathPattern.canonicalWithoutOpening(app.url))
+        let results = await withTaskGroup(of: (location: SearchLocation, result: LocationResult).self) { group in
+            // Safari's web app container is read only for one of its web apps: anything inside another app's
+            // container makes macOS ask for its data unless Peel has Full Disk Access.
+            for location in environment.locations where location.kind != .safariWebApps || app.isASafariWebApp {
+                let home = environment.homeDirectory.path(percentEncoded: false)
+                let root = environment.rootDirectory.path(percentEncoded: false)
+                _ = group.addTaskUnlessCancelled {
+                    [exclusions, measure, reads, installedByApple, nestedFolderLimit] in
+                    (location, await Self.scan(
+                        location,
+                        matcher: matcher,
+                        home: home,
+                        root: root,
+                        bundle: bundle,
+                        exclusions: exclusions,
+                        measure: measure,
+                        reads: reads,
+                        installedByApple: installedByApple,
+                        nestedFolderLimit: nestedFolderLimit
+                    ))
+                }
+            }
+            return await group.reduce(into: [(location: SearchLocation, result: LocationResult)]()) { $0.append($1) }
+        }
+
+        var found: [(location: SearchLocation, leftovers: [Leftover])] = []
+        var unreadableLocations: [SearchLocation] = []
+        var cutShortLocations: [SearchLocation] = []
+        var jobs: [UnclaimedJob] = []
+        for (location, result) in results {
+            switch result {
+            case .found(let leftovers, let cutShort, let unreadable, let unclaimed):
+                found.append((location, leftovers))
+                if let cutShort { cutShortLocations.append(cutShort) }
+                unreadableLocations += unreadable
+                jobs += unclaimed
+            case .unreadable(let location):
+                unreadableLocations.append(location)
+            }
+        }
+        let rows = Self.merged(found)
+        let jobsOfRows = await Self.jobs(
+            jobs, runningFrom: rows, home: environment.homeDirectory.path(percentEncoded: false),
+            root: environment.rootDirectory.path(percentEncoded: false), measure: measure
+        )
+        // A folder another installed app reads too, or one around it, is that app's as well.
+        let alsoRead = environment.locations.filter { !$0.alsoReadBy.isEmpty }
+        let leftovers = (rows + jobsOfRows).map { leftover in
+            let item = PathPattern.comparablePath(of: leftover.url)
+            let readers = alsoRead
+                .filter { PathComponents.isPath(PathPattern.comparablePath(of: $0.url), atOrInside: item) }
+                .flatMap(matcher.installedApps(alsoReading:))
+            return readers.isEmpty ? leftover : leftover.sharing(with: readers)
+        }
+
+        let byPath: (SearchLocation, SearchLocation) -> Bool = {
+            $0.url.path(percentEncoded: false) < $1.url.path(percentEncoded: false)
+        }
+        return LeftoverScan(
+            leftovers: leftovers
+                .map { leftover in exclusions.holdBack(for: leftover.url).map(leftover.heldBack) ?? leftover }
+                .sorted(by: Leftover.comesBefore),
+            unreadableLocations: unreadableLocations.sorted(by: byPath),
+            cutShortLocations: cutShortLocations.sorted(by: byPath),
+            needsFullDiskAccess: unreadableLocations.contains { FullDiskAccess.canList($0.url) == .missing }
+        )
+    }
+
+    /// One location can sit inside another (the recent documents folder is two levels inside Application
+    /// Support, which is looked into that deep), so a file can be reached two ways. It is listed once, under the
+    /// stronger claim: a `Leftover` is known by its path. Between claims of equal strength the location nearer the
+    /// file wins, so the row does not depend on which search ended first.
+    static func merged(_ found: [(location: SearchLocation, leftovers: [Leftover])]) -> [Leftover] {
+        func depth(_ location: SearchLocation) -> Int {
+            PathComponents.of(location.url.path(percentEncoded: false)).count
+        }
+        let nearestFirst = found.sorted { one, other in
+            guard depth(one.location) == depth(other.location) else {
+                return depth(one.location) > depth(other.location)
+            }
+            // Two locations as deep never reach the same file; any fixed order will do.
+            return (one.location.url.path(percentEncoded: false), one.location.kind.rawValue)
+                < (other.location.url.path(percentEncoded: false), other.location.kind.rawValue)
+        }
+        var byPath: [String: Leftover] = [:]
+        for (_, leftovers) in nearestFirst {
+            for leftover in leftovers {
+                let path = PathPattern.comparablePath(of: leftover.url)
+                if let known = byPath[path], known.match.confidence >= leftover.match.confidence { continue }
+                byPath[path] = leftover
+            }
+        }
+        return Array(byPath.values)
+    }
+
+    private enum LocationResult: Sendable {
+        /// `cutShort` is the location itself when the search inside its folders hit the limit, `unreadable` the
+        /// folders inside it that search could not look into, and `jobs` the launchd jobs nothing claimed by name or
+        /// by a program inside the app.
+        case found([Leftover], cutShort: SearchLocation?, unreadable: [SearchLocation], jobs: [UnclaimedJob])
+        case unreadable(SearchLocation)
+    }
+
+    /// A launchd job no claim took, with the program it runs, kept until the scan knows the app's own rows.
+    private struct UnclaimedJob: Sendable {
+        let url: URL
+        let program: String
+        let kind: SearchLocation.Kind
+        let parent: ParentAccess
+    }
+
+    /// The jobs among `jobs` whose program is at or inside a row that is the app's alone, as an updater kept in the
+    /// app's Application Support folder: each goes with that row, as sure of whose it is, and held back with it.
+    private static func jobs(
+        _ jobs: [UnclaimedJob], runningFrom rows: [Leftover], home: String, root: String, measure: @escaping Measure
+    ) async -> [Leftover] {
+        let own = rows.filter(\.match.isTheAppsAlone).map { (row: $0, path: PathPattern.comparablePath(of: $0.url)) }
+        var taken: [Leftover] = []
+        for job in jobs {
+            guard let row = own.first(where: { PathComponents.isPath(job.program, atOrInside: $0.path) })?.row else {
+                continue
+            }
+            let match = LeftoverMatch(reason: .launchdJob, confidence: row.match.confidence, sharedWith: [])
+            let leftover = await leftover(
+                at: job.url, kind: job.kind, match: match, parent: job.parent, home: home, root: root, measure: measure
+            )
+            let heldBack = leftover.match.heldBack == nil ? row.match.heldBack : nil
+            taken.append(heldBack.map(leftover.heldBack) ?? leftover)
+        }
+        return taken
+    }
+
+    /// Kinds of location that belong to macOS or to the user, where a match on the app's name alone is a guess:
+    /// there is a real app called Developer, and `~/Library/Developer` is Xcode's.
+    private static let namedGroundOfSomebodyElse: Set<SearchLocation.Kind> = [.hiddenHomeFiles, .library, .homeFolder]
+
+    private static func scan(
+        _ location: SearchLocation,
+        matcher: LeftoverMatcher,
+        home: String,
+        root: String,
+        bundle: String,
+        exclusions: Exclusions,
+        measure: @escaping Measure,
+        reads: ScanReads,
+        installedByApple: @escaping InstalledByApple,
+        nestedFolderLimit: Int
+    ) async -> LocationResult {
+        let entries: [String]
+        switch await reads.listing(of: location.url) {
+        case .names(let names):
+            entries = names
+            ScanCount.current?.add(entries.count)
+        case .missing:
+            return .found([], cutShort: nil, unreadable: [], jobs: [])
+        case .unreadable:
+            return .unreadable(location)
+        }
+
+        let parent = await reads.parentAccess(location.url)
+        var toMeasure: [Found] = []
+        var nobodysFolders: [URL] = []
+        var makersItems: [URL] = []
+        var jobs: [UnclaimedJob] = []
+        let makers = makersPlaces.contains(location.kind) ? matcher.makersFolderNames : []
+
+        // The guard reads every spelling of a path from the disk, so it is asked only about what the scan would
+        // take or walk into, and what it refuses is left out of both, as is what the person excluded.
+        for name in entries where location.considers(fileName: name) {
+            // A canceled scan stops here, since nobody will read what it finds.
+            guard !Task.isCancelled else { break }
+            let url = location.url.appending(path: name)
+            let path = url.path(percentEncoded: false)
+            // An app kept in a place an uninstall searches, as an input method is, is the app and not its own leftover.
+            guard PathPattern.comparablePath(of: url) != bundle else { continue }
+            if let match = claim(name, at: url, kind: location.kind, matcher: matcher, bundle: bundle, home: home),
+               !isSharedWithTheWholeMac(url, home: home) {
+                guard await !reads.refuses(path, home: home), !exclusions.excludes(url),
+                      !FileAccess.cannotBeRemoved(url)
+                else { continue }
+                toMeasure.append(Found(url: url, match: match, parent: parent, foldersAbove: .itsOwn))
+            } else if let program = LeftoverMatcher.program(ofJobAt: url, kind: location.kind),
+                      await !reads.refuses(path, home: home), !exclusions.excludes(url),
+                      !FileAccess.cannotBeRemoved(url) {
+                jobs.append(UnclaimedJob(url: url, program: program, kind: location.kind, parent: parent))
+            } else if NestedSearch.kinds.contains(location.kind), await reads.isRealFolder(url),
+                      await !reads.refuses(path, home: home), !exclusions.excludes(url) {
+                nobodysFolders.append(url)
+            } else if namesTheMaker(name, kind: location.kind, names: makers),
+                      await !reads.refuses(path, home: home), !exclusions.excludes(url) {
+                makersItems.append(url)
+            }
+        }
+
+        let taken = await withoutWhatAppleInstalled(toMeasure, home: home, installedByApple: installedByApple)
+        let leftovers = await measured(taken, kind: location.kind, home: home, root: root, measure: measure)
+        let inside = await nested(
+            in: nobodysFolders, of: location, matcher: matcher, home: home, root: root, bundle: bundle,
+            exclusions: exclusions, measure: measure, reads: reads, installedByApple: installedByApple,
+            limit: nestedFolderLimit
+        )
+        let makersOwn = await inItsMakersFolders(
+            nobodysFolders + makersItems, rows: inside.found, of: location, matcher: matcher, home: home, root: root,
+            exclusions: exclusions, measure: measure, reads: reads, installedByApple: installedByApple
+        )
+        return .found(
+            leftovers + inside.found + makersOwn, cutShort: inside.wasCutShort ? location : nil,
+            unreadable: inside.unreadable.map { SearchLocation(kind: location.kind, url: $0) }, jobs: jobs
+        )
+    }
+
+    private static let makersPlaces: Set<SearchLocation.Kind> = [
+        .applicationSupport, .caches, .logs, .library, .sharedFolder, .preferences,
+    ]
+
+    /// Whether `name`, in a location of `kind`, is the maker's as `names` write its folder: `elgato.log` in Logs too.
+    private static func namesTheMaker(_ name: String, kind: SearchLocation.Kind, names: Set<String>) -> Bool {
+        names.contains(Naming.folderName(LeftoverMatcher.key(from: name, kind: kind)))
+    }
+
+    /// What the maker's own folders and files hold while the app is the maker's last: a file or a folder whole when
+    /// no row is in it, else each item in it that is no row and holds none. Shown, never selected: the maker may have
+    /// put there what no app of its own made.
+    private static func inItsMakersFolders(
+        _ folders: [URL],
+        rows: [Leftover],
+        of location: SearchLocation,
+        matcher: LeftoverMatcher,
+        home: String,
+        root: String,
+        exclusions: Exclusions,
+        measure: @escaping Measure,
+        reads: ScanReads,
+        installedByApple: @escaping InstalledByApple
+    ) async -> [Leftover] {
+        let names = matcher.makersFolderNames
+        guard !names.isEmpty, makersPlaces.contains(location.kind) else { return [] }
+        let rowPaths = rows.map { PathPattern.comparablePath(of: $0.url) }
+        var found: [Found] = []
+        for folder in folders where namesTheMaker(folder.lastPathComponent, kind: location.kind, names: names)
+            && !SystemFolders.keeps(folder.lastPathComponent, in: location.kind) {
+            let inside = rowPaths.filter { PathComponents.isPath($0, inside: PathPattern.comparablePath(of: folder)) }
+            var items = [folder]
+            if !inside.isEmpty {
+                let entries = if case .names(let names) = await reads.listing(of: folder) { names } else { [String]() }
+                items = entries.filter { !$0.hasPrefix(".") }.map { folder.appending(path: $0) }.filter { item in
+                    !inside.contains { PathComponents.isPath($0, atOrInside: PathPattern.comparablePath(of: item)) }
+                }
+            }
+            let parent = await reads.parentAccess(inside.isEmpty ? location.url : folder)
+            for url in items {
+                guard await !reads.refuses(url.path(percentEncoded: false), home: home), !exclusions.excludes(url),
+                      !FileAccess.cannotBeRemoved(url), !isSharedWithTheWholeMac(url, home: home)
+                else { continue }
+                let match = LeftoverMatch(reason: .inItsMakersFolder, confidence: .possible, sharedWith: [])
+                found.append(Found(url: url, match: match, parent: parent, foldersAbove: .itsOwn))
+            }
+        }
+        let taken = await withoutWhatAppleInstalled(found, home: home, installedByApple: installedByApple)
+        return await measured(taken, kind: location.kind, home: home, root: root, measure: measure)
+    }
+
+    /// Looks inside the folders not taken as the app's. Only a match strong enough to name the app on its own
+    /// (`likely` or better) is taken, because everything else in there is somebody else's.
+    private static func nested(
+        in folders: [URL],
+        of location: SearchLocation,
+        matcher: LeftoverMatcher,
+        home: String,
+        root: String,
+        bundle: String,
+        exclusions: Exclusions,
+        measure: @escaping Measure,
+        reads: ScanReads,
+        installedByApple: @escaping InstalledByApple,
+        limit: Int
+    ) async -> (found: [Leftover], wasCutShort: Bool, unreadable: [URL]) {
+        let kind = location.kind
+        let locationLength = location.url.pathComponents.count
+        func matching(_ url: URL, named name: String) -> LeftoverMatch? {
+            // A browser's manifest is whoever's program it runs, whatever it is called.
+            url.deletingLastPathComponent().lastPathComponent.lowercased() == "nativemessaginghosts"
+                ? runsSomethingInside(bundle, manifest: url)
+                : Self.match(name, at: url, kind: kind, matcher: matcher, home: home, nested: true)
+        }
+        let search: NestedSearch.Findings<Found> = await NestedSearch.walk(
+            inside: folders, of: kind, limit: limit, reads: reads
+        ) { url, name, parent, canLookInside in
+            let path = url.path(percentEncoded: false)
+            let match = matching(url, named: name)
+            // Below a location's own entries only strong evidence counts, and the app's name without its channel
+            // word, which is only possible and so never selected.
+            if let match,
+               match.confidence >= .likely || matcher.namesTheAppWithoutItsChannel(fileName: name, kind: kind),
+               !isSharedWithTheWholeMac(url, home: home) {
+                guard await !reads.refuses(path, home: home), !exclusions.excludes(url) else { return .pass }
+                // Whose the folders on the way are decides what its name is worth.
+                let between = url.deletingLastPathComponent().pathComponents.dropFirst(locationLength)
+                return .take(Found(
+                    url: url, match: match, parent: parent,
+                    foldersAbove: foldersAbove(between, kind: kind, matcher: matcher)
+                ))
+            }
+            guard canLookInside, await reads.isRealFolder(url), await !reads.refuses(path, home: home),
+                  !exclusions.excludes(url)
+            else { return .pass }
+            return .lookInside
+        }
+        let taken = await withoutWhatAppleInstalled(search.found, home: home, installedByApple: installedByApple)
+        let found = await measured(taken, kind: kind, home: home, root: root, measure: measure)
+        // A program keeps its files in a folder named by its identifier (Apple's File System Programming Guide), so
+        // one the app has no claim on holds none of its files, even where Peel can't look inside.
+        let unreadable = search.unreadable.filter { folder in
+            !Identifier.isReverseDNS(LeftoverMatcher.key(from: folder.lastPathComponent, kind: kind))
+                || matching(folder, named: folder.lastPathComponent) != nil
+        }
+        return (found, search.wasCutShort, unreadable)
+    }
+
+    /// What a search took, less what one of Apple's packages installed, which is Apple's whatever its name says. Only
+    /// what sits outside the home is asked, since Apple's receipts list nothing inside one.
+    private static func withoutWhatAppleInstalled(
+        _ found: [Found], home: String, installedByApple: @escaping InstalledByApple
+    ) async -> [Found] {
+        let homePath = PathPattern.comparablePath(of: URL(filePath: home, directoryHint: .isDirectory))
+        let outside = found.filter {
+            !PathComponents.isPath(PathPattern.comparablePath(of: $0.url), atOrInside: homePath)
+        }
+        guard !outside.isEmpty else { return found }
+        let apples = Set(await outside.concurrentMap(width: concurrentMeasurements) { item in
+            await installedByApple(item.url) ? item.url : nil
+        }.compactMap(\.self))
+        return found.filter { !apples.contains($0.url) }
+    }
+
+    /// Something a search took as the app's, waiting to be measured.
+    private struct Found: Sendable {
+        let url: URL
+        let match: LeftoverMatch
+        let parent: ParentAccess
+        let foldersAbove: FoldersAbove
+    }
+
+    /// Whose the folders between a search location and an item found inside them are.
+    enum FoldersAbove: Sendable {
+        /// None, or each named for the app or its maker.
+        case itsOwn
+        /// One is Apple's or another installed app's.
+        case anotherApps
+        /// One is named for neither the app nor its maker, so it may be any program's.
+        case unknown
+    }
+
+    private static func foldersAbove(
+        _ folders: some Collection<String>, kind: SearchLocation.Kind, matcher: LeftoverMatcher
+    ) -> FoldersAbove {
+        let isMacOSs = folders.first.map { SystemFolders.keeps($0, in: kind) } ?? false
+        if isMacOSs || folders.contains(where: { isSomebodyElses($0, kind: kind, matcher: matcher) }) {
+            return .anotherApps
+        }
+        return folders.allSatisfy(matcher.namesTheAppOrItsMaker(folder:)) ? .itsOwn : .unknown
+    }
+
+    /// How many items of one location are measured at once. One after another, a few folders that never answer
+    /// would each hold the location for the whole budget of `FileSize`.
+    static let concurrentMeasurements = 4
+
+    /// Measures what one location found, a few at a time, and keeps the order it was found in.
+    private static func measured(
+        _ found: [Found], kind: SearchLocation.Kind, home: String, root: String, measure: @escaping Measure
+    ) async -> [Leftover] {
+        await found.concurrentMap(width: concurrentMeasurements) { item in
+            await leftover(
+                at: item.url, kind: kind, match: item.match, parent: item.parent, home: home, root: root,
+                foldersAbove: item.foldersAbove, measure: measure
+            )
+        }
+    }
+
+    /// Builds a leftover: measures it and decides whether to hold it back. The scan, cask paths, and installer
+    /// receipts all come through here, so the same rules apply to every leftover.
+    static func leftover(
+        at url: URL,
+        kind: SearchLocation.Kind,
+        match: LeftoverMatch,
+        parent: ParentAccess,
+        home: String,
+        root: String,
+        foldersAbove: FoldersAbove = .itsOwn,
+        measure: Measure = LeftoverScanner.walk,
+        syncKeeper: (URL) -> SyncKeeper? = SyncedFolders().keeper(of:)
+    ) async -> Leftover {
+        // The walk that measures the folder also reports whether it saw a repository or a wallet, so neither
+        // check costs extra reading. A repository means the folder holds more than the app's state, such as work
+        // that was never pushed, and holding it back costs a checkmark, not a file.
+        // A folder that did not answer in time is unknown, not empty: it may hold a repository, and the largest
+        // folders are the ones that run out of time.
+        let contents = await measure(url)
+        let path = url.path(percentEncoded: false)
+        let requiresPrivileges = parent.requiresPrivileges(toRemove: url)
+        let wallet = ProtectedData.holdsABrowserWallet(path)
+        let library = ProtectedData.holdsALibrary(path)
+        let work = ProtectedData.holdsWorkKeptInACache(path)
+        // What the guard will refuse comes first, whatever the walk saw. A folder macOS refuses to open would read
+        // as empty, and an empty folder of the app's own would be selected. From macOS 27, another team's container
+        // is refused outright rather than prompted for.
+        let held: (HoldBack?, SyncKeeper?) = if ProtectedData.holds(path, home: home) || wallet == .found {
+            (.holdsKeys, nil)
+        } else if kind == .containers, ProtectedData.holdsAContainersDocuments(path) {
+            (.holdsDocuments, nil)
+        } else if library == .found {
+            (.holdsALibrary, nil)
+        } else if work == .found {
+            (.holdsWorkKeptInACache, nil)
+        } else if !requiresPrivileges, [wallet, library, work].contains(.notKnown) {
+            (.couldNotLookInside, nil)
+        } else if let keeper = syncKeeper(url) {
+            (.inTheCloud, keeper)
+        } else if let keptOnlyHere = KeptOnlyHere.reason(for: path, home: home, root: root) {
+            (keptOnlyHere, nil)
+        } else if let contents, contents.couldNotBeRead {
+            (HoldBack.unread(contents), nil)
+        } else if let contents {
+            (heldBack(match, at: url, in: kind, contents: contents, foldersAbove: foldersAbove), nil)
+        } else {
+            (.notMeasured, nil)
+        }
+        let (heldBack, syncedBy) = held
+        return Leftover(
+            url: url,
+            kind: kind,
+            match: heldBack.map(match.forReview) ?? match,
+            size: contents?.size ?? 0,
+            isMeasured: contents.map { !$0.couldNotBeRead } ?? false,
+            requiresPrivileges: requiresPrivileges,
+            holdsDamagedSettings: kind == .preferences && PreferenceFile.isDamaged(url),
+            syncedBy: syncedBy,
+            leadsTo: leadsElsewhere(url, match: match)
+        )
+    }
+
+    /// Where a symbolic link leads in the end, read without opening anything, unless it leads into what goes with
+    /// the app: the app itself, or its Homebrew receipt. A Finder alias is left out, since reading it opens it.
+    private static func leadsElsewhere(_ url: URL, match: LeftoverMatch) -> URL? {
+        let intoWhatGoes: [MatchReason] = [.linksToTheApp, .leadsToTheApp, .leadsIntoItsHomebrewReceipt]
+        guard !intoWhatGoes.contains(match.reason), url.isSymbolicLink else { return nil }
+        return url.leadsToInTheEnd
+    }
+
+    /// The reason to show a leftover but leave it unselected, or nil. The scan never lists what the guard refuses
+    /// outright (`ProtectedData.refuses`), such as mail, keys, and iCloud Drive.
+    ///
+    /// In the home folder and at the top of a Library, the app's name alone is weak evidence: a hidden `~/.jotter`
+    /// can belong to a command-line tool of the same name rather than to the Jotter app, and hold work that exists
+    /// nowhere else. This is decided here and not in the matcher, because `nested(in:)` takes an item only on strong
+    /// evidence or the app's name without its channel word, and weaker evidence would drop items such as
+    /// `~/.config/zed` from the scan instead of showing them unselected.
+    private static func heldBack(
+        _ match: LeftoverMatch,
+        at url: URL,
+        in kind: SearchLocation.Kind,
+        contents: FolderContents,
+        foldersAbove: FoldersAbove
+    ) -> HoldBack? {
+        // A wallet comes first: a cask's `zap` can name a coin app's whole data folder, which is where its keys
+        // are. Holding it back costs a checkmark, and the row says what is inside.
+        if let secret = HoldBack.secret(in: contents) { return secret }
+        if contents.holdsRepository { return .holdsRepository }
+        if let backups = KeptOnlyHere.reason(seenIn: contents) { return backups }
+        if kind == .logs, CrashReport.isOne(url) { return .crashReport }
+        if kind == .sharedFolder { return .sharedWithEveryone }
+        if Self.namedGroundOfSomebodyElse.contains(kind), match.restsOnAName { return .namedLikeTheApp }
+        // An identifier names the app wherever it sits. Its name, inside somebody else's folder, does not.
+        if match.restsOnAName, foldersAbove == .anotherApps { return .insideAnotherAppsFolder }
+        if match.restsOnAName, foldersAbove == .unknown { return .namedLikeTheApp }
+        return nil
+    }
+
+    /// This app's claim on an item, from its name and then from what it holds. A plug-in is named for what it
+    /// does, and a launchd job by whoever wrote it, so their names do not say whose they are.
+    private static func claim(
+        _ name: String,
+        at url: URL,
+        kind: SearchLocation.Kind,
+        matcher: LeftoverMatcher,
+        bundle: String,
+        home: String
+    ) -> LeftoverMatch? {
+        guard !kind.isForLinks else { return leadsInside(bundle, link: url) }
+        guard kind != .nativeMessagingHosts else { return runsSomethingInside(bundle, manifest: url) }
+        guard let inside = runsSomethingInside(bundle, job: url, kind: kind) else {
+            return match(name, at: url, kind: kind, matcher: matcher, home: home)
+                ?? namesSomethingInside(bundle, job: url, kind: kind)
+        }
+        let byName = matcher.match(fileName: name, kind: kind, at: url)
+        return byName?.confidence == .certain ? byName : inside
+    }
+
+    /// This app's claim on an item from its name and from the identifier it declares, which is read for a plug-in, a
+    /// crash report, and an item whose name answers nothing. The identifier says whose such an item is: a claim
+    /// through it replaces a weaker one on the name, and a name it does not back makes the item only possible.
+    private static func match(
+        _ name: String,
+        at url: URL,
+        kind: SearchLocation.Kind,
+        matcher: LeftoverMatcher,
+        home: String,
+        nested: Bool = false
+    ) -> LeftoverMatch? {
+        // A system extension macOS activated is its own to remove: it uninstalls one with the app it came in.
+        guard url.pathExtension.lowercased() != "systemextension" else { return nil }
+        if let updaters = matcher.updatersFolder(at: url, home: home) { return updaters }
+        if let named = matcher.productFolder(at: url, home: home) { return named }
+        let byName = DeclaredIdentifier.nameSaysNothing(of: url, kind: kind)
+            ? nil : matcher.match(fileName: name, kind: kind, at: url, nested: nested)
+        guard byName == nil || DeclaredIdentifier.outranksTheName(of: url, kind: kind) else { return byName }
+        // `.elsewhere`, so no extension is taken off the identifier as if it were a file name.
+        let declared = DeclaredIdentifier.of(url, kind: kind).flatMap {
+            matcher.match(fileName: $0, kind: .elsewhere, at: url)
+        }
+        guard let byName else { return declared }
+        guard let declared else { return byName.restsOnAName ? byName.atMost(.possible) : byName }
+        return declared.confidence >= byName.confidence ? declared : byName
+    }
+
+    /// True for a folder another installed app claims, or one Apple named for itself. A name found inside it
+    /// is only a guess: `Caches/com.apple.python/Library/Developer` is not the Developer app's. Another copy of
+    /// the app is no one else.
+    private static func isSomebodyElses(_ name: String, kind: SearchLocation.Kind, matcher: LeftoverMatcher) -> Bool {
+        ProtectedData.isApplesName(name) || !matcher.othersClaiming(fileName: name, kind: kind).apps.isEmpty
+    }
+
+    /// A job that runs a program inside the app is that app's, whatever it is called: `com.maker.updater.plist`
+    /// carries no name of the app it keeps up to date. No rival is named, because a path inside one bundle
+    /// cannot be inside another.
+    private static func runsSomethingInside(
+        _ bundle: String,
+        job url: URL,
+        kind: SearchLocation.Kind
+    ) -> LeftoverMatch? {
+        guard let program = LeftoverMatcher.program(ofJobAt: url, kind: kind),
+              PathComponents.isPath(program, atOrInside: bundle)
+        else { return nil }
+        return LeftoverMatch(reason: .launchdJob, confidence: .certain, sharedWith: [])
+    }
+
+    /// A job that names something inside the app among its arguments, as `open -a` or `sh -c` run it, may be the
+    /// app's: shown for review, never selected, since an argument is no program.
+    private static func namesSomethingInside(
+        _ bundle: String, job url: URL, kind: SearchLocation.Kind
+    ) -> LeftoverMatch? {
+        guard kind == .launchAgents || kind == .launchDaemons, url.pathExtension == "plist",
+              let job = JobDefinition(contentsOf: url),
+              job.arguments.dropFirst().contains(where: { $0 == bundle || $0.contains(bundle + "/") })
+        else { return nil }
+        return LeftoverMatch(reason: .launchdJob, confidence: .possible, sharedWith: [])
+    }
+
+    /// A browser's native messaging manifest is the app's when the program it names, an absolute path, is inside it.
+    private static func runsSomethingInside(_ bundle: String, manifest url: URL) -> LeftoverMatch? {
+        guard let program = NativeMessagingManifest.program(at: url) else { return nil }
+        let path = PathPattern.comparablePath(of: URL(filePath: program))
+        guard PathComponents.isPath(path, atOrInside: bundle) else { return nil }
+        return LeftoverMatch(reason: .nativeMessagingHost, confidence: .certain, sharedWith: [])
+    }
+
+    /// A link or an alias that leads to the app or inside it is that app's, whatever it is called. One that leads
+    /// anywhere else is not claimed.
+    private static func leadsInside(_ bundle: String, link url: URL) -> LeftoverMatch? {
+        guard let target = url.leadsToInTheEnd else { return nil }
+        let path = PathPattern.comparablePath(of: target)
+        guard PathComponents.isPath(path, atOrInside: bundle) else { return nil }
+        let reason: MatchReason = path == bundle ? .leadsToTheApp : .linksToTheApp
+        return LeftoverMatch(reason: reason, confidence: .certain, sharedWith: [])
+    }
+
+    /// True for a home item that many tools share, such as `~/.local`, which an app called Local would claim.
+    /// `RemovalGuard` refuses these, so listing one would only offer a checkmark that fails later. What is inside
+    /// them is still searched by `nested(in:)`.
+    private static func isSharedWithTheWholeMac(_ url: URL, home: String) -> Bool {
+        ProtectedData.isSharedHomeItem(url.path(percentEncoded: false), home: home)
+    }
+}

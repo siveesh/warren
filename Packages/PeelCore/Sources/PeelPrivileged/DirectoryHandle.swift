@@ -1,0 +1,227 @@
+public import Darwin
+public import Foundation
+
+/// A directory held open by a descriptor, opened one component at a time without following a symbolic
+/// link. What is checked and what is then acted on are the same object: if a directory is swapped for a
+/// link afterwards, nothing is redirected, because the descriptor still refers to what was checked.
+///
+/// It is opened for search only, and nothing here lists a directory. Without Full Disk Access, macOS refuses
+/// to open `~/.Trash` for reading (`EPERM`), but allows opening it for search, and `fstatat` and renames made
+/// through that descriptor.
+public final class DirectoryHandle: Sendable {
+    private static let flags = O_SEARCH | O_NOFOLLOW | O_CLOEXEC
+
+    public let path: String
+    let descriptor: Int32
+
+    private init(path: String, descriptor: Int32) {
+        self.path = path
+        self.descriptor = descriptor
+    }
+
+    deinit { close(descriptor) }
+
+    /// Opens a path that `realpath` has already resolved, so it holds no links of its own. A component
+    /// that has become a link since then fails here rather than redirecting the operation.
+    static func at(canonical path: String) -> Result<DirectoryHandle, POSIXError> {
+        var descriptor = Darwin.open("/", O_SEARCH | O_CLOEXEC)
+        guard descriptor >= 0 else { return .failure(.last) }
+        for component in PathComponents.of(path) {
+            let next = component.withCString { openat(descriptor, $0, flags) }
+            let failure = POSIXError.last
+            close(descriptor)
+            guard next >= 0 else { return .failure(failure) }
+            descriptor = next
+        }
+        return .success(DirectoryHandle(path: path, descriptor: descriptor))
+    }
+
+    /// Opens the folder at `path`. Links in `path` are resolved once, here, and the result is then opened
+    /// without following any link.
+    public static func at(_ path: String) -> Result<DirectoryHandle, POSIXError> {
+        guard let real = PrivilegedPathPolicy.realPath(path) else { return .failure(.last) }
+        return at(canonical: real)
+    }
+
+    /// What the kernel calls this folder now, wherever it has been moved to since it was opened.
+    public var currentPath: String? {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
+    /// A subdirectory, opened through this descriptor and refusing a symbolic link left in its place.
+    func child(_ name: String) -> DirectoryHandle? {
+        let descriptor = name.withCString { openat(self.descriptor, $0, Self.flags) }
+        guard descriptor >= 0 else { return nil }
+        return DirectoryHandle(path: path == "/" ? "/" + name : path + "/" + name, descriptor: descriptor)
+    }
+
+    /// The folder `name` inside this one, made when nothing is there, and never a link or a file in its place. A
+    /// folder made here is as closed as this one and writable by its owner alone, since the one that left may have
+    /// been, and comes back with its identity, so the caller can take it away again.
+    public func child(
+        _ name: String,
+        makingIfMissing: Bool
+    ) -> Result<(folder: DirectoryHandle, made: ItemIdentity?), POSIXError> {
+        var made: ItemIdentity?
+        if makingIfMissing {
+            var around = stat()
+            let mode = fstat(descriptor, &around) == 0 ? around.st_mode & 0o755 : 0o755
+            if name.withCString({ mkdirat(descriptor, $0, mode) }) == 0 {
+                var info = stat()
+                guard name.withCString({ fstatat(descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) == 0 else {
+                    let failure = POSIXError.last
+                    _ = name.withCString { unlinkat(descriptor, $0, AT_REMOVEDIR) }
+                    return .failure(failure)
+                }
+                made = ItemIdentity(info)
+            } else {
+                let failure = POSIXError.last
+                guard failure.code == .EEXIST else { return .failure(failure) }
+            }
+        }
+        guard let folder = child(name) else { return .failure(.last) }
+        return .success((folder, made))
+    }
+
+    /// Takes away the folder `name` inside this one, only while it is still the empty folder `made` names.
+    public func removeFolder(_ name: String, if made: ItemIdentity) {
+        var info = stat()
+        guard name.withCString({ fstatat(descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) == 0, ItemIdentity(info) == made
+        else { return }
+        _ = name.withCString { unlinkat(descriptor, $0, AT_REMOVEDIR) }
+    }
+
+    /// What sits at `name` inside this folder, a link itself and never what it leads to, or nil when nothing does.
+    public func status(of name: String) -> stat? {
+        var info = stat()
+        guard name.withCString({ fstatat(descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) == 0 else { return nil }
+        return info
+    }
+
+    /// Makes what sits at `name` inside this folder, a link itself included, belong to `user`; its group stays.
+    public func give(_ name: String, to user: uid_t) -> Bool {
+        name.withCString { fchownat(descriptor, $0, user, gid_t(bitPattern: -1), AT_SYMLINK_NOFOLLOW) == 0 }
+    }
+
+    /// Makes this folder itself belong to `user`, wherever it is now and whatever names it there; its group stays.
+    public func giveItself(to user: uid_t) -> Bool {
+        fchown(descriptor, user, gid_t(bitPattern: -1)) == 0
+    }
+
+    /// The owner of the directory itself, read through the descriptor.
+    public func ownerIdentifier() -> uid_t? {
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else { return nil }
+        return info.st_uid
+    }
+}
+
+/// Identifies an item by its device, inode, and birth time. A rename or a move within its volume keeps all
+/// three, and the birth time tells apart an item that reuses a freed inode number.
+public struct ItemIdentity: Codable, Hashable, Sendable {
+    public let device: Int64
+    public let inode: UInt64
+    /// When the item was made, in nanoseconds since 1970, wrapping instead of trapping outside 1677 to 2262: a
+    /// network share can report a date it doesn't know as 1601, and the value is only ever compared.
+    public let birth: Int64
+
+    public init(_ info: stat) {
+        device = Int64(info.st_dev)
+        inode = UInt64(info.st_ino)
+        birth = Int64(info.st_birthtimespec.tv_sec) &* 1_000_000_000 &+ Int64(info.st_birthtimespec.tv_nsec)
+    }
+
+    /// The identity of the item at `path` itself, never of what a link there leads to.
+    public init?(ofItemAt path: String) {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { return nil }
+        self.init(info)
+    }
+}
+
+/// An item named inside a `DirectoryHandle`. The item holds its parent's handle, so the parent's
+/// descriptor stays open for as long as the item exists.
+public final class OpenItem: Sendable {
+    public let path: String
+    public let name: String
+    public let parent: DirectoryHandle
+    /// Read through the parent's descriptor without following a link. Nil for a place nothing is in yet.
+    public let identity: ItemIdentity?
+    let owner: uid_t?
+    public let mode: mode_t?
+    public let size: Int64?
+
+    init(path: String, name: String, parent: DirectoryHandle, status: stat? = nil) {
+        self.path = path
+        self.name = name
+        self.parent = parent
+        identity = status.map(ItemIdentity.init)
+        owner = status?.st_uid
+        mode = status?.st_mode
+        size = status?.st_size
+    }
+
+    /// The item at `path`, held through a descriptor on the folder it sits in. Links in the folder's path are
+    /// resolved once, here, and the last component is never followed.
+    public static func at(_ path: String) -> Result<OpenItem, POSIXError> {
+        guard path.hasPrefix("/"), PrivilegedPathPolicy.isPlainlyReadable(path) else {
+            return .failure(POSIXError(.EINVAL))
+        }
+        let components = PathComponents.of(path)
+        guard let name = components.last, !components.contains(where: { $0 == "." || $0 == ".." }) else {
+            return .failure(POSIXError(.EINVAL))
+        }
+        return DirectoryHandle.at("/" + components.dropLast().joined(separator: "/")).flatMap { parent in
+            var info = stat()
+            guard name.withCString({ fstatat(parent.descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) == 0 else {
+                return .failure(.last)
+            }
+            return .success(OpenItem(
+                path: (parent.path == "/" ? "" : parent.path) + "/" + name,
+                name: name,
+                parent: parent,
+                status: info
+            ))
+        }
+    }
+}
+
+extension OpenItem {
+    /// The bytes of this item while it is still the regular file that was judged, at most `maximum` of them, read
+    /// without following a link, with the status of the file they were read from.
+    func contents(ofAtMost maximum: Int) -> (data: Data, status: stat)? {
+        guard let identity, let mode, mode & S_IFMT == S_IFREG else { return nil }
+        let file = name.withCString { openat(parent.descriptor, $0, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC) }
+        guard file >= 0 else { return nil }
+        var info = stat()
+        var bytes = [UInt8](repeating: 0, count: maximum + 1)
+        let count = fstat(file, &info) == 0 ? read(file, &bytes, bytes.count) : -1
+        close(file)
+        guard ItemIdentity(info) == identity, count >= 0, count <= maximum, Int64(count) == info.st_size else {
+            return nil
+        }
+        return (Data(bytes[..<count]), info)
+    }
+
+    /// Deletes this item for good when it is a regular file of `owner`, at most `maximum` bytes, whose bytes
+    /// `isDisposable` accepts. The file is read without following a link, and its name is removed only while it
+    /// still leads to the file that was read.
+    public func deleteFile(ownedBy owner: uid_t, ofAtMost maximum: Int, if isDisposable: (Data) -> Bool) {
+        guard let identity, let contents = contents(ofAtMost: maximum), contents.status.st_uid == owner,
+              isDisposable(contents.data)
+        else { return }
+        var now = stat()
+        guard
+            name.withCString({ fstatat(parent.descriptor, $0, &now, AT_SYMLINK_NOFOLLOW) }) == 0,
+            ItemIdentity(now) == identity
+        else { return }
+        _ = name.withCString { unlinkat(parent.descriptor, $0, 0) }
+    }
+}
+
+extension POSIXError {
+    /// The error `errno` holds for the call that just failed. Read it before any other call can change `errno`.
+    static var last: POSIXError { POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+}

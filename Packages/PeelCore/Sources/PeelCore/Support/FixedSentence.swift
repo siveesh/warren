@@ -1,0 +1,86 @@
+internal import PeelPrivileged
+
+/// Every fixed English sentence Peel's own code shows the user from outside the app's string catalog: the
+/// refusals of the path rules and of the helper, a tool that timed out or was stopped, and four of PeelCore's.
+/// The helper cannot know the user's language and PeelCore has no catalog, so each arrives in English, and
+/// the app recognizes it here to show it translated. Anything else (a tool's own output, an error macOS
+/// wrote) is not one of these.
+public enum FixedSentence: CaseIterable, Sendable {
+    case notAFullPath, dotInPath, controlCharacter, folderNotFound, tooManyOpenFolders, outsideHelpersFolders
+    case onlyAppsThere, partOfAnotherApp
+    case notThereAnymore, alreadyThere, protectedByMacOS, irreplaceable, codeFolder, onlyLinksThere, leadsSomewhere
+    case onlyGoneProgramsThere
+    case helperOutOfDate, accountNotAllowed, notAuthorized, tooManyItems, noTrash, pathTooLong, cannotKeepRecord
+    case cannotReadRecord
+    case notInTrash, notInHelpersRecord, invalidRequest, configurationMissing, declaredTwice, keptByTheHelper
+    case anotherDisk, ranOutOfTime, helperMayStillMove
+    case toolTimedOut, toolStopped, notOnItsOwn
+    case receiptMisplaced, receiptForgotten, homebrewNotInstalled, helperUnavailable, homebrewElsewhere
+    case helperSaidNothing
+
+    public init?(_ message: String) {
+        guard let found = Self.allCases.first(where: { $0.english == message || $0.englishBefore.contains(message) })
+        else { return nil }
+        self = found
+    }
+
+    /// The English an earlier version used for the same thing: a helper an update left running still sends it, and
+    /// History keeps the words a removal was refused in.
+    var englishBefore: [String] {
+        switch self {
+        case .helperOutOfDate: ["Peel’s helper is out of date. Reinstall it in Settings."]
+        case .leadsSomewhere: ["It still leads to something on this Mac."]
+        case .declaredTwice: ["Two files declare this job."]
+        case .helperUnavailable: ["Peel’s helper isn’t available."]
+        default: []
+        }
+    }
+
+    /// The English exactly as it is sent.
+    public var english: String {
+        switch self {
+        case .notAFullPath: PrivilegedPathPolicy.Rejection.notAbsolute.explanation
+        case .dotInPath: PrivilegedPathPolicy.Rejection.relativeComponent.explanation
+        case .controlCharacter: PrivilegedPathPolicy.Rejection.controlCharacter.explanation
+        case .folderNotFound: PrivilegedPathPolicy.Rejection.unresolvableParent.explanation
+        case .tooManyOpenFolders: PrivilegedPathPolicy.Rejection.tooManyOpenFolders.explanation
+        case .outsideHelpersFolders: PrivilegedPathPolicy.Rejection.outsideAllowedLocations.explanation
+        case .onlyAppsThere: PrivilegedPathPolicy.Rejection.notAnApplication.explanation
+        case .partOfAnotherApp: PrivilegedPathPolicy.Rejection.partOfAnotherApp.explanation
+        case .notThereAnymore: PrivilegedPathPolicy.Rejection.missing.explanation
+        case .alreadyThere: PrivilegedPathPolicy.Rejection.alreadyExists.explanation
+        case .protectedByMacOS: PrivilegedPathPolicy.Rejection.protectedByFlags.explanation
+        case .irreplaceable: PrivilegedPathPolicy.Rejection.irreplaceable.explanation
+        case .codeFolder: PrivilegedPathPolicy.Rejection.loadsCode.explanation
+        case .onlyLinksThere: PrivilegedPathPolicy.Rejection.notALink.explanation
+        case .leadsSomewhere: PrivilegedPathPolicy.Rejection.leadsSomewhere.explanation
+        case .onlyGoneProgramsThere: PrivilegedPathPolicy.Rejection.startsAProgram.explanation
+        case .helperOutOfDate: HelperRefusal.outOfDate.rawValue
+        case .accountNotAllowed: HelperRefusal.notAllowed.rawValue
+        case .notAuthorized: HelperRefusal.notAuthorized.rawValue
+        case .tooManyItems: HelperRefusal.tooManyItems.rawValue
+        case .noTrash: HelperRefusal.noTrash.rawValue
+        case .pathTooLong: HelperRefusal.pathTooLong.rawValue
+        case .cannotKeepRecord: HelperRefusal.cannotKeepRecord.rawValue
+        case .cannotReadRecord: HelperRefusal.cannotReadRecord.rawValue
+        case .notInTrash: HelperRefusal.notInTrash.rawValue
+        case .notInHelpersRecord: HelperRefusal.notInRecord.rawValue
+        case .invalidRequest: HelperRefusal.invalidRequest.rawValue
+        case .configurationMissing: HelperRefusal.missingConfiguration.rawValue
+        case .declaredTwice: HelperRefusal.declaredTwice.rawValue
+        case .keptByTheHelper: HelperRefusal.keptByTheHelper.rawValue
+        case .anotherDisk: HelperRefusal.anotherDisk.rawValue
+        case .ranOutOfTime: HelperRefusal.ranOutOfTime.rawValue
+        case .helperMayStillMove: PrivilegedHelper.mayStillMove
+        case .toolTimedOut: Subprocess.Failure.timedOut.explanation
+        case .toolStopped: Subprocess.Failure.canceled.explanation
+        case .notOnItsOwn: Subprocess.notOnItsOwn
+        case .receiptMisplaced: PackageActions.misplacedReceipt
+        case .receiptForgotten: PackageActions.forgottenReceipt
+        case .homebrewNotInstalled: Homebrew.notInstalled
+        case .helperUnavailable: PrivilegedHelper.unavailable
+        case .helperSaidNothing: PrivilegedHelper.saidNothing
+        case .homebrewElsewhere: Homebrew.changesOnlyWhereHomebrewInstallsItself
+        }
+    }
+}

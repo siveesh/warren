@@ -690,6 +690,7 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        PeelRemovalGate.install()
         let defaults = UserDefaults.standard
         let lastSelection = defaults.string(forKey: PreferenceKey.lastSelectedSection).flatMap(SidebarSection.init(rawValue:))
         let startupPreference = defaults.string(forKey: PreferenceKey.startupPreference).flatMap(StartupPreference.init(rawValue:)) ?? .rememberLast

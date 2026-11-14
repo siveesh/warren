@@ -1,0 +1,159 @@
+import Darwin
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Testing
+
+struct HomebrewChoiceTests {
+    private func program(
+        _ path: String, in directory: borrowing TemporaryDirectory, mode: mode_t = 0o755
+    ) throws -> URL {
+        let url = try directory.file(path)
+        chmod(url.path(percentEncoded: false), mode)
+        return url
+    }
+
+    @Test func takesOnlyARunnableBrewOfThisAccount() throws {
+        let directory = try TemporaryDirectory()
+        let brew = try program("opt/brew/bin/brew", in: directory)
+
+        #expect(HomebrewChoice.refusal(of: brew) == nil)
+        #expect(HomebrewChoice.refusal(of: try program("opt/brew/bin/python3", in: directory)) == .notBrew)
+        #expect(HomebrewChoice.refusal(of: try program("plain/brew", in: directory, mode: 0o644)) == .notAProgram)
+        #expect(HomebrewChoice.refusal(of: try directory.directory("folder/brew")) == .notAProgram)
+        #expect(HomebrewChoice.refusal(of: try program("open/brew", in: directory, mode: 0o757)) == .writableByEveryone)
+        #expect(HomebrewChoice.refusal(of: brew, user: getuid() + 1) == .ownedByAnotherAccount(owner: NSUserName()))
+    }
+
+    @Test func keepsTheChoiceUntilItIsForgotten() throws {
+        let directory = try TemporaryDirectory()
+        let brew = try program("opt/brew/bin/brew", in: directory)
+        let choice = HomebrewChoice(url: directory.url.appending(path: "Peel/homebrew.json"))
+
+        #expect(choice.load() == nil)
+        #expect(choice.save(brew) == nil)
+        #expect(choice.load()?.path(percentEncoded: false) == brew.path(percentEncoded: false))
+        #expect(choice.save(nil) == nil)
+        #expect(choice.load() == nil)
+    }
+
+    @Test(.permissionsHold) func saysWhyTheChoiceCouldNotBeSaved() throws {
+        let directory = try TemporaryDirectory()
+        let folder = try directory.directory("Peel")
+        try directory.setPermissions(0o500, of: folder)
+        defer { try? directory.setPermissions(0o755, of: folder) }
+
+        let refusedWrite = SystemError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        #expect(HomebrewChoice(url: folder.appending(path: "homebrew.json")).save(nil) == .failed(refusedWrite))
+    }
+
+    @Test func runsNoOtherBrewWhileTheChosenOneCannotRun() throws {
+        let directory = try TemporaryDirectory()
+        let brew = try program("opt/brew/bin/brew", in: directory)
+        let choice = HomebrewChoice(url: directory.url.appending(path: "homebrew.json"))
+        #expect(choice.save(brew) == nil)
+
+        chmod(brew.path(percentEncoded: false), 0o644)
+
+        #expect(choice.load()?.path(percentEncoded: false) == brew.path(percentEncoded: false))
+        #expect(choice.unrunnable()?.refusal == .notAProgram)
+        #expect(Homebrew.executable(chosen: choice.load()) == nil)
+    }
+
+    @Test(arguments: ["{", "", "[\"/opt/brew/bin/brew\"]", "42"])
+    func aChoiceThatCannotBeReadRunsNoBrewUntilItIsChosenAgain(text: String) throws {
+        let directory = try TemporaryDirectory()
+        let brew = try program("opt/brew/bin/brew", in: directory)
+        let usual = try program("opt/homebrew/bin/brew", in: directory)
+        let file = try directory.file("Peel/homebrew.json", contents: Data(text.utf8))
+        let choice = HomebrewChoice(url: file)
+
+        #expect(choice.reading() == .unreadable)
+        #expect(choice.load() == nil)
+        #expect(choice.unrunnable() == HomebrewChoice.Unrunnable(brew: nil, refusal: .unreadable))
+        #expect(Homebrew.executable(choosing: choice, usualPlaces: [usual]) == nil)
+        #expect(Homebrew.mayHaveInstalledPeel(chosen: nil, isChoiceUnreadable: true, root: directory.url))
+
+        #expect(choice.save(brew) == nil)
+        #expect(choice.load()?.path(percentEncoded: false) == brew.path(percentEncoded: false))
+        #expect(DamagedFile.copies(of: file)?.count == 1)
+    }
+
+    @Test func noChoiceAndUsingTheUsualPlacesAreNotAChoiceThatCannotBeRead() throws {
+        let directory = try TemporaryDirectory()
+        let usual = try program("opt/homebrew/bin/brew", in: directory)
+        let choice = HomebrewChoice(url: directory.url.appending(path: "Peel/homebrew.json"))
+
+        #expect(choice.reading() == .nothingChosen)
+        #expect(Homebrew.executable(choosing: choice, usualPlaces: [usual]) == usual)
+        #expect(choice.save(nil) == nil)
+        #expect(choice.reading() == .nothingChosen)
+        #expect(choice.unrunnable() == nil)
+    }
+
+    @Test func runsABrewInAUsualPlaceOnlyByTheRuleAChosenOneFollows() throws {
+        let directory = try TemporaryDirectory()
+        let brew = try program("opt/homebrew/bin/brew", in: directory)
+        let missing = directory.url.appending(path: "usr/local/bin/brew")
+
+        #expect(Homebrew.executable(chosen: nil, usualPlaces: [missing, brew]) == brew)
+        #expect(Homebrew.refusedInAUsualPlace(chosen: nil, usualPlaces: [missing, brew]) == nil)
+
+        #expect(Homebrew.executable(chosen: nil, usualPlaces: [missing, brew], user: getuid() + 1) == nil)
+        let refused = Homebrew.refusedInAUsualPlace(chosen: nil, usualPlaces: [missing, brew], user: getuid() + 1)
+        #expect(refused == HomebrewChoice.Unrunnable(brew: brew, refusal: .ownedByAnotherAccount(owner: NSUserName())))
+        #expect(Homebrew.refusedInAUsualPlace(chosen: brew, usualPlaces: [missing, brew], user: getuid() + 1) == nil)
+    }
+
+    @Test(.permissionsHold) func tellsFromItsCaskroomsWhetherAHomebrewMayHaveInstalledPeel() throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("opt/homebrew/Caskroom/another-app")
+        #expect(!Homebrew.mayHaveInstalledPeel(chosen: nil, root: directory.url))
+
+        let chosen = directory.url.appending(path: "opt/brew/bin/brew")
+        try directory.directory("opt/brew/Caskroom/peel")
+        #expect(Homebrew.mayHaveInstalledPeel(chosen: chosen, root: directory.url))
+        #expect(!Homebrew.mayHaveInstalledPeel(chosen: nil, root: directory.url))
+
+        try directory.directory("usr/local/Caskroom/peel")
+        #expect(Homebrew.mayHaveInstalledPeel(chosen: nil, root: directory.url))
+
+        let closed = try TemporaryDirectory()
+        try closed.directory("opt/homebrew/Caskroom")
+        try closed.setPermissions(0o000, of: "opt/homebrew/Caskroom")
+        defer { try? closed.setPermissions(0o755, of: "opt/homebrew/Caskroom") }
+        #expect(Homebrew.mayHaveInstalledPeel(chosen: nil, root: closed.url), "a Caskroom it can't look into")
+    }
+
+    @Test func runsTheChosenBrewAndFindsItsOwnPrograms() throws {
+        let directory = try TemporaryDirectory()
+        let brew = try program("opt/brew/bin/brew", in: directory)
+        let prefix = directory.url.appending(path: "opt/brew").path(percentEncoded: false)
+        let standard = URL(filePath: "/opt/homebrew/bin/brew")
+
+        #expect(Homebrew.executable(chosen: brew) == brew)
+        let path = try #require(Homebrew.environment(autoUpdate: false, executable: brew)["PATH"])
+        #expect(path.hasPrefix("\(prefix)/bin:\(prefix)/sbin:"))
+        let usual = Homebrew.environment(autoUpdate: false)["PATH"]
+        #expect(Homebrew.environment(autoUpdate: false, executable: standard)["PATH"] == usual)
+    }
+
+    @Test func runsTheHomebrewInUsrLocalThroughRosettaOnAppleSilicon() {
+        let intel = URL(filePath: "/usr/local/bin/brew")
+        let expected = ["-x86_64", "/usr/local/bin/brew", "--version"]
+
+        let translated = Homebrew.launch(of: intel, ["--version"], isAppleSilicon: true, hasRosetta: true)
+        #expect(translated.program == "/usr/bin/arch")
+        #expect(translated.arguments == expected)
+        for (brew, isAppleSilicon, hasRosetta) in [
+            (intel, false, false),
+            (intel, true, false),
+            (URL(filePath: "/opt/homebrew/bin/brew"), true, true),
+            (URL(filePath: "/opt/brew/bin/brew"), true, true),
+        ] {
+            let plain = Homebrew.launch(of: brew, ["--version"], isAppleSilicon: isAppleSilicon, hasRosetta: hasRosetta)
+            #expect(plain.program == brew.path(percentEncoded: false))
+            #expect(plain.arguments == ["--version"])
+        }
+    }
+}

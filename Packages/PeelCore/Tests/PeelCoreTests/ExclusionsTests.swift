@@ -1,0 +1,749 @@
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Testing
+
+struct ExclusionsTests {
+    @Test func saysWhichEntriesExcludeAnItem() {
+        let app = URL(filePath: "/Applications/Example.app", directoryHint: .isDirectory)
+        let folder = URL(filePath: "/Users/me/Projects", directoryHint: .isDirectory)
+        let project = folder.appending(path: "Site", directoryHint: .isDirectory)
+
+        let byIdentifier = Exclusions(bundleIdentifiers: ["org.example.app"]).reasons(excluding: app, app: "org.example.app")
+        #expect(byIdentifier == Exclusions.Reasons(identifier: "org.example.app", paths: [], folders: [], apps: []))
+
+        let byPath = Exclusions(paths: [URL(filePath: "/Applications/Example.app/")]).reasons(excluding: app, app: nil)
+        #expect(byPath.paths.count == 1 && byPath.folders.isEmpty && byPath.identifier == nil)
+
+        let byFolder = Exclusions(paths: [folder]).reasons(excluding: project, app: nil)
+        #expect(byFolder == Exclusions.Reasons(identifier: nil, paths: [], folders: [folder], apps: []))
+
+        let both = Exclusions(paths: [folder, project], bundleIdentifiers: ["org.example.other"])
+            .reasons(excluding: project, app: nil)
+        #expect(both.paths == [project] && both.folders == [folder] && both.identifier == nil)
+
+        #expect(Exclusions(paths: [project]).reasons(excluding: folder, app: nil).isEmpty)
+    }
+
+    @Test func saysWhichExcludedAppsFolderAnItemIsIn() {
+        let caches = URL(filePath: "/Users/me/Library/Caches", directoryHint: .isDirectory)
+        let exclusions = Exclusions(bundleIdentifiers: ["org.example.Notes"])
+
+        let inside = exclusions.reasons(excluding: caches.appending(path: "org.example.notes/data.db"), app: nil)
+        #expect(inside == Exclusions.Reasons(identifier: nil, paths: [], folders: [], apps: ["org.example.Notes"]))
+        let own = exclusions.reasons(excluding: caches.appending(path: "org.example.Notes"), app: nil)
+        #expect(own.apps == ["org.example.Notes"])
+        #expect(exclusions.reasons(excluding: caches.appending(path: "org.example.Other"), app: nil).isEmpty)
+    }
+
+    @Test func findsTheExcludedPlacesInsideAFolderOnce() {
+        let caches = URL(filePath: "/Users/x/Library/Caches", directoryHint: .isDirectory)
+        let exclusions = Exclusions(paths: [
+            caches.appending(path: "org.example.one"),
+            caches.appending(path: "org.example.one/inner"),
+            caches.appending(path: "org.example.two"),
+            URL(filePath: "/Users/x/Documents"),
+        ])
+
+        let places = Set(exclusions.places(inside: caches).map(\.lastPathComponent))
+        #expect(places == ["org.example.one", "org.example.two"])
+        #expect(exclusions.places(inside: URL(filePath: "/Users/x/Library/Logs")).isEmpty)
+        let two = caches.appending(path: "org.example.two")
+        #expect(exclusions.places(inside: two).isEmpty, "a place is not inside itself")
+    }
+
+    /// A slash and a combining mark after it are one `Character`, so a name that begins with the mark is not
+    /// "inside" its folder to a comparison made on characters. Compared name by name, what sits in an excluded
+    /// folder is excluded whatever its name begins with, and an excluded item inside a folder is still held.
+    @Test func whatIsInsideAnExcludedFolderIsExcludedWhateverItsNameBeginsWith() {
+        let folder = URL(filePath: "/Users/x/Projects", directoryHint: .isDirectory)
+        let exclusions = Exclusions(paths: [folder])
+        let marked = URL(filePath: "/Users/x/Projects/\u{301}notes.txt")
+
+        #expect(exclusions.excludes(marked), "a file inside an excluded folder was not excluded")
+        #expect(Exclusions(paths: [marked]).holds(folder), "a folder holding an excluded file could be moved")
+        #expect(!exclusions.excludes(URL(filePath: "/Users/x/Projects Old/notes.txt")))
+    }
+
+    @Test func coversAnItemAndEverythingInsideIt() {
+        let exclusions = Exclusions(paths: [URL(filePath: "/Users/x/Library/Application Support/Keep")])
+
+        #expect(exclusions.excludes(URL(filePath: "/Users/x/Library/Application Support/Keep")))
+        #expect(exclusions.excludes(URL(filePath: "/Users/x/Library/Application Support/Keep/data.db")))
+        #expect(!exclusions.excludes(URL(filePath: "/Users/x/Library/Application Support/Keeper")))
+        #expect(!exclusions.excludes(URL(filePath: "/Users/x/Library/Application Support")))
+        #expect(!Exclusions.none.excludes(URL(filePath: "/Users/x/anything")))
+    }
+
+    /// A folder chosen in an open panel carries a trailing slash; one built from a path string does not.
+    @Test func matchesAFolderHoweverItsURLWasMade() {
+        let chosen = Exclusions(paths: [URL(filePath: "/Users/x/Library/Caches/uv", directoryHint: .isDirectory)])
+
+        #expect(chosen.excludes(URL(filePath: "/Users/x/Library/Caches/uv")))
+        #expect(chosen.excludes(URL(filePath: "/Users/x/Library/Caches/uv", directoryHint: .isDirectory)))
+        #expect(chosen.excludes(URL(filePath: "/Users/x/Library/Caches/uv/archive")))
+        #expect(!chosen.excludes(URL(filePath: "/Users/x/Library/Caches/uvx")))
+    }
+
+    /// `brew uninstall` deletes for good, so the Homebrew page never runs it on a package that would take
+    /// something the user excluded.
+    @Test func keepsWhatBrewUninstallWouldDeleteForGood() {
+        let installation = HomebrewInstallation(version: "7.0.9", prefix: URL(filePath: "/opt/homebrew"))
+        let app = InstalledApp(url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "com.example.app", name: "Example")
+        let cask = HomebrewPackage(name: "example", kind: .cask, appTargets: ["/Applications/Example.app"], quitIdentifiers: ["com.example.app"])
+        let formula = HomebrewPackage(name: "wget", kind: .formula)
+
+        #expect(Exclusions(paths: [URL(filePath: "/Applications/Example.app")]).excludes(cask, apps: [], installation: installation) == true)
+        #expect(Exclusions(paths: [URL(filePath: "/Applications/Example.app/Contents/Resources/keep")]).excludes(cask, apps: [], installation: installation) == true)
+        #expect(Exclusions(bundleIdentifiers: ["com.example.app"]).excludes(cask, apps: [app], installation: installation) == true)
+        #expect(Exclusions(bundleIdentifiers: ["com.example.app"]).excludes(cask, apps: [], installation: installation) == true, "the identifier it quits names it too")
+        #expect(Exclusions(paths: [URL(filePath: "/opt/homebrew/Caskroom/example")]).excludes(cask, apps: [], installation: installation) == true)
+        #expect(Exclusions(paths: [URL(filePath: "/opt/homebrew")]).excludes(formula, apps: [], installation: installation) == true)
+        #expect(Exclusions.unreadable(because: nil).excludes(formula, apps: [], installation: installation) == true, "a list that cannot be read keeps everything")
+        #expect(Exclusions.notYetRead.excludes(formula, apps: [], installation: installation) == true, "a list not read yet keeps everything")
+
+        let unrelated = Exclusions(paths: [URL(filePath: "/Applications/Other.app")], bundleIdentifiers: ["com.other.app"])
+        #expect(unrelated.excludes(cask, apps: [app], installation: installation) == false)
+        #expect(unrelated.excludes(formula, apps: [], installation: installation) == false)
+        #expect(Exclusions(paths: [URL(filePath: "/opt/homebrew/Cellar/curl")]).excludes(formula, apps: [], installation: installation) == false)
+    }
+
+    @Test func keepsWhatElseBrewUninstallRemoves() throws {
+        let directory = try TemporaryDirectory()
+        let installation = HomebrewInstallation(version: "7.0.9", prefix: directory.url.appending(path: "prefix"))
+        let kept = try directory.file("home/Library/Application Support/Kept/state.db")
+        let folder = kept.deletingLastPathComponent()
+        let font = try directory.file("home/Library/Fonts/Example.ttf")
+        let link = try directory.file("prefix/bin/example")
+        let excludes = { (exclusions: Exclusions, cask: HomebrewPackage) in
+            exclusions.excludes(cask, apps: [], installation: installation, home: directory.url.appending(path: "home"))
+        }
+        let named = HomebrewPackage(name: "example", kind: .cask, uninstallPatterns: ["~/Library/Application Support/Kept"])
+        let globbed = HomebrewPackage(name: "example", kind: .cask, uninstallPatterns: ["~/Library/Application Support/Ke*"])
+        let zapped = HomebrewPackage(name: "example", kind: .cask, leftoverPatterns: ["~/Library/Application Support/Kept"])
+        let placed = HomebrewPackage(
+            name: "example", kind: .cask, commandLinks: [link.path(percentEncoded: false)],
+            otherTargets: [font.path(percentEncoded: false)]
+        )
+
+        #expect(excludes(Exclusions(paths: [folder]), named) == true)
+        #expect(excludes(Exclusions(paths: [kept]), named) == true, "the folder it removes holds what is excluded")
+        #expect(excludes(Exclusions(paths: [folder]), globbed) == true)
+        #expect(excludes(Exclusions(paths: [folder]), zapped) == false, "Peel never runs zap")
+        #expect(excludes(Exclusions(paths: [font]), placed) == true)
+        #expect(excludes(Exclusions(paths: [link]), placed) == true)
+        #expect(excludes(Exclusions(paths: [folder]), placed) == false)
+        #expect(excludes(Exclusions(bundleIdentifiers: ["org.example.other"]), placed) == false, "a file holds no app")
+    }
+
+    @Test(.permissionsHold) func keepsAPackageItCannotSearchForAnExclusion() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("prefix/Caskroom/example/1.0/kept/org.example.excluded/state.db")
+        try directory.setPermissions(0, of: "prefix/Caskroom/example/1.0")
+        defer { try? directory.setPermissions(0o755, of: "prefix/Caskroom/example/1.0") }
+        let installation = HomebrewInstallation(version: "7.0.9", prefix: directory.url.appending(path: "prefix"))
+        let cask = HomebrewPackage(name: "example", kind: .cask)
+
+        #expect(Exclusions(bundleIdentifiers: ["org.example.excluded"]).excludes(cask, apps: [], installation: installation) == nil)
+    }
+
+    @Test func matchesAppsByBundleIdentifierOrPlace() {
+        let app = InstalledApp(url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "com.example.app", name: "Example")
+
+        #expect(Exclusions(bundleIdentifiers: ["com.example.app"]).excludes(app))
+        #expect(Exclusions(paths: [URL(filePath: "/Applications/Example.app")]).excludes(app))
+        #expect(!Exclusions(bundleIdentifiers: ["com.other.app"]).excludes(app))
+    }
+
+    /// `/var` is a symbolic link to `/private/var`. Written either way it is the same file, and an exclusion
+    /// that only held for one spelling would quietly stop protecting anything under `/var`, `/tmp`, or `/etc`.
+    @Test func holdsHoweverTheSamePathIsSpelled() {
+        let exclusions = Exclusions(paths: [URL(filePath: "/var/folders/x/C/com.example.app")])
+
+        #expect(exclusions.excludes(URL(filePath: "/private/var/folders/x/C/com.example.app")))
+        #expect(exclusions.excludes(URL(filePath: "/private/var/folders/x/C/com.example.app/inside")))
+        #expect(!exclusions.excludes(URL(filePath: "/private/var/folders/x/C/com.example.other")))
+
+        let theOtherWayRound = Exclusions(paths: [URL(filePath: "/private/tmp/keep")])
+        #expect(theOtherWayRound.excludes(URL(filePath: "/tmp/keep")))
+    }
+
+    /// The other direction: a folder around something excluded, however either of them is spelled.
+    @Test func knowsAFolderThatHoldsSomethingExcluded() {
+        let exclusions = Exclusions(paths: [URL(filePath: "/var/folders/x/C/Keep/Inner/data.db")])
+
+        #expect(exclusions.holds(URL(filePath: "/private/var/folders/x/C/Keep")))
+        #expect(exclusions.holds(URL(filePath: "/VAR/folders/x/C/keep/inner", directoryHint: .isDirectory)))
+        #expect(!exclusions.holds(URL(filePath: "/var/folders/x/C/Keep/Inner/data.db")))
+        #expect(!exclusions.holds(URL(filePath: "/var/folders/x/C/Kee")))
+        #expect(!exclusions.holds(URL(filePath: "/var/folders/x/C/Other")))
+        #expect(!Exclusions.none.holds(URL(filePath: "/var")))
+    }
+
+    @Test func anExcludedAppsOwnFolderIsExcludedWithAllItHolds() {
+        let caches = URL(filePath: "/Users/x/Library/Caches", directoryHint: .isDirectory)
+        let exclusions = Exclusions(bundleIdentifiers: ["org.example.Notes"])
+
+        #expect(exclusions.excludes(caches.appending(path: "org.example.Notes")))
+        #expect(exclusions.excludes(caches.appending(path: "ORG.EXAMPLE.NOTES/data.db")))
+        #expect(exclusions.excludes(URL(filePath: "/Users/x/Library/Containers/org.example.Notes/Data/Library/Caches")))
+        #expect(!exclusions.excludes(caches.appending(path: "org.example.Notes.savedState")))
+        #expect(!exclusions.excludes(caches.appending(path: "org.example.NotesHelper")))
+        #expect(!exclusions.excludes(caches))
+        #expect(!Exclusions(bundleIdentifiers: ["Example"]).excludes(caches.appending(path: "Example")))
+    }
+
+    @Test func aFolderWithAnExcludedAppsOwnFolderALevelOrTwoInsideHoldsIt() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Maker/org.example.Notes/data.db")
+        try directory.file("Vendor/Products/org.example.Notes/data.db")
+        try directory.file("Other/org.example.Other/data.db")
+        let exclusions = Exclusions(bundleIdentifiers: ["org.example.Notes"])
+
+        #expect(exclusions.holds(directory.url.appending(path: "Maker")))
+        #expect(exclusions.holds(directory.url.appending(path: "Vendor")))
+        #expect(!exclusions.holds(directory.url.appending(path: "Other")))
+        #expect(!exclusions.holds(directory.url.appending(path: "Maker/org.example.Notes")))
+    }
+
+    @Test func refusesToRemoveAnExcludedAppsOwnFolderOrAFolderHoldingIt() async throws {
+        let directory = try TemporaryDirectory()
+        let own = try directory.file("home/Library/Caches/org.example.Notes/cache.db").deletingLastPathComponent()
+        let maker = try directory.file("home/Library/Application Support/Maker/org.example.Notes/data.db")
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let other = try directory.file("home/Library/Caches/org.example.Other/cache.db").deletingLastPathComponent()
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home"),
+            rootDirectory: directory.url.appending(path: "root")
+        )
+        let trash = try directory.directory("Trash")
+        let exclusions = Exclusions(bundleIdentifiers: ["org.example.Notes"])
+        let service = TrashService(environment: environment, exclusions: exclusions) { url in
+            let destination = trash.appending(path: url.lastPathComponent)
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        }
+
+        let result = await service.trash([own, maker, other])
+        #expect(result.trashed.map(\.originalURL) == [other])
+        #expect(result.failures.map(\.reason) == [.guarded(.excluded), .guarded(.excluded)])
+        #expect(own.isThere && maker.isThere)
+    }
+
+    private func app(_ path: String, identifier: String, in directory: borrowing TemporaryDirectory) throws -> URL {
+        let info = try PropertyListSerialization.data(
+            fromPropertyList: ["CFBundleIdentifier": identifier], format: .xml, options: 0
+        )
+        return try directory.file("\(path)/Contents/Info.plist", contents: info)
+            .deletingLastPathComponent().deletingLastPathComponent()
+    }
+
+    @Test func refusesToRemoveAnExcludedAppOrAFolderHoldingIt() async throws {
+        let directory = try TemporaryDirectory()
+        let excluded = try app("home/Applications/Notes.app", identifier: "org.example.Notes", in: directory)
+        let holder = try app("home/Downloads/Old/Notes.app", identifier: "org.example.Notes", in: directory)
+            .deletingLastPathComponent()
+        let other = try app("home/Applications/Other.app", identifier: "org.example.Other", in: directory)
+        let trash = try directory.directory("Trash")
+        let service = TrashService(
+            environment: SearchEnvironment(
+                homeDirectory: directory.url.appending(path: "home"),
+                rootDirectory: directory.url.appending(path: "root")
+            ),
+            exclusions: Exclusions(bundleIdentifiers: ["org.example.Notes"])
+        ) { url in
+            let destination = trash.appending(path: url.lastPathComponent)
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        }
+
+        let result = await service.trash([excluded, holder, other])
+
+        #expect(result.trashed.map(\.originalURL) == [other])
+        #expect(result.failures.map(\.reason) == [.guarded(.excluded), .guarded(.excluded)])
+        #expect(excluded.isThere && holder.isThere)
+    }
+
+    @Test func putsNoExcludedAppBack() throws {
+        let directory = try TemporaryDirectory()
+        let trashed = try app("home/.Trash/Notes.app", identifier: "org.example.Notes", in: directory)
+        let other = try app("home/.Trash/Other.app", identifier: "org.example.Other", in: directory)
+        let service = TrashService(
+            environment: SearchEnvironment(
+                homeDirectory: directory.url.appending(path: "home"),
+                rootDirectory: directory.url.appending(path: "root")
+            ),
+            exclusions: Exclusions(bundleIdentifiers: ["org.example.Notes"])
+        ) { $0 }
+        let applications = directory.url.appending(path: "home/Applications", directoryHint: .isDirectory)
+
+        let refusal = service.refusal(ofPuttingBack: TrashedItem(
+            originalURL: applications.appending(path: "Notes.app"), trashedURL: trashed, date: .now
+        ), canUseHelper: true)
+        let control = service.refusal(ofPuttingBack: TrashedItem(
+            originalURL: applications.appending(path: "Other.app"), trashedURL: other, date: .now
+        ), canUseHelper: true)
+
+        #expect(refusal == .notAllowed(.excluded))
+        #expect(control == nil)
+    }
+
+    @Test func refusesToRemoveAFolderThatHoldsSomethingExcluded() async throws {
+        let directory = try TemporaryDirectory()
+        let kept = try directory.file("home/Library/Application Support/Example/keep.db")
+        try directory.file("home/Library/Application Support/Example/cache.db")
+        let folder = kept.deletingLastPathComponent()
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home"),
+            rootDirectory: directory.url.appending(path: "root")
+        )
+        let trash = try directory.directory("Trash")
+        let service = TrashService(environment: environment, exclusions: Exclusions(paths: [kept])) { url in
+            let destination = trash.appending(path: url.lastPathComponent)
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        }
+
+        let result = await service.trash([folder])
+        #expect(result.trashed.isEmpty)
+        #expect(result.failures.map(\.reason) == [.guarded(.excluded)])
+        #expect(FileManager.default.fileExists(atPath: kept.path(percentEncoded: false)))
+    }
+
+    @Test func keepsExcludedItemsOutOfResults() {
+        let urls = [URL(filePath: "/a/one"), URL(filePath: "/a/two"), URL(filePath: "/b/three")]
+        let kept = Exclusions(paths: [URL(filePath: "/a")]).keeping(urls) { $0 }
+        #expect(kept == [URL(filePath: "/b/three")])
+    }
+
+    @Test func keepsAnExcludedAppsOwnFolderOutOfResults() {
+        let urls = [URL(filePath: "/a/org.example.Notes/one"), URL(filePath: "/a/two")]
+        let kept = Exclusions(bundleIdentifiers: ["org.example.Notes"]).keeping(urls) { $0 }
+        #expect(kept == [URL(filePath: "/a/two")])
+    }
+
+    @Test func aPathWrittenByHandIsReadAndWhatCantBeReadIsKeptAside() async throws {
+        let directory = try TemporaryDirectory()
+        let file = try directory.file(
+            "Peel/exclusions.json",
+            contents: Data(#"{"bundleIdentifiers":["org.example.notes",7],"paths":["/Users/example/Project","~/Documents",null]}"#.utf8)
+        )
+        let store = ExclusionStore(url: file)
+        let project = URL(filePath: "/Users/example/Project/notes.txt")
+
+        let saved = await store.load()
+        #expect(saved.isKnown)
+        #expect(saved.excludes(project))
+        #expect(saved.unreadableEntries == 3)
+
+        _ = await store.change { $0.add([URL(filePath: "/Users/example/Music/Keep")]) }
+
+        #expect(DamagedFile.copies(of: file)?.count == 1)
+        #expect(await store.load().unreadableEntries == 0)
+        #expect(await store.load().excludes(project))
+    }
+
+    @Test func survivesBeingWrittenAndReadBack() async throws {
+        let directory = try TemporaryDirectory()
+        let store = ExclusionStore(url: directory.url.appending(path: "exclusions.json"))
+        #expect(await store.load() == .none)
+
+        let exclusions = Exclusions(paths: [URL(filePath: "/Users/x/Keep")], bundleIdentifiers: ["com.example.app"])
+        _ = await store.change { $0 = exclusions }
+        #expect(await store.load() == exclusions)
+    }
+
+    /// The app reads the list at launch, and `peel exclusions` can change it while the app runs. A change reads the
+    /// list again under the file's lock, so what the other one saved meanwhile is kept.
+    @Test func aChangeKeepsWhatAnotherWriterSaved() async throws {
+        let directory = try TemporaryDirectory()
+        let file = directory.url.appending(path: "Peel/exclusions.json")
+        let (app, terminal) = (ExclusionStore(url: file), ExclusionStore(url: file))
+        let (kept, added) = (URL(filePath: "/Users/x/Kept"), URL(filePath: "/Users/x/Added"))
+        _ = await app.load()
+        _ = await terminal.change { $0 = Exclusions(paths: [kept]) }
+
+        let outcome = await app.change { $0.paths.insert(added) }
+
+        #expect(outcome == .saved(Exclusions(paths: [kept, added])))
+        #expect(await app.load().paths == [kept, added])
+    }
+
+    /// Changes made at once, as two processes can make them, each land.
+    @Test func changesMadeAtOnceAllLand() async throws {
+        let directory = try TemporaryDirectory()
+        let store = ExclusionStore(url: directory.url.appending(path: "Peel/exclusions.json"))
+
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0..<16 {
+                group.addTask { _ = await store.change { $0.paths.insert(URL(filePath: "/Users/x/\(index)")) } }
+            }
+        }
+
+        #expect(await store.load().paths.count == 16)
+    }
+
+    @Test func startingOverLeavesAListItCanReadAsItIs() async throws {
+        let directory = try TemporaryDirectory()
+        let store = ExclusionStore(url: directory.url.appending(path: "exclusions.json"))
+        let chosen = Exclusions(paths: [URL(filePath: "/Users/x/Keep")], bundleIdentifiers: ["com.example.app"])
+        _ = await store.change { $0 = chosen }
+
+        #expect(await store.startOver() == .notNeeded)
+        #expect(await store.load() == chosen, "what the person excluded was thrown away")
+    }
+
+    @Test func startingOverKeepsAListItCannotReadAside() async throws {
+        let directory = try TemporaryDirectory()
+        let file = try directory.file("exclusions.json", contents: Data("not json".utf8))
+
+        #expect(await ExclusionStore(url: file).startOver() == .started)
+        #expect(await ExclusionStore(url: file).load() == .none)
+        let kept = try FileManager.default.contentsOfDirectory(atPath: directory.url.path(percentEncoded: false))
+        #expect(kept.contains { $0.hasPrefix("exclusions-damaged-") })
+    }
+
+    /// A list that cannot be read is left as it is: changing it would throw away what the user chose.
+    @Test func aChangeLeavesAListItCannotReadAsItIs() async throws {
+        let directory = try TemporaryDirectory()
+        let file = try directory.file("exclusions.json", contents: Data("not json".utf8))
+
+        let outcome = await ExclusionStore(url: file).change { $0.bundleIdentifiers.insert("com.example.app") }
+
+        #expect(outcome == .unreadable(.damaged))
+        #expect(try String(contentsOf: file, encoding: .utf8) == "not json")
+    }
+
+    /// An edit in Settings to a list that cannot be read starts a new list, as Settings says it does, and the old
+    /// file stays beside it under another name.
+    @Test func anEditThatStartsOverKeepsTheListItCannotReadAside() async throws {
+        let directory = try TemporaryDirectory()
+        let file = try directory.file("exclusions.json", contents: Data("not json".utf8))
+
+        let outcome = await ExclusionStore(url: file).change(startingOverIfUnreadable: true) {
+            $0.bundleIdentifiers.insert("com.example.app")
+        }
+
+        #expect(outcome == .saved(Exclusions(bundleIdentifiers: ["com.example.app"])))
+        #expect(await ExclusionStore(url: file).load() == Exclusions(bundleIdentifiers: ["com.example.app"]))
+        let names = try FileManager.default.contentsOfDirectory(atPath: directory.url.path(percentEncoded: false))
+        let aside = try #require(names.first { $0.hasPrefix("exclusions-damaged-") })
+        #expect(try String(contentsOf: directory.url.appending(path: aside), encoding: .utf8) == "not json")
+    }
+
+    @Test(.permissionsHold) func saysWhyAListItCannotReadCouldNotBeSetAsideToStartAgain() async throws {
+        let directory = try TemporaryDirectory()
+        let file = try directory.file("Peel/exclusions.json", contents: Data("not json".utf8))
+        try directory.setPermissions(0o500, of: "Peel")
+        defer { try? directory.setPermissions(0o755, of: "Peel") }
+
+        let outcome = await ExclusionStore(url: file).change(startingOverIfUnreadable: true) {
+            $0.bundleIdentifiers.insert("com.example.app")
+        }
+
+        let refusedMove = SystemError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        #expect(outcome == .notSaved(Exclusions(bundleIdentifiers: ["com.example.app"]), .failed(refusedMove)))
+        #expect(try String(contentsOf: file, encoding: .utf8) == "not json")
+    }
+
+    /// A change that cannot be written says what the list would have been, so the app can keep it until it quits.
+    @Test(.permissionsHold) func aChangeThatCannotBeWrittenSaysWhatItWouldHaveSaved() async throws {
+        let directory = try TemporaryDirectory()
+        let folder = directory.url.appending(path: "Peel", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let store = ExclusionStore(url: folder.appending(path: "exclusions.json"))
+        _ = await store.change { $0 = Exclusions(paths: [URL(filePath: "/Users/x/Kept")]) }
+        try directory.setPermissions(0o500, of: folder)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: folder.path(percentEncoded: false)
+            )
+        }
+
+        let outcome = await store.change { $0.paths.insert(URL(filePath: "/Users/x/Added")) }
+
+        let refusedWrite = SystemError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        let wouldHaveSaved = Exclusions(paths: [URL(filePath: "/Users/x/Kept"), URL(filePath: "/Users/x/Added")])
+        #expect(outcome == .notSaved(wouldHaveSaved, .failed(refusedWrite)))
+        #expect(await store.load().paths == [URL(filePath: "/Users/x/Kept")])
+    }
+
+    /// An entry that makes no sense is dropped, and the rest of the list is kept.
+    @Test func keepsTheRestOfAListWithABadEntry() async throws {
+        let directory = try TemporaryDirectory()
+        let file = try directory.file("exclusions.json", contents: Data(#"{"paths":["file:///Users/x/Vault/",7,""],"bundleIdentifiers":["com.example.app",false]}"#.utf8))
+
+        let loaded = await ExclusionStore(url: file).load()
+
+        #expect(!loaded.isUnreadable)
+        #expect(loaded.excludes(URL(filePath: "/Users/x/Vault/secret.txt")))
+        #expect(loaded.bundleIdentifiers == ["com.example.app"])
+    }
+
+    /// A list that is there and cannot be read is not an empty list: what was excluded is unknown.
+    @Test(.permissionsHold) func doesNotReadAListItCannotUnderstandAsEmpty() async throws {
+        let directory = try TemporaryDirectory()
+        let broken = try directory.file("broken.json", contents: Data(#"{"paths":["file:///Users/x/Vault/""#.utf8))
+        let locked = try directory.file("locked.json", contents: Data(#"{"paths":[]}"#.utf8))
+        let folder = try directory.directory("folder.json")
+        try directory.setPermissions(0, of: "locked.json")
+        defer { try? directory.setPermissions(0o644, of: "locked.json") }
+
+        let closed = SystemError(domain: NSPOSIXErrorDomain, code: Int(EACCES))
+        #expect(await ExclusionStore(url: broken).load() == .unreadable(because: .damaged))
+        #expect(await ExclusionStore(url: locked).load() == .unreadable(because: .failed(closed)))
+        #expect(await ExclusionStore(url: folder).load() == .unreadable(because: .notAFile))
+        #expect(await ExclusionStore(url: directory.url.appending(path: "missing.json")).load() == .none)
+    }
+
+    @Test func movesNothingWhileTheListCannotBeRead() async throws {
+        let directory = try TemporaryDirectory()
+        let item = try directory.file("home/Library/Caches/com.example.app/cache.db").deletingLastPathComponent()
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home"),
+            rootDirectory: directory.url.appending(path: "root")
+        )
+        let service = TrashService(environment: environment, exclusions: .unreadable(because: nil)) { $0 }
+
+        let result = await service.trash([item])
+        #expect(result.trashed.isEmpty)
+        #expect(result.failures.map(\.reason) == [.guarded(.exclusionsNotKnown)])
+    }
+
+    /// A list Peel cannot reach is not known to be empty: a folder on the way that cannot be searched, or a link
+    /// that leads nowhere, reads as a list that cannot be read, so nothing moves.
+    @Test func aListItCannotReachIsUnreadableNotEmpty() async throws {
+        let directory = try TemporaryDirectory()
+        let saved = Data(#"{"paths":[],"bundleIdentifiers":["com.example.app"]}"#.utf8)
+        let file = try directory.file("Peel/exclusions.json", contents: saved)
+        let link = directory.url.appending(path: "linked.json")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: URL(filePath: "/nowhere/list.json"))
+        try directory.setPermissions(0o600, of: "Peel")
+        defer { try? directory.setPermissions(0o755, of: "Peel") }
+
+        let closed = SystemError(domain: NSPOSIXErrorDomain, code: Int(EACCES))
+        let nothingThere = SystemError(domain: NSPOSIXErrorDomain, code: Int(ENOENT))
+        #expect(await ExclusionStore(url: file).load() == .unreadable(because: .failed(closed)))
+        #expect(await ExclusionStore(url: link).load() == .unreadable(because: .failed(nothingThere)))
+    }
+
+    /// Until the app has read the saved list, what the user excluded is not known, so nothing moves, as for a list
+    /// that cannot be read.
+    @Test func movesNothingBeforeTheListIsRead() async throws {
+        let directory = try TemporaryDirectory()
+        let item = try directory.file("home/Library/Caches/com.example.app/cache.db").deletingLastPathComponent()
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home"),
+            rootDirectory: directory.url.appending(path: "root")
+        )
+        let service = TrashService(environment: environment, exclusions: .notYetRead) { $0 }
+
+        let result = await service.trash([item])
+        #expect(result.trashed.isEmpty)
+        #expect(result.failures.map(\.reason) == [.guarded(.exclusionsNotKnown)])
+        #expect(!Exclusions.notYetRead.isKnown && !Exclusions.notYetRead.isUnreadable)
+        #expect(Exclusions.none.isKnown && !Exclusions.unreadable(because: nil).isKnown)
+    }
+
+    @Test func refusesToRemoveAnExcludedItem() async throws {
+        let directory = try TemporaryDirectory()
+        let kept = try directory.file("home/Library/Caches/com.example.keep/cache.db").deletingLastPathComponent()
+        let removable = try directory.file("home/Library/Caches/com.example.other/cache.db").deletingLastPathComponent()
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home"),
+            rootDirectory: directory.url.appending(path: "root")
+        )
+        let trash = try directory.directory("Trash")
+        let service = TrashService(environment: environment, exclusions: Exclusions(paths: [kept])) { url in
+            let destination = trash.appending(path: url.lastPathComponent)
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        }
+
+        let result = await service.trash([kept, removable])
+        #expect(result.trashed.map(\.originalURL) == [removable])
+        #expect(result.failures.map(\.reason) == [.guarded(.excluded)])
+        #expect(FileManager.default.fileExists(atPath: kept.path(percentEncoded: false)))
+    }
+}
+
+/// Every scanner leaves out what the user excluded, so an excluded item never shows up at all.
+struct ExclusionsReachEveryScannerTests {
+    private func environment(in directory: borrowing TemporaryDirectory) -> SearchEnvironment {
+        SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+    }
+
+    @Test func aBackgroundItemTheUserExcludedIsNotListed() async throws {
+        let directory = try TemporaryDirectory()
+        let plist = try directory.file("home/Library/LaunchAgents/com.example.keepme.plist", contents: Data("""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>Label</key><string>com.example.keepme</string></dict></plist>
+        """.utf8))
+
+        let listed = await BackgroundItems.scan(environment: environment(in: directory)).items
+        let kept = await BackgroundItems.scan(
+            environment: environment(in: directory),
+            exclusions: Exclusions(paths: [plist])
+        ).items
+
+        #expect(listed.contains { $0.label == "com.example.keepme" })
+        #expect(!kept.contains { $0.label == "com.example.keepme" }, "the scanner spells the path with /private and the exclusion does not")
+    }
+
+    /// An app's page lists the files its installer receipt names, and leaves out any path the user excluded.
+    @Test func theItemsOfAnExcludedPathAreNotListedForAPackage() async throws {
+        let directory = try TemporaryDirectory()
+        let volume = PathPattern.canonical(directory.url).path(percentEncoded: false)
+        let app = PathPattern.canonical(try directory.directory("Applications/Example.app"))
+        let info = try #require(String(
+            data: PropertyListSerialization.data(fromPropertyList: ["volume": volume, "install-location": ""], format: .xml, options: 0),
+            encoding: .utf8
+        ))
+        let pkgutil: PackageReceipts.Pkgutil = { arguments in
+            switch arguments.first {
+            case "--file-info-plist": PkgutilAnswer.fileInfo(arguments[1], packages: "com.example.pkg")
+            case "--pkg-info-plist": info
+            case "--files": "Applications/Example.app\n"
+            default: ""
+            }
+        }
+
+        let listed = await PackageReceipts.receipts(installing: app, exclusions: .none, pkgutil: pkgutil)
+        let excluded = await PackageReceipts.receipts(
+            installing: app,
+            exclusions: Exclusions(paths: [app]),
+            pkgutil: pkgutil
+        )
+
+        #expect(listed.first?.items.count == 1)
+        #expect(excluded.first?.items.isEmpty == true)
+    }
+
+    /// A leftover folder around something excluded is shown and says why, but is never selected.
+    @Test func aLeftoverThatHoldsSomethingExcludedIsShownAndLeftAlone() async throws {
+        let directory = try TemporaryDirectory()
+        let kept = try directory.file("home/Library/Application Support/com.example.app/keep.db")
+        try directory.file("home/Library/Caches/com.example.app/cache.db")
+        let app = InstalledApp(url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "com.example.app", name: "Example")
+
+        let plan = await Uninstallation.prepare(
+            app,
+            installedApps: [app],
+            exclusions: Exclusions(paths: [kept]),
+            environment: environment(in: directory)
+        )
+
+        let holder = try #require(
+            plan.scan.leftovers.first {
+                $0.url.lastPathComponent == "com.example.app" && $0.kind == .applicationSupport
+            }
+        )
+        #expect(holder.match.heldBack == .holdsAnExclusion)
+        #expect(!holder.match.isRecommended)
+        let suggested = plan.suggestedSelection(canUseHelper: true).map { $0.path(percentEncoded: false) }
+        #expect(!suggested.contains { $0.contains("Application Support") })
+        #expect(suggested.contains { $0.contains("/Caches/com.example.app") })
+    }
+
+    /// Developer caches and build artifacts leave out a folder that holds something excluded.
+    @Test func aCacheOrAnArtifactThatHoldsSomethingExcludedIsNotOffered() async throws {
+        let directory = try TemporaryDirectory()
+        let keptInCache = try directory.file("home/Library/Caches/pip/http/keep.bin", bytes: 4096)
+        try directory.file("home/Projects/app/package.json")
+        let keptInModules = try directory.file("home/Projects/app/node_modules/patched/index.js", bytes: 4096)
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let exclusions = Exclusions(paths: [keptInCache, keptInModules])
+
+        let caches = await DeveloperCaches.scan(
+            in: SearchEnvironment(homeDirectory: home, rootDirectory: home), exclusions: exclusions
+        )
+        #expect(!caches.flatMap(\.locations).contains { $0.url.lastPathComponent == "pip" })
+
+        let artifacts = await ProjectArtifacts.scan(roots: [home.appending(path: "Projects")], exclusions: exclusions).artifacts
+        #expect(artifacts.isEmpty)
+    }
+
+    /// Background Items says what runs, so an excluded app's jobs stay listed there, and Peel acts on none of them.
+    @Test func theBackgroundItemsOfAnExcludedAppAreListedAndLeftAlone() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/com.example.keepme.updater.plist", contents: Data("""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>Label</key><string>com.example.keepme.updater</string></dict></plist>
+        """.utf8))
+        let app = InstalledApp(url: URL(filePath: "/Applications/Keep Me.app"), bundleIdentifier: "com.example.KeepMe", name: "Keep Me")
+
+        let listed = await BackgroundItems.scan(installedApps: [app], environment: environment(in: directory)).items
+        let kept = await BackgroundItems.scan(
+            installedApps: [app],
+            environment: environment(in: directory),
+            exclusions: Exclusions(bundleIdentifiers: ["com.example.KeepMe"])
+        ).items
+
+        #expect(listed.first { $0.label == "com.example.keepme.updater" }?.ownerBundleIdentifier == "com.example.KeepMe")
+        let excluded = try #require(kept.first { $0.label == "com.example.keepme.updater" })
+        #expect(excluded.isExcluded && !excluded.canBeControlled && !excluded.canMoveToTrash)
+    }
+
+    @Test func aPluginTheUserExcludedIsNotListed() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/QuickLook/Keep.qlgenerator/Contents/Info.plist", contents: Data("<plist/>".utf8))
+        let plugin = directory.url.appending(path: "home/Library/QuickLook/Keep.qlgenerator")
+
+        let listed = await Plugins.scan(environment: environment(in: directory)).plugins
+        let kept = await Plugins.scan(
+            environment: environment(in: directory), exclusions: Exclusions(paths: [plugin])
+        ).plugins
+
+        #expect(listed.contains { $0.url.lastPathComponent == "Keep.qlgenerator" })
+        #expect(!kept.contains { $0.url.lastPathComponent == "Keep.qlgenerator" }, "the scanner spells the path with /private and the exclusion does not")
+    }
+
+    /// A stand-in for `pkgutil` says what is installed, so the test does not depend on the receipts of the Mac
+    /// running it.
+    @Test func aReceiptItemTheUserExcludedIsNotListed() async throws {
+        let directory = try TemporaryDirectory()
+        let volume = PathPattern.canonical(directory.url).path(percentEncoded: false)
+        let app = PathPattern.canonical(try directory.directory("Applications/Example.app"))
+        let support = PathPattern.canonical(try directory.directory("Library/Application Support/Example"))
+        let info = try #require(String(
+            data: PropertyListSerialization.data(fromPropertyList: ["volume": volume, "install-location": ""], format: .xml, options: 0),
+            encoding: .utf8
+        ))
+        let pkgutil: PackageReceipts.Pkgutil = { arguments in
+            switch arguments.first {
+            case "--pkgs-plist": PkgutilAnswer.packages("com.example.pkg")
+            case "--pkg-info-plist": info
+            case "--files": "Applications/Example.app\nLibrary/Application Support/Example\n"
+            default: ""
+            }
+        }
+
+        let all = await PackageReceipts.list(exclusions: .none, pkgutil: pkgutil).receipts
+        #expect(Set(all.flatMap(\.items).map(\.url)) == [app, support])
+
+        let kept = await PackageReceipts.list(exclusions: Exclusions(paths: [support]), pkgutil: pkgutil).receipts
+        #expect(kept.flatMap(\.items).map(\.url) == [app])
+    }
+
+    /// Excluding a whole disk, a home folder, or a Library would leave every tool with nothing to show. Settings
+    /// and `peel exclusions add` share this one rule, so they refuse the same paths.
+    @Test func refusesAnExclusionTooBroadToBeWorthAnything() {
+        let home = URL(filePath: "/Users/me")
+        for path in ["/", "/Users/me", "/Users/me/", "/Users/me/Library", "/Applications", "/Library", "/System", "/Users", "/Volumes", "/opt"] {
+            #expect(Exclusions.isTooBroad(URL(filePath: path), home: home), "\(path) was allowed")
+        }
+        // Matching folds case and reads a path name by name, so the same folders written otherwise are as broad.
+        for path in ["/users/me", "/USERS/ME/library", "/Users/me/./Library", "/Users/me/Documents/../Library", "/library"] {
+            #expect(Exclusions.isTooBroad(URL(filePath: path), home: home), "\(path) was allowed")
+        }
+        for path in ["/Users/me/Documents/Keep", "/Users/me/Library/Application Support/Acme", "/Applications/Acme.app", "/Volumes/Work/Acme"] {
+            #expect(!Exclusions.isTooBroad(URL(filePath: path), home: home), "\(path) was refused")
+        }
+    }
+}

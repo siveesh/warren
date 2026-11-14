@@ -1,0 +1,500 @@
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Synchronization
+import Testing
+
+struct BulkUninstallationTests {
+    private func app(_ identifier: String, _ name: String) -> InstalledApp {
+        InstalledApp(url: URL(filePath: "/Applications/\(name).app"), bundleIdentifier: identifier, name: name)
+    }
+
+    private func leftover(
+        _ path: String,
+        size: Int64,
+        sharedWith: [String] = [],
+        confidence: MatchConfidence = .certain
+    ) -> Leftover {
+        Leftover(
+            url: URL(filePath: path),
+            kind: .applicationSupport,
+            match: LeftoverMatch(reason: .bundleIdentifier, confidence: confidence, sharedWith: sharedWith),
+            size: size,
+            isMeasured: true,
+            requiresPrivileges: false
+        )
+    }
+
+    private func uninstallation(_ app: InstalledApp, _ leftovers: [Leftover], appSize: Int64 = 1000) -> Uninstallation {
+        Uninstallation(
+            app: app,
+            appSize: appSize,
+            appRequiresPrivileges: false,
+            scan: LeftoverScan(leftovers: leftovers, unreadableLocations: [])
+        )
+    }
+
+    @Test func leavesForAnAdministratorWhatOnlyAppsThatWentUsed() {
+        let synth = app("org.example.synth", "Synth")
+        let effects = app("org.example.synth-fx", "Synth Effects")
+        let other = app("org.example.other", "Other")
+        func beyond(_ path: String, sharedWith: [String] = []) -> Leftover {
+            var leftover = leftover(path, size: 10, sharedWith: sharedWith).heldBack(.beyondTheHelper)
+            leftover.isLeftForAnAdministrator = true
+            return leftover
+        }
+        let shared = "/Library/Example Audio/Shared"
+        let own = "/Library/Example Audio/Synth"
+        let used = "/Library/Example Audio/Used"
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(synth, [
+                beyond(shared, sharedWith: [effects.reference]),
+                beyond(own),
+                beyond(used, sharedWith: [other.reference]),
+            ]),
+            uninstallation(effects, [beyond(shared, sharedWith: [synth.reference])]),
+        ])
+        let moved = { (apps: [InstalledApp]) in
+            TrashResult(trashed: apps.map { TrashedItem(originalURL: $0.url, trashedURL: $0.url, date: .now) })
+        }
+
+        let both = bulk.leftForAnAdministrator(after: moved([synth, effects]))
+        #expect(Set(both.map(\.path)) == [shared, own])
+        #expect(both.first { $0.path == shared }?.apps.map(\.name) == ["Synth", "Synth Effects"])
+        #expect(bulk.leftForAnAdministrator(after: moved([synth])).map(\.path) == [own])
+        #expect(bulk.leftForAnAdministrator(after: TrashResult()).isEmpty)
+    }
+
+    @Test func anAppsBundleSaysItSharesItsStorage() {
+        let clone = app("org.example.clone", "Clone")
+        let own = app("org.example.own", "Own")
+        var shared = uninstallation(clone, [])
+        shared.appSharesStorage = true
+
+        let bulk = BulkUninstallation(uninstallations: [shared, uninstallation(own, [])])
+
+        #expect(bulk.items.filter { $0.sharesStorage }.map { $0.url } == [clone.url])
+    }
+
+    @Test func aChosenAppsBundleStaysAnAppWhenAnotherChosenAppListsIt() {
+        let synth = app("org.example.synth", "Synth")
+        let effects = app("org.example.synth-fx", "Synth Effects")
+        let synthsFiles = [leftover("/Applications/Synth Effects.app", size: 10, sharedWith: [effects.reference])]
+        let effectsFiles = [leftover("/Applications/Synth.app", size: 10, sharedWith: [synth.reference])]
+
+        for order in [[synth, effects], [effects, synth]] {
+            let bulk = BulkUninstallation(uninstallations: order.map {
+                uninstallation($0, $0 == synth ? synthsFiles : effectsFiles)
+            })
+
+            #expect(Set(bulk.items.filter(\.isApplication).map(\.url)) == [synth.url, effects.url])
+            #expect(bulk.items.count == 2)
+        }
+    }
+
+    /// A checkbox can select what a row lets the person choose, by the rule of an app's own page: nothing Peel
+    /// leaves alone or with something excluded inside, nothing that needs the helper while it cannot act, no app
+    /// macOS keeps or the helper may not move, and nothing of an excluded app or of Peel. Everything Peel suggests
+    /// is among it.
+    @Test func selectsOnlyWhatARowLetsThePersonChoose() {
+        let notes = app("com.example.notes", "Notes")
+        let own = leftover("/Users/x/Library/Caches/com.example.notes", size: 100)
+        let keys = leftover("/Users/x/Library/Application Support/Notes Keys", size: 100).heldBack(.holdsKeys)
+        let excluded = leftover("/Users/x/Library/Application Support/Notes Excluded", size: 100).heldBack(.holdsAnExclusion)
+        let needsHelper = Uninstallation(
+            app: notes, appSize: 1000, appRequiresPrivileges: true,
+            scan: LeftoverScan(leftovers: [own, keys, excluded], unreadableLocations: [])
+        )
+        let chess = InstalledApp(url: URL(filePath: "/System/Applications/Chess.app"), bundleIdentifier: "com.apple.Chess", name: "Chess", isSystemProtected: true)
+        let chessData = leftover("/Users/x/Library/Containers/com.apple.Chess", size: 100)
+        var beyond = uninstallation(app("com.example.scribbler", "Scribbler"), [])
+        beyond.isAppBeyondTheHelper = true
+        var excludedApp = uninstallation(app("com.example.excluded", "Excluded"), [])
+        excludedApp.isExcluded = true
+        let peel = uninstallation(app("com.tuguidragos.Peel", "Peel"), [leftover("/Users/x/Library/Caches/com.tuguidragos.Peel", size: 100)])
+        let bulk = BulkUninstallation(uninstallations: [
+            needsHelper, uninstallation(chess, [chessData]), beyond, excludedApp, peel,
+        ])
+
+        #expect(bulk.selectable(canUseHelper: false) == [own.url, chessData.url])
+        #expect(bulk.selectable(canUseHelper: true) == [notes.url, own.url, chessData.url])
+        for canUseHelper in [false, true] {
+            #expect(
+                bulk.suggestedSelection(canUseHelper: canUseHelper)
+                    .isSubset(of: bulk.selectable(canUseHelper: canUseHelper))
+            )
+        }
+    }
+
+    /// An app stays when a copy of it is not selected. Two copies share their files, and neither bundle is one of
+    /// them.
+    @Test func namesTheAppsThatStayAndTheirFiles() {
+        let notes = app("com.example.notes", "Notes")
+        let copy = InstalledApp(url: URL(filePath: "/Users/x/Applications/Notes.app"), bundleIdentifier: notes.bundleIdentifier, name: notes.name)
+        let mail = app("com.example.mail", "Mail")
+        let own = leftover("/Users/x/Library/Caches/com.example.notes", size: 100)
+        let shared = leftover("/Users/x/Library/Group Containers/group.com.example", size: 100)
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(notes, [own, shared]), uninstallation(copy, [own]), uninstallation(mail, [shared]),
+        ])
+
+        #expect(bulk.staying(selected: [notes.url, copy.url, mail.url]).isEmpty)
+        #expect(bulk.staying(selected: [notes.url, mail.url]) == [notes.reference])
+        #expect(bulk.staying(selected: [notes.url, copy.url]) == [mail.reference])
+        #expect(bulk.files(of: notes.reference) == [own.url, shared.url])
+        #expect(bulk.files(of: mail.reference) == [shared.url])
+    }
+
+    /// Two copies of one app share its files. Choosing one of them among several apps leaves what the other copy
+    /// uses unselected, since that copy stays; choosing both lets it go.
+    @Test func aCopyThatIsNotChosenKeepsTheFilesItUses() throws {
+        let notes = app("com.example.notes", "Notes")
+        let copy = InstalledApp(url: URL(filePath: "/Users/x/Applications/Notes.app"), bundleIdentifier: notes.bundleIdentifier, name: notes.name)
+        let mail = app("com.example.mail", "Mail")
+        let matcher = LeftoverMatcher(app: notes, installedApps: [notes, copy, mail])
+        let match = try #require(matcher.match(fileName: "com.example.notes.plist", kind: .preferences))
+        let preferences = Leftover(
+            url: URL(filePath: "/Users/x/Library/Preferences/com.example.notes.plist"),
+            kind: .preferences, match: match, size: 100, isMeasured: true, requiresPrivileges: false
+        )
+        let bulk = BulkUninstallation(uninstallations: [uninstallation(notes, [preferences]), uninstallation(mail, [])])
+        #expect(!bulk.suggestedSelection(canUseHelper: true).contains(preferences.url))
+
+        let bothCopies = BulkUninstallation(uninstallations: [
+            uninstallation(notes, [preferences]), uninstallation(copy, [preferences]),
+        ])
+        #expect(bothCopies.suggestedSelection(canUseHelper: true).contains(preferences.url))
+    }
+
+    /// A batch keeps the order an app's own page keeps: what could not be measured first among the leftovers, since
+    /// it is most likely the biggest, then the largest. The apps come after their leftovers.
+    @Test func listsWhatCouldNotBeMeasuredFirst() {
+        let notes = app("com.example.notes", "Notes")
+        var slow = leftover("/Users/x/Library/Application Support/Notes", size: 0)
+        slow = Leftover(
+            url: slow.url,
+            kind: slow.kind,
+            match: slow.match,
+            size: 0,
+            isMeasured: false,
+            requiresPrivileges: false
+        )
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(notes, [leftover("/Users/x/Library/Caches/com.example.notes", size: 900), slow]),
+        ])
+
+        #expect(bulk.items.map(\.url.lastPathComponent) == ["Notes", "com.example.notes", "Notes.app"])
+    }
+
+    @Test func listsAFileSharedByTwoChosenAppsOnce() throws {
+        let word = app("com.microsoft.Word", "Word")
+        let excel = app("com.microsoft.Excel", "Excel")
+        let shared = "/Users/x/Library/Group Containers/UBF8T346G9.Office"
+
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(word, [leftover(shared, size: 500, sharedWith: ["com.microsoft.Excel"])]),
+            uninstallation(excel, [leftover(shared, size: 500, sharedWith: ["com.microsoft.Word"])]),
+        ])
+
+        let item = try #require(bulk.items.first { $0.url.path(percentEncoded: false) == shared })
+        #expect(bulk.items.filter { $0.url.path(percentEncoded: false) == shared }.count == 1)
+        #expect(item.apps.sorted() == ["com.microsoft.Excel", "com.microsoft.Word"])
+        #expect(item.sharedWithOthers.isEmpty)
+        #expect(item.isRecommended)
+    }
+
+    /// One folder claimed by two chosen apps: a cask names it outright for one, and for the other the scanner
+    /// found a repository in it and took the checkmark away. The checkmark stays away whichever app comes first.
+    @Test func aCheckmarkOneAppTookAwayStaysAwayWhateverTheOrder() throws {
+        let tool = app("com.example.tool", "Tool")
+        let editor = app("com.example.editor", "Editor")
+        let folder = "/Users/x/Library/Application Support/Shared Work"
+        let named = Leftover(
+            url: URL(filePath: folder), kind: .applicationSupport,
+            match: LeftoverMatch(reason: .homebrewCask, confidence: .certain, sharedWith: []),
+            size: 100,
+            isMeasured: true,
+            requiresPrivileges: false
+        )
+        let held = Leftover(
+            url: URL(filePath: folder), kind: .applicationSupport,
+            match: LeftoverMatch(reason: .name, confidence: .likely, sharedWith: [], heldBack: .holdsRepository),
+            size: 100,
+            isMeasured: true,
+            requiresPrivileges: false
+        )
+
+        for uninstallations in [
+            [uninstallation(tool, [named]), uninstallation(editor, [held])],
+            [uninstallation(editor, [held]), uninstallation(tool, [named])],
+        ] {
+            let item = try #require(
+                BulkUninstallation(uninstallations: uninstallations).items.first {
+                    $0.url.path(percentEncoded: false) == folder
+                }
+            )
+            #expect(!item.isRecommended, "selected with \(uninstallations[0].app.name) first")
+            #expect(item.match?.heldBack == .holdsRepository)
+            #expect(item.match?.confidence == .likely)
+        }
+    }
+
+    @Test func leavesFilesSharedWithAppsThatStayBehind() {
+        let firefox = app("org.mozilla.firefox", "Firefox")
+        let profiles = "/Users/x/Library/Application Support/Firefox"
+
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(firefox, [leftover(profiles, size: 800, sharedWith: ["org.mozilla.nightly"])]),
+        ])
+
+        let item = bulk.items.first { $0.url.path(percentEncoded: false) == profiles }
+        #expect(item?.sharedWithOthers == ["org.mozilla.nightly"])
+        #expect(item?.isRecommended == false)
+        #expect(!bulk.suggestedSelection(canUseHelper: true).contains(URL(filePath: profiles)))
+    }
+
+    /// An excluded app chosen along with others stays: never selected, and not moved even when selected by hand.
+    @Test func leavesAnExcludedAppOutOfTheBatch() {
+        let kept = app("com.example.kept", "Kept")
+        let gone = app("com.example.gone", "Gone")
+        var excluded = uninstallation(kept, [])
+        excluded.isExcluded = true
+        let bulk = BulkUninstallation(uninstallations: [
+            excluded,
+            uninstallation(gone, [leftover("/Users/x/Library/Caches/com.example.gone", size: 10)]),
+        ])
+
+        let keptItem = bulk.items.first { $0.url == kept.url }
+        #expect(keptItem?.isExcluded == true)
+        #expect(keptItem?.isRecommended == false)
+        #expect(!bulk.suggestedSelection(canUseHelper: true).contains(kept.url))
+        #expect(!bulk.removalOrder(of: [kept.url, gone.url]).contains(kept.url))
+        #expect(bulk.removalOrder(of: [kept.url, gone.url]) == [gone.url])
+        #expect(bulk.total == SizeTotal(known: 1010, isComplete: true))
+    }
+
+    /// An app macOS keeps, chosen along with others: neither it nor what it holds is selected, shared or not.
+    @Test func ticksNothingOfAnAppMacOSKeeps() {
+        let notes = InstalledApp(url: URL(filePath: "/System/Applications/Notes.app"), bundleIdentifier: "com.apple.Notes", name: "Notes", isSystemProtected: true)
+        let gone = app("com.example.gone", "Gone")
+        let store = leftover("/Users/x/Library/Group Containers/group.com.apple.notes", size: 50)
+        let shared = leftover("/Users/x/Library/Caches/shared", size: 5)
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(notes, [store, shared]),
+            uninstallation(gone, [shared, leftover("/Users/x/Library/Caches/com.example.gone", size: 10)]),
+        ])
+
+        #expect(bulk.suggestedSelection(canUseHelper: true) == [gone.url, URL(filePath: "/Users/x/Library/Caches/com.example.gone")])
+        // The app macOS keeps is not part of what could go: the guard refuses it.
+        #expect(bulk.total == SizeTotal(known: 1_000 + 50 + 5 + 10, isComplete: true))
+    }
+
+    /// The total counts only what can be moved. A container whose documents the guard refuses is left out, and a
+    /// folder that was not measured makes the total incomplete ("Over"), as on an app's own page.
+    @Test func countsWhatCanGoAndDoesNotReadAnUnknownSizeAsZero() {
+        let gone = app("com.example.gone", "Gone")
+        let refused = Leftover(
+            url: URL(filePath: "/Users/x/Library/Containers/com.example.gone"),
+            kind: .containers,
+            match: LeftoverMatch(reason: .bundleIdentifier, confidence: .certain, sharedWith: [])
+                .forReview(.holdsDocuments),
+            size: 700,
+            isMeasured: true,
+            requiresPrivileges: false
+        )
+        let unmeasured = Leftover(
+            url: URL(filePath: "/Users/x/Library/Application Support/com.example.gone"),
+            kind: .applicationSupport,
+            match: LeftoverMatch(reason: .bundleIdentifier, confidence: .certain, sharedWith: [])
+                .forReview(.notMeasured),
+            size: 0,
+            isMeasured: false,
+            requiresPrivileges: false
+        )
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(gone, [refused, unmeasured, leftover("/Users/x/Library/Caches/com.example.gone", size: 10)]),
+        ])
+
+        #expect(bulk.total == SizeTotal(known: 1_000 + 10, isComplete: false))
+    }
+
+    /// Apps chosen together: an app that stays keeps its files, those it shares with another chosen app included,
+    /// and the others go whole.
+    @Test func anAppThatStaysKeepsItsFilesWhileTheOthersGo() async throws {
+        let directory = try TemporaryDirectory()
+        let stays = InstalledApp(url: try directory.directory("Applications/Stays.app"), bundleIdentifier: "com.example.stays", name: "Stays")
+        let goes = InstalledApp(url: try directory.directory("Applications/Goes.app"), bundleIdentifier: "com.example.goes", name: "Goes")
+        let kept = try directory.directory("home/Library/Caches/com.example.stays")
+        let shared = try directory.directory("home/Library/Application Support/Example")
+        let gone = try directory.directory("home/Library/Caches/com.example.goes")
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(stays, [kept, shared].map { leftover($0.path(percentEncoded: false), size: 1) }),
+            uninstallation(goes, [gone, shared].map { leftover($0.path(percentEncoded: false), size: 1) }),
+        ])
+        let trash = try directory.directory("Trash")
+        let service = TrashService(
+            environment: SearchEnvironment(
+                homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+                rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+            )
+        ) { url in
+            // As macOS refuses an app it won't let Peel move.
+            guard url != stays.url else { throw CocoaError(.fileWriteNoPermission) }
+            let destination = trash.appending(path: UUID().uuidString)
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        }
+
+        let selection = Set(bulk.items.map(\.url))
+        let result = await bulk.move(selection, using: service)
+
+        #expect(result.failures.map(\.url) == [stays.url])
+        #expect(bulk.appsThatKeptTheirFiles(after: result, selection: selection) == [stays])
+        let moved = Set(result.trashed.map { PathPattern.comparablePath(of: $0.originalURL) })
+        #expect(moved == Set([goes.url, gone].map(PathPattern.comparablePath)))
+        for url in [kept, shared] {
+            #expect(FileManager.default.fileExists(atPath: url.path(percentEncoded: false)), "\(url.lastPathComponent) moved although its app stayed")
+        }
+    }
+
+    @Test func namesTheAppsWhoseItemsMovedAndThoseWhoseItemsStayed() async throws {
+        let directory = try TemporaryDirectory()
+        let stays = InstalledApp(url: try directory.directory("Applications/Stays.app"), bundleIdentifier: "org.example.stays", name: "Stays")
+        let goes = InstalledApp(url: try directory.directory("Applications/Goes.app"), bundleIdentifier: "org.example.goes", name: "Goes")
+        let kept = InstalledApp(url: try directory.directory("Applications/Kept.app"), bundleIdentifier: "org.example.kept", name: "Kept")
+        let copy = InstalledApp(url: try directory.directory("Other/Goes.app"), bundleIdentifier: "org.example.goes", name: "Goes")
+        let staysCache = try directory.directory("home/Library/Caches/org.example.stays")
+        let goesCache = try directory.directory("home/Library/Caches/org.example.goes")
+        let keptCache = try directory.directory("home/Library/Caches/org.example.kept")
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(stays, [leftover(staysCache.path(percentEncoded: false), size: 1)]),
+            uninstallation(goes, [leftover(goesCache.path(percentEncoded: false), size: 1)]),
+            uninstallation(kept, [leftover(keptCache.path(percentEncoded: false), size: 1)]),
+            uninstallation(copy, []),
+        ])
+        let trash = try directory.directory("Trash")
+        let service = TrashService(
+            environment: SearchEnvironment(
+                homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+                rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+            )
+        ) { url in
+            guard url != stays.url else { throw CocoaError(.fileWriteNoPermission) }
+            let destination = trash.appending(path: UUID().uuidString)
+            try FileManager.default.moveItem(at: url, to: destination)
+            return destination
+        }
+
+        let result = await bulk.move([stays.url, staysCache, goes.url, goesCache, keptCache], using: service)
+
+        #expect(bulk.apps(owning: result.trashed.map(\.originalURL)) == [goes, kept])
+        #expect(bulk.apps(owning: result.failures.map(\.url)) == [stays])
+    }
+
+    @Test func movesTheAppsBeforeTheirFiles() {
+        let first = app("com.example.one", "One")
+        let second = app("com.example.two", "Two")
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(first, [leftover("/Users/x/Library/Caches/com.example.one", size: 10)]),
+            uninstallation(second, [leftover("/Users/x/Library/Caches/com.example.two", size: 20)]),
+        ])
+
+        let selection = bulk.suggestedSelection(canUseHelper: true)
+        #expect(selection.count == 4)
+        let order = bulk.removalOrder(of: selection).map { $0.lastPathComponent }
+        #expect(order == ["One.app", "Two.app", "com.example.two", "com.example.one"])
+        #expect(bulk.total == SizeTotal(known: 2030, isComplete: true))
+    }
+
+    /// Two apps chosen together can each list a folder inside the other's: its bytes are counted once.
+    @Test func theTotalCountsAFolderInsideAnotherOnce() {
+        let first = app("com.example.first", "First")
+        let second = app("com.example.second", "Second")
+        let bulk = BulkUninstallation(uninstallations: [
+            uninstallation(first, [leftover("/Users/x/Library/Application Support/Vendor", size: 100)]),
+            uninstallation(second, [leftover("/Users/x/Library/Application Support/Vendor/Second", size: 40)]),
+        ])
+
+        #expect(bulk.total == SizeTotal(known: 1_000 + 1_000 + 100, isComplete: true))
+    }
+
+    /// Five apps chosen together, each with its own folders and one in a folder of a vendor no app is named for.
+    private func fiveAppsWithTheirFiles(
+        in directory: borrowing TemporaryDirectory
+    ) throws -> (apps: [InstalledApp], environment: SearchEnvironment) {
+        let apps = try ["Tide", "Gale", "Moss", "Fern", "Reed"].map { name in
+            let identifier = "org.example.\(name.lowercased())"
+            try directory.file("home/Library/Application Support/\(name)/config.json")
+            try directory.file("home/Library/Application Support/Shared Vendor/\(name)/data.bin")
+            try directory.file("home/Library/Caches/\(identifier)/Cache.db")
+            try directory.file("home/Library/Preferences/\(identifier).plist")
+            try directory.file("home/Library/Logs/\(name)/\(name).log")
+            return InstalledApp(
+                url: try directory.directory("Applications/\(name).app"), bundleIdentifier: identifier, name: name
+            )
+        }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: try directory.directory("root")
+        )
+        return (apps, environment)
+    }
+
+    @Test func appsChosenTogetherReadEachFolderOnceAndAskTheGuardOnce() async throws {
+        let directory = try TemporaryDirectory()
+        let (apps, environment) = try fiveAppsWithTheirFiles(in: directory)
+        let listed = Mutex<[String: Int]>([:])
+        let asked = Mutex<[String: Int]>([:])
+        let scanner = LeftoverScanner(
+            environment: environment,
+            measure: LeftoverScanner.walk,
+            refuses: { path, home in
+                asked.withLock { $0[path, default: 0] += 1 }
+                return ProtectedData.refuses(path, home: home)
+            },
+            list: { folder in
+                listed.withLock { $0[folder.path(percentEncoded: false), default: 0] += 1 }
+                return ScanReads.listing(of: folder)
+            }
+        )
+
+        let bulk = await BulkUninstallation.prepare(
+            apps, installedApps: apps, exclusions: .none, casks: [], receipts: [], systemExtensions: { [] },
+            environment: environment, scanner: scanner
+        )
+
+        #expect(bulk.items.count == apps.count * 6)
+        let vendor = environment.homeDirectory.appending(path: "Library/Application Support/Shared Vendor")
+        #expect(listed.withLock { $0[vendor.path(percentEncoded: false)] } == 1)
+        #expect(listed.withLock { $0.filter { $0.value > 1 }.keys.sorted() } == [])
+        #expect(asked.withLock { $0.filter { $0.value > 1 }.keys.sorted() } == [])
+    }
+
+    @Test func appsChosenTogetherFindWhatEachFindsAlone() async throws {
+        let directory = try TemporaryDirectory()
+        let (apps, environment) = try fiveAppsWithTheirFiles(in: directory)
+        func rows(_ uninstallation: Uninstallation) -> [String] {
+            uninstallation.scan.leftovers.map { leftover in
+                [
+                    leftover.url.path(percentEncoded: false), "\(leftover.match.confidence)",
+                    leftover.match.sharedWith.joined(separator: ","), "\(String(describing: leftover.match.heldBack))",
+                    "\(leftover.size)",
+                ].joined(separator: " ")
+            }.sorted()
+        }
+
+        let bulk = await BulkUninstallation.prepare(
+            apps, installedApps: apps, exclusions: .none, casks: [], receipts: [], systemExtensions: { [] },
+            environment: environment
+        )
+
+        for (app, together) in zip(apps, bulk.uninstallations) {
+            let alone = await Uninstallation.prepare(
+                app, installedApps: apps, exclusions: .none, casks: [], receipts: [], systemExtensions: { [] },
+                environment: environment
+            )
+            #expect(rows(together) == rows(alone), "\(app.name)")
+            #expect(!rows(alone).isEmpty, "\(app.name)")
+        }
+    }
+}

@@ -198,3 +198,11 @@ private let sparkleFixture = """
     #expect(!restored.visibleSections(in: .storage, selection: .dashboard).contains(.cleanup))
     #expect(restored.visibleSections(in: .storage, selection: .cleanup).contains(.cleanup))
 }
+
+@Test func systemGuardNeverTouchRulesAreSharedWithThePeelGate() {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    #expect(SystemGuard.isNeverTouched(home.appendingPathComponent(".ssh/id_ed25519")))
+    #expect(SystemGuard.isNeverTouched(home.appendingPathComponent("Library/Keychains/login.keychain-db")))
+    #expect(SystemGuard.isNeverTouched(URL(fileURLWithPath: "/System/Library/CoreServices")))
+    #expect(!SystemGuard.isNeverTouched(home.appendingPathComponent("Library/Caches/com.example.app")))
+}

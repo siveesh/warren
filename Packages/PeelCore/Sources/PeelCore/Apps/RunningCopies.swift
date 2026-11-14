@@ -1,0 +1,141 @@
+public import AppKit
+internal import PeelPrivileged
+
+/// Finds the running processes that belong to an app, so they can be quit before its files are moved and
+/// nothing rewrites those files meanwhile.
+public enum RunningCopies {
+    public struct Process: Sendable, Hashable {
+        public let identifier: pid_t
+        public let bundleIdentifier: String?
+        public let bundleURL: URL?
+        /// False for a process of another account, root's included, which neither the person nor Peel may signal
+        /// (`kill(2)` answers `EPERM`).
+        public let mayBeQuit: Bool
+
+        public init(identifier: pid_t, bundleIdentifier: String?, bundleURL: URL?, mayBeQuit: Bool = true) {
+            self.identifier = identifier
+            self.bundleIdentifier = bundleIdentifier
+            self.bundleURL = bundleURL
+            self.mayBeQuit = mayBeQuit
+        }
+
+        /// Whether this is an app extension inside `app`, which its host keeps running and nobody quits.
+        public func isAnExtension(inside app: URL) -> Bool {
+            guard let bundleURL, bundleURL.pathExtension == "appex" else { return false }
+            return PathComponents.isPath(
+                PathPattern.comparablePath(of: bundleURL), inside: PathPattern.comparablePath(of: app)
+            )
+        }
+
+        /// The name a person knows it by: its bundle's name as Finder shows it, else its identifier.
+        public var name: String? {
+            bundleURL.map(AppInspector.displayName) ?? bundleIdentifier
+        }
+    }
+
+    /// `processes` by their bundle identifier, the first of each, as the judgments of orphaned files read them.
+    public static func byIdentifier(_ processes: [Process]) -> [String: Process] {
+        Dictionary(
+            processes.compactMap { process in process.bundleIdentifier.map { ($0, process) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+    }
+
+    @MainActor
+    public static var current: [Process] {
+        NSWorkspace.shared.runningApplications.compactMap { running in
+            guard running.bundleIdentifier != nil || running.bundleURL != nil else { return nil }
+            return Process(
+                identifier: running.processIdentifier,
+                bundleIdentifier: running.bundleIdentifier,
+                bundleURL: running.bundleURL,
+                mayBeQuit: kill(running.processIdentifier, 0) == 0 || errno != EPERM
+            )
+        }
+    }
+
+    /// The processes launchd keeps running as jobs of `apps`, from inside them. Asked to quit, one only starts again,
+    /// so nobody is asked: moving the app stops its job.
+    @concurrent
+    public static func keptRunningByJobs(inside apps: [URL]) async -> Set<pid_t> {
+        var found: Set<pid_t> = []
+        for app in apps {
+            found.formUnion(await LaunchdCleanup.running(inside: app).map(\.pid))
+        }
+        return found
+    }
+
+    /// The processes of `app` among `running` that quit before its files move: those `belonging(to:)` finds, but for
+    /// an extension inside the app, which its host keeps running and the move ends once the app is in the Trash, and
+    /// for what launchd keeps running as a job of the app, which only starts again and which the move stops.
+    @concurrent
+    public static func toQuit(
+        beforeMoving app: InstalledApp,
+        among running: [Process],
+        installedApps: [InstalledApp],
+        keptByJobs jobs: @Sendable ([URL]) async -> Set<pid_t> = { await keptRunningByJobs(inside: $0) }
+    ) async -> [Process] {
+        let own = belonging(to: app, among: running, installedApps: installedApps)
+            .filter { !$0.isAnExtension(inside: app.url) }
+        guard !own.isEmpty else { return [] }
+        let kept = await jobs([app.url])
+        return own.filter { !kept.contains($0.identifier) }
+    }
+
+    /// Returns the processes in `running` that belong to `app` and may be quit. The app itself is known by where it
+    /// runs from: a copy elsewhere is another app, and quitting it would close the one in use. The app's helpers run
+    /// from inside its bundle, or carry an identifier the bundle embeds or one that extends the app's, unless another
+    /// installed app owns that identifier (Chrome Canary beside Chrome) or it runs as an app of its own outside a
+    /// Library, as Canary does on another disk. A process whose location is unknown is judged by its identifier.
+    /// Identifiers are compared without case, as bundle identifiers are. A process of another account writes none of
+    /// the person's files, and while its program runs from inside the app, the move refuses the app.
+    ///
+    /// `sharingItsSettings` is for a reset: every copy of the app writes the same preference domain, wherever
+    /// it runs from, so all of them count.
+    public static func belonging(
+        to app: InstalledApp,
+        among running: [Process],
+        installedApps: [InstalledApp],
+        sharingItsSettings: Bool = false,
+        environment: SearchEnvironment = .current
+    ) -> [Process] {
+        let bundle = PathPattern.comparablePath(of: app.url)
+        let identifier = app.bundleIdentifier?.lowercased()
+        let embedded = Set(app.embeddedBundleIdentifiers.map { $0.lowercased() })
+        let others = installedApps
+            .filter { PathPattern.comparablePath(of: $0.url) != bundle }
+            .compactMap { $0.bundleIdentifier?.lowercased() }
+            .filter { $0 != identifier }
+
+        return running.filter { process in
+            guard process.mayBeQuit else { return false }
+            let place = process.bundleURL.map(PathPattern.comparablePath)
+            if let place, PathComponents.isPath(place, atOrInside: bundle) { return true }
+            guard let identifier, let name = process.bundleIdentifier?.lowercased() else { return false }
+            if name == identifier { return sharingItsSettings || place == nil }
+            guard embedded.contains(name) || name.hasPrefix(identifier + ".") else { return false }
+            if let place, environment.keepsOnItsOwn(appAt: place) { return false }
+            // Leaves out what another installed app owns: its own identifier, or one that extends an identifier
+            // longer than this app's. So Canary's helpers belong to Canary, never to Chrome.
+            return !others.contains { other in
+                name == other || (other.count > identifier.count && name.hasPrefix(other + "."))
+            }
+        }
+    }
+
+    /// Returns the processes in `running` that a Homebrew command on `cask` would replace or delete from under them:
+    /// those of its apps, as `belonging(to:)` finds them, and those its definition names to quit.
+    public static func belonging(
+        toCask cask: HomebrewPackage,
+        apps: [InstalledApp],
+        among running: [Process],
+        installedApps: [InstalledApp]
+    ) -> [Process] {
+        let named = Set(cask.quitIdentifiers.map { $0.lowercased() })
+        let own = Set(apps.flatMap { belonging(to: $0, among: running, installedApps: installedApps) })
+        return running.filter { process in
+            own.contains(process)
+                || (process.mayBeQuit && process.bundleIdentifier.map { named.contains($0.lowercased()) } == true)
+        }
+    }
+}

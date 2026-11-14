@@ -1,0 +1,705 @@
+public import Foundation
+internal import PeelPrivileged
+import Synchronization
+
+public enum PackageReceipts {
+    static let concurrentReceipts = 4
+
+    /// Directories many packages install into; they never belong to a single package. The folders Peel searches in
+    /// `/Library` come from `LibraryFolder`, so the two can't drift apart, with every folder on the way to one.
+    static let sharedDirectories: Set<String> = {
+        let searched = (LibraryFolder.local + LibraryFolder.plugIns).map { "/Library/" + $0.rawValue }
+        return Set(searched + searched.flatMap(ProtectedObjects.ancestors(of:))).union(otherSharedDirectories)
+    }()
+
+    private static let otherSharedDirectories: Set<String> = [
+        "/", "/Applications", "/Applications/Utilities", "/Library/ColorSync", "/Library/ColorSync/Profiles",
+        "/Library/Extensions", "/Library/Fonts", "/Library/Frameworks", "/Library/Printers",
+        "/Library/SystemExtensions", "/System", "/Users", "/Users/Shared", "/etc", "/opt", "/private", "/private/etc",
+        "/private/tmp", "/private/var", "/tmp", "/usr", "/usr/local", "/usr/local/bin", "/usr/local/etc",
+        "/usr/local/include", "/usr/local/lib", "/usr/local/libexec", "/usr/local/sbin", "/usr/local/share",
+        "/usr/local/share/doc", "/usr/local/share/man", "/usr/local/share/man/man1", "/var",
+    ]
+
+    /// The same in a home folder, where a package installed for one account writes, each named from that folder.
+    static let sharedInTheHome: Set<String> = {
+        let searched = LibraryFolder.inTheUsersLibrary.map { "/Library/" + $0.rawValue }
+        let alsoInAHome = otherSharedDirectories.filter { $0.hasPrefix("/Library/") || $0.hasPrefix("/Applications") }
+        let own = ProtectedData.accountFolders.map { "/" + $0 }
+        return Set(searched + searched.flatMap(ProtectedObjects.ancestors(of:)) + alsoInAHome + own + ["/"])
+    }()
+
+    /// Returns whether `receipt` is the installer receipt of the app whose bundle identifier is `identifier`:
+    /// the identifier itself, or the identifier followed by `.`, `-`, or `_`. A shared prefix is not enough,
+    /// so `com.adguard.mac.vpn-pkg` (AdGuard VPN) never proves `com.adguard.mac.adguard` (AdGuard), and
+    /// `com.example.app2.pkg` never proves `com.example.app`. As in matching files, the identifier has to be a valid
+    /// one, and three components long for a receipt that only begins with it: `com.microsoft` begins every Microsoft
+    /// package's. Both arguments must be in lowercase.
+    public static func proves(_ receipt: String, isThe identifier: String) -> Bool {
+        guard Identifier.isValid(identifier) else { return false }
+        guard receipt != identifier else { return true }
+        return Identifier.componentCount(of: identifier) >= 3
+            && [".", "-", "_"].contains { receipt.hasPrefix(identifier + $0) }
+    }
+
+    /// The identifier among `identifiers` whose app `receipt` belongs to: the longest that proves it, since a receipt
+    /// named for one identifier and a separator can carry on into another app's (`…synth-fx.app.pkg` is Synth FX's,
+    /// not Synth's). All in lowercase.
+    public static func owner(of receipt: String, among identifiers: some Sequence<String>) -> String? {
+        identifiers.filter { proves(receipt, isThe: $0) }.max { $0.count < $1.count }
+    }
+
+    /// Returns the identifiers of all installed packages, in lowercase, without reading each receipt. That is
+    /// enough to find an app's own receipt and to tell whether a cask really belongs to an app.
+    @concurrent
+    public static func identifiers() async -> Set<String> {
+        await identifiers(pkgutil: pkgutil)
+    }
+
+    static func identifiers(pkgutil: Pkgutil) async -> Set<String> {
+        Set((packageList(in: await pkgutil(["--pkgs-plist"])) ?? []).map { $0.lowercased() })
+    }
+
+    /// Reads what `pkgutil --pkgs-plist` prints: an array of package identifiers. Nil for no answer, or an answer
+    /// in any other form, which says nothing about what is installed.
+    static func packageList(in answer: String?) -> [String]? {
+        guard let answer else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: Data(answer.utf8), format: nil)) as? [String]
+    }
+
+    /// Nil when the tool could not be run, failed, or timed out: no answer is not "nothing installed".
+    typealias Pkgutil = @Sendable ([String]) async -> String?
+
+    /// What `pkgutil` answered during one preparation, each question asked once: an app's page asks about the app's
+    /// receipts for its uninstall and for itself, and apps chosen together ask the same about what is inside a bundle.
+    /// No answer is not kept.
+    public final class Answers: Sendable {
+        private let asking: Pkgutil
+        private let known = Mutex<[[String]: String]>([:])
+
+        public convenience init() {
+            self.init(asking: PackageReceipts.pkgutil)
+        }
+
+        init(asking: @escaping Pkgutil) {
+            self.asking = asking
+        }
+
+        func answer(_ arguments: [String]) async -> String? {
+            if let answer = known.withLock({ $0[arguments] }) { return answer }
+            let answer = await asking(arguments)
+            if let answer { known.withLock { $0[arguments] = answer } }
+            return answer
+        }
+    }
+
+    /// `pkgutil` asked about what was installed for one account alone, which it knows by that account's home folder as
+    /// the volume, and of which plain `pkgutil` says nothing.
+    static func forAccount(home: URL, _ pkgutil: @escaping Pkgutil) -> Pkgutil {
+        let volume = home.path(percentEncoded: false)
+        return { await pkgutil(["--volume", volume] + $0) }
+    }
+
+    public static func list(exclusions: Exclusions = .none) async -> PackageScan {
+        await list(exclusions: exclusions, pkgutil: pkgutil)
+    }
+
+    /// Lists every installed package except Apple's, sorted by identifier. `pkgutil` is a parameter so a test
+    /// can say what is installed instead of asking the real tool.
+    @concurrent
+    static func list(
+        exclusions: Exclusions,
+        pkgutil: @escaping Pkgutil,
+        environment: SearchEnvironment = .current,
+        systemExtensions: @escaping AppExtensions.SystemExtensionsAnswer = AppExtensions.askingMacOS
+    ) async -> PackageScan {
+        let removalGuard = RemovalGuard(environment: environment, exclusions: exclusions)
+        let reach = HelperReach(environment: environment)
+        let shared = sharedFolders(in: environment)
+        let installed = InstalledSystemExtensions(asking: systemExtensions)
+        guard let packages = packageList(in: await pkgutil(["--pkgs-plist"])) else {
+            return PackageScan(receipts: [], couldNotAsk: true)
+        }
+        let account = forAccount(home: environment.homeDirectory, pkgutil)
+        let forTheAccount = packageList(in: await account(["--pkgs-plist"])) ?? []
+        let asked: [(identifier: String, volume: URL?, pkgutil: Pkgutil)] =
+            packages.map { ($0, nil, pkgutil) } + forTheAccount.map { ($0, environment.homeDirectory, account) }
+
+        let receipts = await withTaskGroup(of: PackageReceipt.self) { group in
+            var pending = asked.filter { !$0.identifier.hasPrefix("com.apple.") }.makeIterator()
+            var results: [PackageReceipt] = []
+            for _ in 0..<concurrentReceipts where !Task.isCancelled {
+                guard let package = pending.next() else { break }
+                group.addTask {
+                    await Self.receipt(
+                        package.identifier,
+                        volume: package.volume,
+                        exclusions: exclusions,
+                        pkgutil: package.pkgutil,
+                        removalGuard: removalGuard,
+                        reach: reach,
+                        shared: shared,
+                        installed: installed,
+                        environment: environment
+                    ).receipt
+                }
+            }
+            while let result = await group.next() {
+                results.append(result)
+                // A stopped scan starts no other package: each would ask `pkgutil` for nothing.
+                if !Task.isCancelled, let package = pending.next() {
+                    group.addTask {
+                        await Self.receipt(
+                            package.identifier,
+                            volume: package.volume,
+                            exclusions: exclusions,
+                            pkgutil: package.pkgutil,
+                            removalGuard: removalGuard,
+                            reach: reach,
+                            shared: shared,
+                            installed: installed,
+                            environment: environment
+                        ).receipt
+                    }
+                }
+            }
+            return results
+        }
+        let history = InstallHistory.entries(onVolume: environment.rootDirectory)
+        return PackageScan(
+            receipts: heldBackWhereShared(receipts)
+                .map { receipt in
+                    var named = receipt
+                    named.name = history[receipt.identifier]?.name
+                    named.productVersion = history[receipt.identifier]?.version
+                    return named
+                }
+                .sorted { $0.identifier.localizedStandardCompare($1.identifier) == .orderedAscending }
+        )
+    }
+
+    /// `receipts` with each item two of them list held back in both: moved from one package's page, it would leave
+    /// the other package without it.
+    private static func heldBackWhereShared(_ receipts: [PackageReceipt]) -> [PackageReceipt] {
+        var listings: [String: Int] = [:]
+        for item in receipts.flatMap(\.items) {
+            listings[PathPattern.comparablePath(of: item.url), default: 0] += 1
+        }
+        return receipts.map { receipt in
+            var receipt = receipt
+            for index in receipt.items.indices where receipt.items[index].heldBack == nil
+                && listings[PathPattern.comparablePath(of: receipt.items[index].url), default: 0] > 1 {
+                receipt.items[index].heldBack = .listedByAnotherPackage
+            }
+            return receipt
+        }
+    }
+
+    /// Returns the receipts of the packages that installed `url`, asking `pkgutil` about that one path instead
+    /// of listing every package.
+    @concurrent
+    public static func receipts(
+        installing url: URL, exclusions: Exclusions = .none, answers: Answers = Answers()
+    ) async -> [PackageReceipt] {
+        await receipts(installing: url, exclusions: exclusions, pkgutil: answers.answer)
+    }
+
+    /// `pkgutil --file-info-plist` matches a path against the receipt's file list, which is relative to the
+    /// package's install location: with the install location `Applications`, an app is found as `/Example.app`. So
+    /// the leading folders are dropped one at a time until a package answers, and the answer counts only if that
+    /// package really installed this path.
+    @concurrent
+    static func receipts(
+        installing url: URL,
+        exclusions: Exclusions,
+        pkgutil: @escaping Pkgutil,
+        environment: SearchEnvironment = .current,
+        systemExtensions: @escaping AppExtensions.SystemExtensionsAnswer = AppExtensions.askingMacOS
+    ) async -> [PackageReceipt] {
+        let wanted = PathPattern.comparablePath(of: PathPattern.canonical(url))
+        let home = environment.homeDirectory
+        // A package installed for one account alone writes only in that account's home folder, and an account with
+        // no package of its own has nothing to find.
+        var asked: [(volume: URL?, pkgutil: Pkgutil)] = [(nil, pkgutil)]
+        if PathComponents.isPath(wanted, inside: PathPattern.comparablePath(of: home)) {
+            let account = forAccount(home: home, pkgutil)
+            if !(await identifiers(pkgutil: account)).isEmpty { asked.append((home, account)) }
+        }
+
+        var receipts: [PackageReceipt] = []
+        let removalGuard = RemovalGuard(environment: environment, exclusions: exclusions)
+        let reach = HelperReach(environment: environment)
+        let shared = sharedFolders(in: environment)
+        let installed = InstalledSystemExtensions(asking: systemExtensions)
+        for domain in asked {
+            let identifiers = await packages(listing: wanted, pkgutil: domain.pkgutil)
+            for identifier in identifiers.sorted() where !Task.isCancelled {
+                let found = await receipt(
+                    identifier,
+                    volume: domain.volume,
+                    exclusions: exclusions,
+                    pkgutil: domain.pkgutil,
+                    removalGuard: removalGuard,
+                    reach: reach,
+                    shared: shared,
+                    installed: installed,
+                    environment: environment
+                )
+                guard found.installs(wanted) else { continue }
+                receipts.append(found.receipt)
+            }
+        }
+        return receipts
+    }
+
+    /// The packages that wrote `app` and nothing outside it, the folders on the way to it aside. Once the app is gone,
+    /// such a receipt describes nothing on the disk. A receipt lists its files relative to its install location, and
+    /// they are compared name by name in that form, since most of them need not exist.
+    static func receipts(writingOnly app: URL, pkgutil: Pkgutil) async -> [String] {
+        let bundle = PathPattern.canonical(app)
+        let identifiers = await packages(listing: PathPattern.comparablePath(of: bundle), pkgutil: pkgutil)
+        let names = PathComponents.of(bundle.path(percentEncoded: false))
+        var found: [String] = []
+        for identifier in identifiers.sorted() where !Task.isCancelled {
+            guard let (_, _, installLocation) = await description(of: identifier, pkgutil: pkgutil),
+                  let listing = await pkgutil(["--files", identifier])
+            else { continue }
+            let location = PathComponents.of(PathPattern.canonical(installLocation).path(percentEncoded: false))
+            guard names.starts(with: location) else { continue }
+            let wanted = Array(names.dropFirst(location.count))
+            let entries = lines(of: listing).map { PathComponents.of($0).filter { $0 != "." } }
+            let isTheAppOrOnTheWay = { (entry: [String]) in entry.starts(with: wanted) || wanted.starts(with: entry) }
+            // A package installed into the app itself lists only what is inside it, so it wrote the app and no more.
+            if wanted.isEmpty || entries.contains(wanted), entries.allSatisfy(isTheAppOrOnTheWay) {
+                found.append(identifier)
+            }
+        }
+        return found
+    }
+
+    /// Whether the package left anything outside `app` that is still on the disk, of which the receipt is the only
+    /// record. A package `pkgutil` doesn't describe counts as having left something, so its receipt stays.
+    static func leftSomethingOutside(
+        _ identifier: String, app: URL, accountHome: URL? = nil, pkgutil: Pkgutil
+    ) async -> Bool {
+        guard let (_, _, installLocation) = await description(of: identifier, pkgutil: pkgutil),
+              let listing = await pkgutil(["--files", identifier])
+        else { return true }
+        let bundle = PathPattern.comparablePath(of: PathPattern.canonical(app))
+        return topLevel(
+            files: lines(of: listing), installLocation: installLocation.path(percentEncoded: false),
+            accountHome: accountHome?.path(percentEncoded: false)
+        ).onDisk
+            .contains { !PathComponents.isPath(PathPattern.comparablePath(of: URL(filePath: $0)), atOrInside: bundle) }
+    }
+
+    /// The packages whose receipts list the bundle at `path`, as `pkgutil` names them: it matches a path literally
+    /// against each receipt's file list, which is relative to the package's install location.
+    private static func packages(listing path: String, pkgutil: Pkgutil) async -> Set<String> {
+        for asked in spellings(of: path) where !Task.isCancelled {
+            let identifiers = Set(packageIdentifiers(in: await pkgutil(["--file-info-plist", asked])))
+            if !identifiers.isEmpty { return identifiers }
+        }
+        // A package installed into a bundle lists only what is inside it, as `Contents/...`, like every package
+        // installed that way, so only the one whose install location is this bundle counts.
+        var inside: Set<String> = []
+        for identifier in packageIdentifiers(in: await pkgutil(["--file-info-plist", "/Contents/Info.plist"]))
+        where !Task.isCancelled {
+            guard let location = await description(of: identifier, pkgutil: pkgutil)?.installLocation else { continue }
+            if PathPattern.comparablePath(of: PathPattern.canonical(location)) == path { inside.insert(identifier) }
+        }
+        return inside
+    }
+
+    /// Returns `path`, then the same path with its leading folders dropped one at a time (`/a/b/c`, `/b/c`,
+    /// `/c`), since a receipt lists what it installed relative to its install location. Any of these can also
+    /// match another package's file, so each answer is checked against what that package really installed.
+    static func spellings(of path: String) -> [String] {
+        let components = PathComponents.of(path)
+        return (0..<max(1, components.count)).map { "/" + components.dropFirst($0).joined(separator: "/") }
+    }
+
+    /// Reads what `pkgutil --file-info-plist` prints: a `path-info` array with the `pkgid` of each package that
+    /// lists the path. Apple's own packages are left out.
+    static func packageIdentifiers(in answer: String?) -> [String] {
+        installers(in: answer).filter { !$0.hasPrefix("com.apple.") }
+    }
+
+    private static func installers(in answer: String?) -> [String] {
+        guard let answer,
+              let plist = try? PropertyListSerialization.propertyList(from: Data(answer.utf8), format: nil),
+              let packages = (plist as? [String: Any])?["path-info"] as? [[String: Any]] else { return [] }
+        return packages.compactMap { $0["pkgid"] as? String }
+    }
+
+    /// Whether one of Apple's packages installed `url`: a receipt of macOS or of one of Apple's tools lists it, and
+    /// that package installs at the root, the only place where the path a receipt lists is the path asked about.
+    @concurrent
+    public static func isInstalledByApple(_ url: URL) async -> Bool {
+        await isInstalledByApple(url, pkgutil: pkgutil)
+    }
+
+    static func isInstalledByApple(_ url: URL, pkgutil: Pkgutil) async -> Bool {
+        let path = PathPattern.comparablePath(of: PathPattern.canonical(url))
+        let apples = installers(in: await pkgutil(["--file-info-plist", path])).filter { $0.hasPrefix("com.apple.") }
+        for identifier in apples.sorted() where !Task.isCancelled {
+            guard let installLocation = await description(of: identifier, pkgutil: pkgutil)?.installLocation else {
+                continue
+            }
+            if PathPattern.comparablePath(of: installLocation) == "/" { return true }
+        }
+        return false
+    }
+
+    /// A receipt and everything it lists, so `installs(_:)` can tell whether it installed a path.
+    struct Found {
+        let receipt: PackageReceipt
+        let files: [String]
+        /// Where the package put what it lists. One installed into a bundle, an app's own folder, made that bundle.
+        var installLocation: URL?
+
+        func installs(_ path: String) -> Bool {
+            guard let installLocation, !files.isEmpty else { return false }
+            let comparable = { PathPattern.comparablePath(of: PathPattern.canonical(URL(filePath: $0))) }
+            let name = (path as NSString).lastPathComponent.lowercased()
+            // The kernel names a line otherwise only when it is a link or one of a file's several names.
+            let lists = files.contains { file in
+                let full = PackageReceipts.path(of: file, in: installLocation).path(percentEncoded: false)
+                guard (full as NSString).lastPathComponent.lowercased() == name || mayBeNamedOtherwise(full) else {
+                    return false
+                }
+                return comparable(full) == path
+            }
+            return lists || comparable(installLocation.path(percentEncoded: false)) == path
+        }
+
+        private func mayBeNamedOtherwise(_ path: String) -> Bool {
+            var info = stat()
+            guard lstat(path, &info) == 0 else { return false }
+            let kind = info.st_mode & S_IFMT
+            return kind == S_IFLNK || kind == S_IFREG && info.st_nlink > 1
+        }
+    }
+
+    private static func receipt(
+        _ identifier: String,
+        volume askedVolume: URL? = nil,
+        exclusions: Exclusions = .none,
+        pkgutil: Pkgutil,
+        removalGuard: RemovalGuard,
+        reach: HelperReach,
+        shared: [String],
+        installed: InstalledSystemExtensions,
+        environment: SearchEnvironment
+    ) async -> Found {
+        guard let (info, volume, installLocation) = await description(of: identifier, pkgutil: pkgutil) else {
+            // `pkgutil` named the package but did not describe it. It stays listed, with what it installed unknown,
+            // rather than vanishing from the page.
+            let unknown = PackageReceipt(
+                identifier: identifier,
+                version: nil,
+                installDate: nil,
+                volume: askedVolume ?? URL(filePath: "/", directoryHint: .isDirectory),
+                items: [], nothingLeftOnDisk: false, isFileListKnown: false
+            )
+            return Found(receipt: unknown, files: [])
+        }
+
+        let listing = await pkgutil(["--files", identifier])
+        let files = lines(of: listing)
+        let throughScripts = listing != nil
+            && (files.isEmpty || isTemporary(installLocation: info["install-location"] as? String ?? ""))
+
+        let found = topLevel(
+            files: files, installLocation: installLocation.path(percentEncoded: false),
+            accountHome: askedVolume?.path(percentEncoded: false)
+        )
+        // An app's own rules reach the rest of its package, as they reach its files on its page, and a folder an app
+        // sits in moves that app too. What else a folder holds isn't this package's, even when the folder is.
+        let inspected = { (paths: [String]) in
+            paths.compactMap { AppInspector.inspect(URL(filePath: PathPattern.located($0) ?? $0)) }
+        }
+        let apps = inspected(found.offered.flatMap { appPaths(in: $0) })
+        let ownApps = found.othersFilled.isEmpty
+            ? apps : inspected(found.offered.filter { !found.othersFilled.contains($0) }.flatMap { appPaths(in: $0) })
+        var removedApps: [String: RemovedElsewhere] = [:]
+        for app in apps {
+            let carried = await AppExtensions.installed(carriedBy: app) { await installed.answer() }
+            let removed = RemovedElsewhere.of(app, installedSystemExtensions: carried)
+            removedApps[PathPattern.comparablePath(of: app.url)] = removed
+        }
+        let rule = { (app: InstalledApp) in removedApps[PathPattern.comparablePath(of: app.url)] }
+        let removedWithItsApp = ownApps.lazy.compactMap(rule).first
+        var uninstallers: [UninstallsItself] = []
+        for app in apps {
+            if let uninstaller = await UninstallsItself.of(app, environment: environment) {
+                uninstallers.append(uninstaller)
+            }
+        }
+        let uninstaller = uninstallers.first
+        var items: [PackageReceipt.Item] = []
+        var seen: Set<String> = []
+        for path in found.offered {
+            // `located` resolves the folders on the way but not the last component: when a receipt lists a
+            // link, the item is the link itself, not what it leads to.
+            let url = URL(filePath: PathPattern.located(path) ?? path)
+            guard !exclusions.excludes(url), seen.insert(PathPattern.comparablePath(of: url)).inserted else { continue }
+            let requiresPrivileges = FileAccess.requiresPrivilegesToRemove(url)
+            let contents = await FileSize.contents(of: url)
+            let place = PathPattern.comparablePath(of: url)
+            let isShared = shared.contains { PathComponents.isPath(place, atOrInside: $0) }
+            let isFilledByOthers = found.othersFilled.contains(path)
+            let app = apps.first { PathComponents.isPath(PathPattern.comparablePath(of: $0.url), atOrInside: place) }
+            let heldBack: HoldBack? = if SignInPlugIns.isOne(url, root: volume) {
+                .signInPlugIn
+            } else if requiresPrivileges && reach.isBeyond(url) {
+                .beyondTheHelper
+            } else if let held = uninstaller?.holdBack(for: url) {
+                held
+            } else {
+                KeptOnlyHere.reason(
+                    for: url.path(percentEncoded: false), home: environment.homeDirectory.path(percentEncoded: false),
+                    root: volume.path(percentEncoded: false)
+                ) ?? HoldBack.seen(in: contents) ?? contents.flatMap(KeptOnlyHere.reason(seenIn:))
+                    ?? (isShared ? .sharedWithEveryone : nil) ?? (isFilledByOthers ? .holdsWhatOthersPut : nil)
+            }
+            items.append(PackageReceipt.Item(
+                url: url,
+                size: contents.flatMap { $0.couldNotBeRead ? nil : $0.size },
+                requiresPrivileges: requiresPrivileges,
+                refusal: removalGuard.refusal(of: url),
+                heldBack: heldBack,
+                removedElsewhere: url.isNamedAsAnApp
+                    ? removedApps[place]
+                    : apps.lazy.filter { PathComponents.isPath(PathPattern.comparablePath(of: $0.url), inside: place) }
+                        .compactMap(rule).first ?? removedWithItsApp,
+                uninstallsItself: uninstallers.first {
+                    PathComponents.isPath(PathPattern.comparablePath(of: $0.app.url), atOrInside: place)
+                },
+                app: app,
+                leftInTheSystem: app.flatMap { LeftInTheSystem.of($0, environment: environment) },
+                commandToRunFirst: app.flatMap { CommandToRunFirst.of($0, environment: environment) }
+            ))
+        }
+
+        return Found(
+            receipt: PackageReceipt(
+                identifier: identifier,
+                version: info["pkg-version"] as? String,
+                installDate: (info["install-time"] as? Int).map { Date(timeIntervalSince1970: TimeInterval($0)) },
+                volume: volume,
+                items: items,
+                // Judged from the disk: `items` leaves out what is excluded or protected, even while it is there.
+                nothingLeftOnDisk: listing != nil && !throughScripts && found.onDisk.isEmpty,
+                isFileListKnown: listing != nil,
+                installedThroughItsScripts: throughScripts,
+                apps: ownApps
+            ),
+            files: files,
+            installLocation: installLocation
+        )
+    }
+
+    /// What `pkgutil --pkg-info-plist` says of a package, with the volume and the folder its file list is relative to.
+    private static func description(
+        of identifier: String,
+        pkgutil: Pkgutil
+    ) async -> (info: [String: Any], volume: URL, installLocation: URL)? {
+        guard
+            let data = await pkgutil(["--pkg-info-plist", identifier])?.data(using: .utf8),
+            let info = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        else { return nil }
+        let volume = URL(filePath: info["volume"] as? String ?? "/", directoryHint: .isDirectory)
+        let location = info["install-location"] as? String ?? ""
+        return (info, volume, volume.appending(path: location, directoryHint: .isDirectory))
+    }
+
+    /// Whether a package's install location, relative to its volume, is one of the temporary folders an installer's
+    /// scripts move files out of.
+    static func isTemporary(installLocation location: String) -> Bool {
+        let names = PathComponents.of(location).filter { $0 != "." }
+        let place = names.first == "private" ? Array(names.dropFirst()) : names
+        return place.first == "tmp" || (place.first == "var" && ["tmp", "folders"].contains(place.dropFirst().first))
+    }
+
+    private static func path(of file: String, in installLocation: URL) -> URL {
+        installLocation.appending(path: file.hasPrefix("./") ? String(file.dropFirst(2)) : file)
+    }
+
+    /// Where the packages `patterns` name wrote apps, finding the packages as Homebrew does for a cask's `pkgutil`
+    /// entries: `pkgutil --pkgs=` matches each pattern against whole identifiers.
+    static func apps(installedByPackagesMatching patterns: [String], pkgutil: Pkgutil) async -> [String] {
+        var identifiers: Set<String> = []
+        for pattern in patterns {
+            identifiers.formUnion(lines(of: await pkgutil(["--pkgs=\(pattern)"])))
+        }
+        var apps: Set<String> = []
+        for identifier in identifiers where !Task.isCancelled {
+            guard let (_, _, installLocation) = await description(of: identifier, pkgutil: pkgutil) else { continue }
+            for folder in lines(of: await pkgutil(["--files", identifier, "--only-dirs"])) {
+                let app = path(of: folder, in: installLocation)
+                if app.isNamedAsAnApp { apps.insert(PathPattern.comparablePath(of: app)) }
+            }
+        }
+        return apps.sorted()
+    }
+
+    private static func lines(of answer: String?) -> [String] {
+        (answer ?? "").split(whereSeparator: \.isNewline).map(String.init)
+    }
+
+    /// The folders every account on the Mac uses, `/Users/Shared`, spelled to be compared.
+    private static func sharedFolders(in environment: SearchEnvironment) -> [String] {
+        environment.locations.filter { $0.kind == .sharedFolder }.map { PathPattern.comparablePath(of: $0.url) }
+    }
+
+    /// How many levels deep the search goes into a folder that also holds files this package did not install.
+    private static let deepestDescent = 6
+
+    /// Returns the outermost existing paths that are this package's own, never a shared directory such as
+    /// `/Library`. `onDisk` holds all of them, and a path this account can't reach is not gone. `offered` leaves out
+    /// protected data (`ProtectedData.refuses`), which Peel never lists at all. `othersFilled` holds the folders
+    /// offered whole that hold what something besides this package put there. `accountHome` is the home folder of the
+    /// account a package was installed for alone, where the folders every package shares are those of a home.
+    static func topLevel(
+        files: [String],
+        installLocation: String,
+        accountHome: String? = nil,
+        home: String = URL.homeDirectory.path(percentEncoded: false),
+        namesInside: (String) -> [String]? = PackageReceipts.namesInside,
+        exists: (String) -> Bool = { !URL(filePath: $0).isMissing }
+    ) -> (onDisk: [String], offered: [String], othersFilled: Set<String>) {
+        let root = (installLocation as NSString).standardizingPath
+        let paths = files.map { file -> String in
+            let relative = file.hasPrefix("./") ? String(file.dropFirst(2)) : file
+            return ((root as NSString).appendingPathComponent(relative) as NSString).standardizingPath
+        }
+        let listed = Set(paths)
+        // A Mac disk is case-insensitive unless formatted otherwise, so `library/...` in a receipt is `/Library`.
+        let shared = Set(sharedDirectories.map { $0.lowercased() })
+        let sharedAtHome = Set(sharedInTheHome.map { $0.lowercased() })
+        let accountFolder = accountHome.map { ($0 as NSString).standardizingPath.lowercased() }
+        let isSharedWhenLowered = { (path: String) in
+            guard let accountFolder, path == accountFolder || path.hasPrefix(accountFolder + "/") else {
+                return shared.contains(path)
+            }
+            return sharedAtHome.contains(path == accountFolder ? "/" : String(path.dropFirst(accountFolder.count)))
+        }
+        let isShared = { (path: String) in isSharedWhenLowered(path.lowercased()) }
+        let lowered = paths.map { $0.lowercased() }
+        // A package can be built with a bundle as its install location, an app's own folder, and lists only what is
+        // inside it. The bundle is still one item.
+        if !isShared(root), isBundle(root, exists: exists) {
+            return ([root], ProtectedData.refuses(root, home: home) ? [] : [root], [])
+        }
+
+        let outermost = Set(zip(paths, lowered).filter { path, lowered in
+            guard !isSharedWhenLowered(lowered), path != root else { return false }
+            let parent = (path as NSString).deletingLastPathComponent
+            return parent == root || isSharedWhenLowered((lowered as NSString).deletingLastPathComponent)
+                || !listed.contains(parent)
+        }.map(\.0))
+        .filter(exists)
+
+        let folded = Set(lowered)
+        var othersFilled: Set<String> = []
+        let onDisk = outermost
+            .flatMap {
+                onlyWhatThisPackageWrote(
+                    $0, listed: folded, namesInside: namesInside, exists: exists, othersFilled: &othersFilled
+                )
+            }
+            .sorted()
+        return (onDisk, onDisk.filter { !ProtectedData.refuses($0, home: home) }, othersFilled)
+    }
+
+    /// Returns `path` when this package installed everything inside it, at any depth, and otherwise the parts
+    /// inside it that the package did install, so a vendor folder that two of its products share is never offered
+    /// whole. A bundle is always one item: an app that updated itself does not match its receipt file by file, and
+    /// its parts are never listed on their own. `listed` holds the package's paths in lowercase.
+    static func onlyWhatThisPackageWrote(
+        _ path: String,
+        listed: Set<String>,
+        namesInside: (String) -> [String]?,
+        exists: (String) -> Bool,
+        depth: Int = 0,
+        othersFilled: inout Set<String>
+    ) -> [String] {
+        guard let names = namesInside(path), !isBundle(path, exists: exists) else { return [path] }
+        let inside = names.map { (path as NSString).appendingPathComponent($0) }
+        let own = inside.filter { listed.contains($0.lowercased()) }
+        func parts(_ depth: Int) -> [String] {
+            own.flatMap {
+                onlyWhatThisPackageWrote(
+                    $0, listed: listed, namesInside: namesInside, exists: exists, depth: depth,
+                    othersFilled: &othersFilled
+                )
+            }
+        }
+        if own.count == inside.count {
+            let found = parts(depth)
+            return found == own && !own.contains(where: othersFilled.contains) ? [path] : found
+        }
+        // Nothing inside is listed, or the search went as deep as it goes: the folder is still the only thing this
+        // receipt can name, and what else is in it is not this package's.
+        guard !own.isEmpty, depth < deepestDescent else {
+            othersFilled.insert(path)
+            return [path]
+        }
+        return parts(depth + 1)
+    }
+
+    /// `path` when it is an app, or else the apps a level or two inside it, as far as the guard looks for an excluded
+    /// one. An app inside another bundle is that bundle's own.
+    static func appPaths(in path: String) -> [String] {
+        guard !PathComponents.isNamedAsAnApp(path) else { return [path] }
+        guard !isBundle(path, exists: { URL(filePath: $0).isThere }), let names = namesInside(path) else { return [] }
+        return names.sorted().flatMap { name -> [String] in
+            let inside = (path as NSString).appendingPathComponent(name)
+            if PathComponents.isNamedAsAnApp(inside) { return URL(filePath: inside).isRealFolder ? [inside] : [] }
+            guard !isBundle(inside, exists: { URL(filePath: $0).isThere }) else { return [] }
+            return (namesInside(inside) ?? []).sorted().map { (inside as NSString).appendingPathComponent($0) }
+                .filter { PathComponents.isNamedAsAnApp($0) && URL(filePath: $0).isRealFolder }
+        }
+    }
+
+    /// What is inside a folder, or nil for a file or a link, which is one item whatever it leads to.
+    static func namesInside(_ path: String) -> [String]? {
+        var info = stat()
+        guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { return nil }
+        return try? FileManager.default.contentsOfDirectory(atPath: path)
+    }
+
+    /// A folder with an extension and an `Info.plist` in `Contents`, or in `Resources` for a framework. A dot alone
+    /// is no bundle: `Logitech.localized` is a plain folder.
+    private static func isBundle(_ path: String, exists: (String) -> Bool) -> Bool {
+        guard !(path as NSString).pathExtension.isEmpty else { return false }
+        return ["Contents/Info.plist", "Resources/Info.plist"].contains {
+            exists((path as NSString).appendingPathComponent($0))
+        }
+    }
+
+    /// A tool that could not be run, or that failed, says nothing about what is installed.
+    static func pkgutil(_ arguments: [String]) async -> String? {
+        guard case .success(let output) = await Subprocess.run("/usr/sbin/pkgutil", arguments, timeout: 30) else { return nil }
+        return output.status == 0 ? output.text : nil
+    }
+}
+
+/// Which system extensions macOS has installed, asked at most once for a scan, and only once an app carries one.
+actor InstalledSystemExtensions {
+    private let asking: AppExtensions.SystemExtensionsAnswer
+    private var asked: Task<[AppExtension]?, Never>?
+
+    init(asking: @escaping AppExtensions.SystemExtensionsAnswer) {
+        self.asking = asking
+    }
+
+    func answer() async -> [AppExtension]? {
+        if let asked { return await asked.value }
+        let asking = asking
+        let task = Task { await asking() }
+        asked = task
+        return await task.value
+    }
+}

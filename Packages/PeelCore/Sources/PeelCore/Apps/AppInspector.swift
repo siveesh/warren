@@ -1,0 +1,426 @@
+import CoreServices
+import Darwin
+public import AppKit
+public import Foundation
+import Security
+internal import PeelPrivileged
+import UniformTypeIdentifiers
+
+public enum AppInspector {
+    /// Where macOS thinks an app is, including folders Peel doesn't scan, such as a build folder.
+    /// A copy in the Trash doesn't count as installed.
+    public static func applicationURL(forBundleIdentifier identifier: String) -> URL? {
+        applicationURLs(forBundleIdentifier: identifier).first
+    }
+
+    /// Every copy of the app with `identifier` that macOS knows, wherever it is, best first. A copy in the Trash
+    /// doesn't count as installed.
+    static func applicationURLs(forBundleIdentifier identifier: String) -> [URL] {
+        NSWorkspace.shared.urlsForApplications(withBundleIdentifier: identifier).filter { url in
+            !isInATrash(url) && FileManager.default.fileExists(atPath: url.path(percentEncoded: false))
+        }
+    }
+
+    /// Whether a copy of the app at `url` other than that one is installed, outside a Trash: one of `installedApps`, or
+    /// one macOS knows, with the same identifier, that is still there. The list may still name the place the app was
+    /// just moved from. An app with no valid identifier has no copies to tell apart.
+    public static func anotherCopyIsInstalled(of url: URL, among installedApps: [InstalledApp]) -> Bool {
+        anotherCopyIsInstalled(of: url, among: installedApps, knownCopies: applicationURLs(forBundleIdentifier:))
+    }
+
+    /// `knownCopies` answers which copies macOS knows of an identifier, which a test can't make it know. A copy it
+    /// knows on a disk that can't be written and can be ejected, such as the disk image the app came on, isn't
+    /// installed.
+    static func anotherCopyIsInstalled(
+        of url: URL, among installedApps: [InstalledApp], knownCopies: (String) -> [URL]
+    ) -> Bool {
+        guard let identifier = inspect(url)?.bundleIdentifier, Identifier.isValid(identifier) else { return false }
+        let own = PathPattern.comparablePath(of: url)
+        let copies = installedApps.filter { $0.bundleIdentifier?.lowercased() == identifier.lowercased() }.map(\.url)
+            + knownCopies(identifier)
+        return copies.contains { PathPattern.comparablePath(of: $0) != own && staysInstalled($0) }
+    }
+
+    /// Whether the app at `url` stays installed: it is there, outside a Trash, and not on a disk that can't be written
+    /// and can be ejected, such as the disk image it came on.
+    static func staysInstalled(_ url: URL) -> Bool {
+        url.isThere && !isInATrash(url) && !isOnAReadOnlyDiskThatEjects(url)
+    }
+
+    private static func isOnAReadOnlyDiskThatEjects(_ url: URL) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.volumeIsReadOnlyKey, .volumeIsEjectableKey])
+        return values?.volumeIsReadOnly == true && values?.volumeIsEjectable == true
+    }
+
+    static func isInATrash(_ url: URL) -> Bool {
+        let names = PathComponents.of(url.path(percentEncoded: false))
+        return names.contains(".Trash") || names.contains(".Trashes")
+    }
+
+    /// The identifiers of the apps Spotlight has indexed whose identifier begins with one of `prefixes`, wherever they
+    /// are, such as every app of one maker. Empty when Spotlight is off, has none, or does not answer within `budget`,
+    /// and when a prefix is not made of an identifier's characters, since each goes into the query as it is.
+    static func indexedIdentifiers(
+        beginningWith prefixes: [String],
+        within budget: TimeInterval = spotlightBudget
+    ) async -> Set<String> {
+        guard let query = spotlightQuery(forIdentifiersBeginningWith: prefixes) else { return [] }
+        return await SlowRead.answer(within: budget) { _ in identifiers(answering: query) } ?? []
+    }
+
+    static func spotlightQuery(forIdentifiersBeginningWith prefixes: [String]) -> String? {
+        let isAnIdentifiersStart = { (prefix: String) in
+            !prefix.isEmpty && prefix.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || "._-".contains($0)) }
+        }
+        guard !prefixes.isEmpty, prefixes.allSatisfy(isAnIdentifiersStart) else { return nil }
+        let identifiers = prefixes.map { "kMDItemCFBundleIdentifier == \"\($0)*\"c" }.joined(separator: " || ")
+        return "kMDItemContentTypeTree == \"com.apple.application-bundle\" && (\(identifiers))"
+    }
+
+    /// Blocks until Spotlight has answered `query` in full, so it runs on a thread of its own.
+    static func identifiers(answering query: String) -> Set<String> {
+        guard let query = MDQueryCreate(kCFAllocatorDefault, query as CFString, nil, nil),
+              MDQueryExecute(query, CFOptionFlags(kMDQuerySynchronous.rawValue))
+        else { return [] }
+        return Set((0..<MDQueryGetResultCount(query)).compactMap { index in
+            guard let result = MDQueryGetResultAtIndex(query, index) else { return nil }
+            return MDItemCopyAttribute(
+                Unmanaged<MDItem>.fromOpaque(result).takeUnretainedValue(),
+                kMDItemCFBundleIdentifier
+            ) as? String
+        })
+    }
+
+    /// How long a scan waits for Spotlight. It answers a query on one attribute at once unless it is rebuilding its
+    /// index, and a scan can do without the apps it would name.
+    private static let spotlightBudget: TimeInterval = 2
+
+    /// Why something can't be read as an app, once `inspect` gave nothing for it.
+    public enum Unreadable: Sendable, Equatable {
+        case gone
+        case notAnApp
+        /// The Info.plist, which says what the app is, isn't there.
+        case noInfo
+        /// Permissions keep this account from reading the Info.plist: its own, or those of a folder on its way.
+        case infoClosed
+        /// macOS's privacy protection keeps Peel from reading the Info.plist, as in Downloads after Don't Allow.
+        case infoKeptByPrivacy
+        /// The Info.plist opens but isn't a property list Peel can read.
+        case infoDamaged
+        /// The Info.plist sits at the bundle's top, where an app for iPhone, iPad, Apple TV, Apple Watch, or Apple
+        /// Vision Pro keeps it: a Mac app keeps it in `Contents`.
+        case builtForAnotherPlatform
+    }
+
+    /// Whether `url` is an app bundle itself: a folder named as an app, not a link to one nor a file named like one,
+    /// whose Info.plist doesn't sit behind a link either, which would make it another app.
+    public static func isABundle(_ url: URL) -> Bool {
+        var info = stat()
+        guard url.isNamedAsAnApp, lstat(PathPattern.comparablePath(of: url), &info) == 0,
+              info.st_mode & S_IFMT == S_IFDIR
+        else { return false }
+        let infoFolder = PathPattern.comparablePath(of: AppBundleLayout(of: url).infoFolder)
+        return lstat(infoFolder, &info) != 0 || info.st_mode & S_IFMT != S_IFLNK
+    }
+
+    /// Whether what arrived in the Trash at `url` is an app that left this Mac: a bundle, since a link to one leaves
+    /// the app where it is, and no other copy installed.
+    public static func isAnAppThatLeft(_ url: URL, among installedApps: [InstalledApp]) -> Bool {
+        isABundle(url) && !anotherCopyIsInstalled(of: url, among: installedApps)
+    }
+
+    public static func whyUnreadable(_ url: URL) -> Unreadable {
+        if url.isMissing { return .gone }
+        guard url.isNamedAsAnApp else { return .notAnApp }
+        if url.isSymbolicLink {
+            // `canonicalWithoutOpening` answers the link itself when it leads nowhere or round in a loop.
+            let destination = PathPattern.canonicalWithoutOpening(url)
+            return destination.isSymbolicLink ? .gone : whyUnreadable(destination)
+        }
+        guard isABundle(url) else { return .notAnApp }
+        let info = AppBundleLayout(of: url).infoFolder.appending(path: "Info.plist")
+        if info.isMissing { return url.appending(path: "Info.plist").isThere ? .builtForAnotherPlatform : .noInfo }
+        return access(info.path(percentEncoded: false), R_OK) == 0 ? .infoDamaged : unreadableInfo(accessError: errno)
+    }
+
+    /// Why an Info.plist that is there can't be read, from what `access(2)` answered: `EPERM` is macOS's privacy
+    /// protection, which System Settings lifts, and anything else the permissions.
+    static func unreadableInfo(accessError: Int32) -> Unreadable {
+        accessError == EPERM ? .infoKeptByPrivacy : .infoClosed
+    }
+
+    public static func inspect(_ url: URL) -> InstalledApp? {
+        // A link names the app it leads to, which is what is read: never the link, whose page would select the app's
+        // files while only the link moved.
+        if url.isSymbolicLink {
+            let destination = PathPattern.canonicalWithoutOpening(url).path(percentEncoded: false)
+            let bundle = URL(filePath: destination, directoryHint: .isDirectory)
+            return isABundle(bundle) ? inspect(bundle) : nil
+        }
+        guard isABundle(url) else { return nil }
+        let layout = AppBundleLayout(of: url)
+        let contents = layout.infoFolder
+        guard let info = infoDictionary(in: contents) else { return nil }
+        let bundleIdentifier = info["CFBundleIdentifier"] as? String
+
+        let signing = signingInformation(for: layout.signedBundle)
+        let executable = (info["CFBundleExecutable"] as? String).map { layout.executableFolder.appending(path: $0) }
+        // The App Store leaves its metadata beside a wrapped app, as it leaves a receipt inside a Mac app.
+        let receipt = layout.isWrapped
+            ? url.appending(path: "Wrapper/iTunesMetadata.plist") : contents.appending(path: "_MASReceipt/receipt")
+        let isFromAppStore = FileManager.default.fileExists(atPath: receipt.path(percentEncoded: false))
+        let appStoreListing: AppStoreListing? = if !isFromAppStore {
+            nil
+        } else if layout.isWrapped {
+            iPhoneAndiPadListing(metadataAt: receipt)
+        } else {
+            .mac
+        }
+        let isSystemProtected = isSystemProtected(url)
+        let use = use(of: url)
+        let electronConfiguration = ElectronUpdater.configuration(in: contents)
+        let architectures = executable.flatMap(MachOHeader.architectures(ofExecutableAt:)) ?? []
+        let asksForIntelFirst = (info["LSArchitecturePriority"] as? [String])?.first == "x86_64"
+        let vsCodeProduct = ProductFolders.vsCodeProduct(of: url)
+
+        return InstalledApp(
+            url: url,
+            bundleIdentifier: bundleIdentifier,
+            name: displayName(of: url, identifier: bundleIdentifier),
+            bundleName: info["CFBundleName"] as? String,
+            version: statedVersion(in: info),
+            buildVersion: stated(info["CFBundleVersion"]),
+            teamIdentifier: signing.teamIdentifier,
+            developer: signing.developer,
+            applicationGroups: signing.applicationGroups,
+            embeddedBundleIdentifiers: embeddedBundleIdentifiers(in: contents, isWrapped: layout.isWrapped),
+            architectures: architectures,
+            asksForIntelFirst: asksForIntelFirst,
+            isFromAppStore: isFromAppStore,
+            isSignedByTheAppStore: signing.appStoreIdentifier.map { $0 == bundleIdentifier } == true,
+            isSystemProtected: isSystemProtected,
+            enclosingPackage: url.enclosingPackage,
+            lastUsedDate: use.lastUsedDate,
+            isUseRecorded: use.isRecorded,
+            dateAdded: dateAdded(of: url),
+            updateFeed: UpdateFeed.detect(
+                info: info,
+                electronConfiguration: electronConfiguration,
+                vsCodeFeed: vsCodeProduct.flatMap {
+                    VSCodeUpdateService.feedURL(product: $0)
+                },
+                appStoreListing: appStoreListing,
+                isSystemProtected: isSystemProtected,
+                isFromSetapp: InstalledApp.isFromSetapp(at: url, identifier: bundleIdentifier)
+            ),
+            updaterFolder: electronConfiguration.flatMap(ElectronUpdater.downloadsFolder(fromConfiguration:)),
+            velopackID: Velopack.id(in: contents),
+            productFolders: ProductFolders.of(appAt: url, vsCodeProduct: vsCodeProduct),
+            webApp: bundleIdentifier.flatMap { WebApp.of(identifier: $0, info: info) },
+            carriesSystemExtensions: AppExtensions.systemExtensions(carriedBy: url).map { !$0.isEmpty } ?? true,
+            isSealIntact: MakersUninstaller.keepsItsScriptInside(
+                team: signing.teamIdentifier, identifier: bundleIdentifier
+            ) ? CodeSignature.sealHolds(at: url) : nil
+        )
+    }
+
+    private static func iPhoneAndiPadListing(metadataAt url: URL) -> AppStoreListing {
+        let metadata = BoundedRead.data(at: url, maximum: 1_048_576).flatMap {
+            try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any]
+        }
+        let item = (metadata?["itemId"] as? Int).flatMap { $0 > 0 ? $0 : nil }
+        let store = (metadata?["storefrontCountryCode"] as? String)?.lowercased()
+        let isACountry = store.map { $0.count == 2 && $0.allSatisfy { $0.isASCII && $0.isLetter } } ?? false
+        return .iPhoneAndiPad(item: item, store: isACountry ? store : nil)
+    }
+
+    private static let embeddedBundleDirectories = [
+        "Library/LoginItems",
+        "Library/SystemExtensions",
+        "PlugIns",
+        "Extensions",
+        "XPCServices",
+        "Helpers",
+        "Frameworks",
+    ]
+
+    private static let embeddedBundleExtensions: Set<String> = ["app", "appex", "xpc", "systemextension"]
+
+    static func infoDictionary(in contents: URL) -> [String: Any]? {
+        guard let data = BoundedRead.data(at: contents.appending(path: "Info.plist")) else { return nil }
+        return try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+    }
+
+    /// The version a bundle's Info.plist states: its short version, else its build number.
+    static func statedVersion(in info: [String: Any]?) -> String? {
+        stated(info?["CFBundleShortVersionString"]) ?? stated(info?["CFBundleVersion"])
+    }
+
+    /// A value of an Info.plist as text. One that is not text, or holds only blank space, states nothing, so it is
+    /// never shown as an empty line.
+    static func stated(_ value: Any?) -> String? {
+        guard let text = value as? String, !text.allSatisfy(\.isWhitespace) else { return nil }
+        return text
+    }
+
+    /// Whether the bundle's Info.plist is there and macOS will not let Peel read it, so nothing can be told about
+    /// the app.
+    static func isClosed(_ bundle: URL) -> Bool {
+        let info = AppBundleLayout(of: bundle).infoFolder.appending(path: "Info.plist")
+        return !info.isMissing && BoundedRead.data(at: info) == nil
+    }
+
+    /// The name Finder shows for the app macOS knows by `identifier`, or the identifier itself when it knows none.
+    public static func knownName(forBundleIdentifier identifier: String) -> String {
+        applicationURL(forBundleIdentifier: identifier).map(displayName(of:)) ?? identifier
+    }
+
+    /// The name Finder shows for a bundle, in the user's language when the app translates its name. Asking Launch
+    /// Services for it registers the bundle, so one it does not know yet is named by its file.
+    public static func displayName(of url: URL) -> String {
+        displayName(of: url, identifier: bundleIdentifier(ofAppAt: url))
+    }
+
+    static func bundleIdentifier(ofAppAt url: URL) -> String? {
+        infoDictionary(in: AppBundleLayout(of: url).infoFolder)?["CFBundleIdentifier"] as? String
+    }
+
+    static func displayName(of url: URL, identifier: String?) -> String {
+        let name = identifier.map { isKnown(url, as: $0) } == true
+            ? FileManager.default.displayName(atPath: url.path(percentEncoded: false)) : url.lastPathComponent
+        return PathComponents.isNamedAsAnApp(name) ? String(name.dropLast(4)) : name
+    }
+
+    private static func isKnown(_ url: URL, as identifier: String) -> Bool {
+        let path = PathPattern.comparablePath(of: PathPattern.canonicalWithoutOpening(url))
+        return NSWorkspace.shared.urlsForApplications(withBundleIdentifier: identifier).contains {
+            PathPattern.comparablePath(of: PathPattern.canonicalWithoutOpening($0)) == path
+        }
+    }
+
+    /// The icon of the app at `url`. Asking IconServices registers a bundle, as asking its name does, so only an app
+    /// Launch Services knows at that place is asked there; any other's comes from its own files, or is the generic one.
+    public static func icon(ofAppAt url: URL) -> NSImage {
+        if bundleIdentifier(ofAppAt: url).map({ isKnown(url, as: $0) }) == true {
+            return NSWorkspace.shared.icon(forFile: url.path(percentEncoded: false))
+        }
+        return ownIcon(ofAppAt: url) ?? NSWorkspace.shared.icon(for: .applicationBundle)
+    }
+
+    static func ownIcon(ofAppAt url: URL) -> NSImage? {
+        guard let bundle = Bundle(url: AppBundleLayout(of: url).signedBundle), let info = bundle.infoDictionary else {
+            return nil
+        }
+        if let file = info["CFBundleIconFile"] as? String,
+           let icns = bundle.url(forResource: file, withExtension: file.hasSuffix(".icns") ? nil : "icns"),
+           let image = NSImage(contentsOf: icns) {
+            return image
+        }
+        if let name = info["CFBundleIconName"] as? String, let image = bundle.image(forResource: name) {
+            return image
+        }
+        return nil
+    }
+
+    /// What a checked signature says of the bundle at `url`; `appStoreIdentifier` is the identifier the App Store
+    /// signed it under, nil unless the App Store did.
+    static func signingInformation(
+        for url: URL
+    ) -> (teamIdentifier: String?, developer: String?, applicationGroups: [String], appStoreIdentifier: String?) {
+        guard let information = CodeSignature.information(at: url) else { return (nil, nil, [], nil) }
+        let team = information[kSecCodeInfoTeamIdentifier as String] as? String
+        let leaf = (information[kSecCodeInfoCertificates as String] as? [SecCertificate])?.first
+        let isTheAppStores = leaf.map(CodeSignature.isTheAppStoresLeaf) == true
+        return (
+            team,
+            leaf.flatMap { SecCertificateCopySubjectSummary($0) as String? }.flatMap {
+                CodeSignature.developer(fromLeaf: $0, team: team)
+            },
+            applicationGroups(in: information),
+            isTheAppStores ? information[kSecCodeInfoIdentifier as String] as? String : nil
+        )
+    }
+
+    /// The application groups the bundle's checked signature claims.
+    static func applicationGroups(at url: URL) -> [String] {
+        CodeSignature.information(at: url).map(applicationGroups(in:)) ?? []
+    }
+
+    private static func applicationGroups(in information: [String: Any]) -> [String] {
+        let entitlements = information[kSecCodeInfoEntitlementsDict as String] as? [String: Any]
+        return entitlements?["com.apple.security.application-groups"] as? [String] ?? []
+    }
+
+    private static func embeddedBundleIdentifiers(in contents: URL, isWrapped: Bool) -> [String] {
+        let fileManager = FileManager.default
+        var identifiers: [String] = []
+
+        for directory in embeddedBundleDirectories {
+            let folder = contents.appending(path: directory, directoryHint: .isDirectory)
+            guard let children = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            else {
+                continue
+            }
+            for child in children where embeddedBundleExtensions.contains(child.pathExtension.lowercased()) {
+                // An iOS bundle keeps its Info.plist at its top, so those inside a wrapped app do too.
+                let childContents = isWrapped ? child : child.appending(path: "Contents", directoryHint: .isDirectory)
+                if let identifier = infoDictionary(in: childContents)?["CFBundleIdentifier"] as? String {
+                    identifiers.append(identifier)
+                }
+            }
+        }
+
+        if !isWrapped {
+            var unread: [URL] = []
+            let app = contents.deletingLastPathComponent()
+            for bundle in IntelInspector.frameworkProcesses(inside: app, bundlesOnly: true, unreadable: &unread) {
+                let info = infoDictionary(in: bundle.appending(path: "Contents", directoryHint: .isDirectory))
+                if let identifier = info?["CFBundleIdentifier"] as? String { identifiers.append(identifier) }
+            }
+        }
+
+        let launchServices = contents.appending(path: "Library/LaunchServices", directoryHint: .isDirectory)
+        if let helpers = try? fileManager.contentsOfDirectory(atPath: launchServices.path(percentEncoded: false)) {
+            identifiers += helpers.filter { $0.split(separator: ".").count >= 3 }
+        }
+
+        for directory in ["Library/LaunchAgents", "Library/LaunchDaemons"] {
+            let folder = contents.appending(path: directory, directoryHint: .isDirectory)
+            guard let plists = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
+                continue
+            }
+            for plist in plists where plist.pathExtension == "plist" {
+                guard let label = BoundedRead.propertyList(at: plist)?["Label"] as? String else { continue }
+                identifiers.append(label)
+            }
+        }
+
+        return Array(Set(identifiers)).sorted()
+    }
+
+    private static func isSystemProtected(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path(percentEncoded: false), &info) == 0 else { return false }
+        return info.st_flags & UInt32(SF_RESTRICTED) != 0
+    }
+
+    /// When the app was last opened, and whether Spotlight records it at all. An item outside Spotlight's index holds
+    /// only what the file system says (`kMDItemFS…`), yet asked for its last used date it answers with its
+    /// modification date. So the date is read only when the item holds it, and the index holds the item when it holds
+    /// a content type.
+    static func use(of url: URL) -> (lastUsedDate: Date?, isRecorded: Bool) {
+        guard
+            let item = MDItemCreateWithURL(kCFAllocatorDefault, url as CFURL),
+            let names = MDItemCopyAttributeNames(item) as? [String]
+        else { return (nil, false) }
+        let lastUsedDate = names.contains(kMDItemLastUsedDate as String)
+            ? MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date
+            : nil
+        return (lastUsedDate, names.contains(kMDItemContentType as String))
+    }
+
+    /// When the app appeared in its folder, which is the closest thing to an install date.
+    private static func dateAdded(of url: URL) -> Date? {
+        (try? url.resourceValues(forKeys: [.addedToDirectoryDateKey]))?.addedToDirectoryDate
+    }
+}

@@ -1,0 +1,298 @@
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Synchronization
+import Testing
+
+struct BackgroundItemOwnershipTests {
+    private func app(_ identifier: String, _ name: String, team: String? = nil) -> InstalledApp {
+        InstalledApp(url: URL(filePath: "/Applications/\(name).app"), bundleIdentifier: identifier, name: name, teamIdentifier: team)
+    }
+
+    /// Who signed each program, given here so that no test depends on what is signed on the Mac it runs on.
+    private static let teams = ["/usr/local/bin/example-helper": "ABCDE12345", "/usr/local/bin/impostor": "ZZZZZ99999"]
+
+    private var ownership: BackgroundItemOwnership {
+        BackgroundItemOwnership(
+            installedApps: [app("com.example.app", "Example", team: "ABCDE12345"), app("com.other.tool", "Tool")],
+            teamOfProgram: { Self.teams[$0] }
+        )
+    }
+
+    @Test func readsAJobsSignatureOnlyWhenItsProgramIsGone() throws {
+        final class Reads: Sendable { let programs = Mutex<[String]>([]) }
+        let reads = Reads()
+        let ownership = BackgroundItemOwnership(installedApps: []) { program in
+            reads.programs.withLock { $0.append(program) }
+            return nil
+        }
+        let live = try #require(JobDefinition(["Label": "org.example.live", "Program": "/bin/sh"]))
+        let gone = try #require(JobDefinition(["Label": "org.example.gone", "Program": "/opt/org.example/gone"]))
+
+        #expect(!ownership.isOrphan(live))
+        #expect(ownership.isOrphan(gone))
+        #expect(reads.programs.withLock { $0 } == ["/opt/org.example/gone"])
+    }
+
+    @Test func neverCallsGoneAProgramWhosePathHoldsANul() throws {
+        let ownership = BackgroundItemOwnership(installedApps: []) { _ in nil }
+        let job = try #require(JobDefinition(["Label": "org.example.cut", "Program": "/bin/sh\u{0}gone"]))
+
+        #expect(!ownership.isOrphan(job))
+        #expect(!ownership.isOrphan(label: "org.example.cut", program: "/bin/sh\u{0}gone", owner: nil))
+    }
+
+    @Test(.permissionsHold) func neverCallsGoneAProgramInAFolderItCannotSearch() throws {
+        let directory = try TemporaryDirectory()
+        let program = try directory.file("Vendor/bin/agent").path(percentEncoded: false)
+        try directory.setPermissions(0, of: "Vendor")
+        defer { try? directory.setPermissions(0o755, of: "Vendor") }
+        let ownership = BackgroundItemOwnership(installedApps: []) { _ in nil }
+        let job = try #require(JobDefinition(["Label": "org.example.agent", "Program": program]))
+
+        #expect(!ownership.isOrphan(job))
+        #expect(!ownership.isOrphan(label: "org.example.agent", program: program, owner: nil))
+    }
+
+    /// What the helper refuses, the page must not offer: both read the same label.
+    @Test func knowsTheJobTheHelperWillNotActOn() {
+        func item(_ label: String, _ kind: BackgroundItem.Kind) -> BackgroundItem {
+            BackgroundItem(
+                label: label,
+                kind: kind,
+                source: .app,
+                plistURL: nil,
+                program: nil,
+                runsAtLoad: false,
+                keepsAlive: false,
+                ownerBundleIdentifier: nil,
+                ownerName: nil,
+                ownerURL: nil,
+                isOrphan: false,
+                state: .loaded,
+                isDisabled: false
+            )
+        }
+        let helper = item(HelperIdentity.helperIdentifier, .daemon)
+        #expect(helper.isPeelsHelper)
+        #expect(!PrivilegedPathPolicy.allowsDaemon(helper.label))
+        #expect(!item(HelperIdentity.helperIdentifier, .agent).isPeelsHelper, "an agent never reaches the helper")
+        #expect(!item("com.example.helper", .daemon).isPeelsHelper)
+    }
+
+    @Test func prefersTheBundleTheJobNames() {
+        let owner = ownership.owner(
+            label: "org.unrelated.label",
+            associated: ["com.example.app"],
+            program: "/usr/local/bin/example-helper"
+        )
+        #expect(owner?.bundleIdentifier == "com.example.app")
+        #expect(owner?.name == "Example")
+        #expect(owner?.isInstalled == true)
+    }
+
+    /// `AssociatedBundleIdentifiers` is written by whoever wrote the plist. macOS believes it only when the
+    /// program is signed by the team of the app it names, and so does Peel. Otherwise a persistence agent that
+    /// names Chrome would be shown as Chrome's, and could never be called orphaned.
+    @Test func believesAnAssociationOnlyFromTheSameTeam() {
+        let impostor = ownership.owner(label: "org.unrelated.label", associated: ["com.example.app"], program: "/usr/local/bin/impostor")
+        #expect(impostor == nil)
+
+        let unsigned = ownership.owner(label: "org.unrelated.label", associated: ["com.example.app"], program: "/usr/local/bin/unsigned")
+        #expect(unsigned == nil)
+
+        // The chain goes on past an association it does not believe, and every name in the list is tried.
+        let byLabel = ownership.owner(label: "com.other.tool.helper", associated: ["com.example.app"], program: "/usr/local/bin/impostor")
+        #expect(byLabel?.bundleIdentifier == "com.other.tool")
+        let second = ownership.owner(label: "org.unrelated.label", associated: ["com.nobody.app", "com.example.app"], program: "/usr/local/bin/example-helper")
+        #expect(second?.bundleIdentifier == "com.example.app")
+    }
+
+    /// What macOS itself says registered a job is not a claim a plist makes, and is believed as it is.
+    @Test func believesWhatMacOSSaysRegisteredTheJob() {
+        let owner = ownership.owner(label: "org.unrelated.label", registeredBy: "com.other.tool", associated: [], program: nil)
+        #expect(owner?.bundleIdentifier == "com.other.tool")
+    }
+
+    /// A label, or the bundle a program sits in, is a name anyone can give, so it proves an app's job only when the
+    /// program is signed by that app's team or sits inside that very app. Otherwise the owner is a name alone, and
+    /// the page says so.
+    @Test func saysHowSureItIsOfAnOwner() throws {
+        let directory = try TemporaryDirectory()
+        let installed = try directory.directory("Applications/Example.app")
+        try directory.file("Applications/Example.app/Contents/Info.plist", contents: PropertyListSerialization.data(
+            fromPropertyList: ["CFBundleIdentifier": "com.example.app"], format: .xml, options: 0))
+        try directory.file("tmp/Fake.app/Contents/Info.plist", contents: PropertyListSerialization.data(
+            fromPropertyList: ["CFBundleIdentifier": "com.example.app"], format: .xml, options: 0))
+        let ownership = BackgroundItemOwnership(
+            installedApps: [InstalledApp(url: installed, bundleIdentifier: "com.example.app", name: "Example", teamIdentifier: "ABCDE12345"), app("com.other.tool", "Tool")],
+            teamOfProgram: { Self.teams[$0] }
+        )
+        func owner(
+            _ label: String,
+            registeredBy: String? = nil,
+            associated: [String] = [],
+            program: String?
+        ) -> BackgroundItemOwnership.Owner? {
+            ownership.owner(label: label, registeredBy: registeredBy, associated: associated, program: program)
+        }
+
+        #expect(owner("org.unrelated.label", registeredBy: "com.other.tool", program: nil)?.isConfirmed == true)
+        #expect(owner("org.unrelated.label", associated: ["com.example.app"], program: "/usr/local/bin/example-helper")?.isConfirmed == true)
+        #expect(owner("com.example.app.updater", program: "/usr/local/bin/example-helper")?.isConfirmed == true)
+        #expect(owner("org.unrelated.label", program: installed.appending(path: "Contents/MacOS/helper").path(percentEncoded: false))?.isConfirmed == true)
+
+        let impostor = try #require(owner("com.example.app.updater", program: "/usr/local/bin/impostor"))
+        #expect(impostor.bundleIdentifier == "com.example.app")
+        #expect(!impostor.isConfirmed)
+        #expect(owner("com.other.tool.helper", program: nil)?.isConfirmed == false)
+        let planted = try #require(owner("org.unrelated.label", program: directory.url.appending(path: "tmp/Fake.app/Contents/MacOS/x").path(percentEncoded: false)))
+        #expect(planted.bundleIdentifier == "com.example.app")
+        #expect(!planted.isConfirmed)
+    }
+
+    @Test func ownsAJobByTheBundleItsProgramSitsIn() throws {
+        let directory = try TemporaryDirectory()
+        for folder in ["Vendor", ".Trash"] {
+            try directory.file("\(folder)/Updater.app/Contents/Info.plist", contents: PropertyListSerialization.data(
+                fromPropertyList: ["CFBundleIdentifier": "org.example.updater"], format: .xml, options: 0))
+        }
+        let bundle = directory.url.appending(path: "Vendor/Updater.app").path(percentEncoded: false)
+        let program = bundle + "/Contents/MacOS/Updater"
+        func owner(_ teams: [String: String], program: String = program) -> BackgroundItemOwnership.Owner? {
+            BackgroundItemOwnership(installedApps: [], teamOfProgram: { teams[$0] })
+                .owner(label: "org.example.updater.agent", associated: [], program: program)
+        }
+
+        let signed = try #require(owner([program: "ABCDE12345", bundle: "ABCDE12345"]))
+        #expect(signed.bundleIdentifier == "org.example.updater")
+        #expect(signed.name == "Updater")
+        #expect(signed.url == URL(filePath: bundle, directoryHint: .isDirectory))
+        #expect(signed.isConfirmed)
+
+        let unsigned = try #require(owner([:]))
+        #expect(unsigned.url == URL(filePath: bundle, directoryHint: .isDirectory))
+        #expect(!unsigned.isConfirmed, "a bundle anyone can make proves nothing")
+        #expect(owner([program: "ABCDE12345", bundle: "ZZZZZ99999"])?.isConfirmed == false)
+        #expect(owner([program: "ABCDE12345"])?.isConfirmed == false)
+
+        let trashed = directory.url.appending(path: ".Trash/Updater.app/Contents/MacOS/Updater").path(percentEncoded: false)
+        #expect(owner([:], program: trashed)?.url == nil, "a copy in a Trash isn't installed")
+    }
+
+    @Test func knowsWhereTheOwnerIs() {
+        #expect(ownership.owner(label: "com.other.tool.helper", associated: [], program: nil)?.url == URL(filePath: "/Applications/Tool.app"))
+        let associated = ownership.owner(label: "org.unrelated.label", associated: ["com.example.app"], program: "/usr/local/bin/example-helper")
+        #expect(associated?.url == URL(filePath: "/Applications/Example.app"))
+        let elsewhere = ownership.owner(label: "org.unrelated.label", registeredBy: "com.apple.CharacterPaletteIM", associated: [], program: nil)
+        #expect(elsewhere?.url?.lastPathComponent == "CharacterPalette.app")
+        #expect(elsewhere?.isInstalled == true)
+        #expect(ownership.owner(label: "com.missing.app.agent", registeredBy: "com.missing.app", associated: [], program: nil)?.url == nil)
+    }
+
+    @Test func fallsBackToTheLabelWhenNothingElseMatches() {
+        let owner = ownership.owner(label: "com.other.tool.helper", associated: [], program: nil)
+        #expect(owner?.bundleIdentifier == "com.other.tool")
+        #expect(owner?.isInstalled == true)
+    }
+
+    @Test func reportsAnOwnerThatIsGone() {
+        let owner = ownership.owner(label: "com.missing.app.agent", registeredBy: "com.missing.app", associated: [], program: nil)
+        #expect(owner?.bundleIdentifier == "com.missing.app")
+        #expect(owner?.name == nil)
+        #expect(owner?.isInstalled == false)
+
+        // An app the plist names that is gone is still named. It is not installed, so the job can still be called
+        // orphaned.
+        let named = ownership.owner(label: "org.unrelated.label", associated: ["com.missing.app"], program: nil)
+        #expect(named?.bundleIdentifier == "com.missing.app")
+        #expect(named?.isInstalled == false)
+    }
+
+    @Test func callsItOrphanedOnlyWhenNothingIsLeft() throws {
+        let directory = try TemporaryDirectory()
+        let program = try directory.file("bin/tool").path(percentEncoded: false)
+        let installed = ownership.owner(label: "com.example.app.updater", associated: [], program: nil)
+        let missing = ownership.owner(label: "com.missing.app.agent", registeredBy: "com.missing.app", associated: [], program: nil)
+
+        #expect(!ownership.isOrphan(label: "com.example.app.updater", program: program, owner: installed))
+        #expect(!ownership.isOrphan(label: "com.missing.app.agent", program: program, owner: missing))
+        #expect(ownership.isOrphan(label: "com.missing.app.agent", program: "/nowhere/gone", owner: missing))
+        #expect(ownership.isOrphan(label: "com.missing.app.agent", program: nil, owner: nil))
+        #expect(!ownership.isOrphan(label: "com.apple.something", program: "/nowhere/gone", owner: nil))
+        // A job that names no program of its own is orphaned once the app it belongs to is gone, just as when
+        // nothing claims it at all.
+        #expect(ownership.isOrphan(label: "com.missing.app.agent", program: nil, owner: missing))
+        #expect(!ownership.isOrphan(label: "com.example.app.updater", program: nil, owner: installed))
+    }
+
+    /// `man launchd.plist`: without `Program`, the first of `ProgramArguments` "may be either an absolute path,
+    /// or a relative path which is resolved using _PATH_STDPATH". So a hand-written agent that runs `sh` every
+    /// night still has a program, and is not orphaned.
+    @Test func findsAProgramLaunchdLooksUpByName() {
+        #expect(!ownership.isOrphan(label: "local.nightly", program: "sh", owner: nil))
+        #expect(!ownership.isOrphan(label: "local.nightly", program: "osascript", owner: nil))
+        #expect(ownership.isOrphan(label: "local.nightly", program: "no-such-tool-anywhere", owner: nil))
+
+        let job = JobDefinition(["Label": "local.nightly", "ProgramArguments": ["sh", "-c", 1]])
+        #expect(job?.program == "sh", "one argument that is not text cost the whole list")
+        #expect(JobDefinition(["Label": "x", "AssociatedBundleIdentifiers": ["a.b.c", "d.e.f"]])?.associated == ["a.b.c", "d.e.f"])
+        #expect(JobDefinition(["Label": "x", "AssociatedBundleIdentifiers": "a.b.c"])?.associated == ["a.b.c"])
+    }
+
+    @Test func readsEveryShapeOfJobPlist() {
+        let withProgram = JobDefinition(["Label": "com.example.a", "Program": "/Applications/Example.app/Contents/MacOS/Helper", "RunAtLoad": true])
+        #expect(withProgram?.program == "/Applications/Example.app/Contents/MacOS/Helper")
+        #expect(withProgram?.runsAtLoad == true)
+
+        let withArguments = JobDefinition(["Label": "com.example.b", "ProgramArguments": ["/usr/local/bin/tool", "--daemon"]])
+        #expect(withArguments?.program == "/usr/local/bin/tool")
+
+        // `man launchd.plist`: BundleProgram is "an app-bundle relative path", so it names no program here.
+        #expect(JobDefinition(["Label": "com.example.c", "BundleProgram": "Contents/MacOS/Helper"])?.program == nil)
+
+        let withAssociations = JobDefinition(["Label": "com.example.d", "AssociatedBundleIdentifiers": ["com.example.app", "com.example.other"]])
+        #expect(withAssociations?.associated.first == "com.example.app")
+
+        let keepAliveDictionary = JobDefinition(["Label": "com.example.e", "KeepAlive": ["SuccessfulExit": false]])
+        #expect(keepAliveDictionary?.keepsAlive == true)
+        #expect(keepAliveDictionary?.runsAtLoad == true, "launchd starts a job it keeps alive as soon as it is loaded")
+
+        #expect(JobDefinition(["Program": "/usr/local/bin/tool"]) == nil)
+    }
+
+    @Test func readsAProgramsTeamOnceWhileTheFileStaysTheSame() throws {
+        let directory = try TemporaryDirectory()
+        let program = try directory.file("agent", bytes: 16).path(percentEncoded: false)
+        let reads = Mutex(0)
+        let teams = BackgroundItemOwnership.ProgramTeams { _ in
+            reads.withLock { $0 += 1 }
+            return "ORGEXAMPLE"
+        }
+
+        let first = teams.team(of: program)
+        let second = teams.team(of: program)
+        let readsOfTheSameFile = reads.withLock { $0 }
+        try Data(count: 32).write(to: URL(filePath: program))
+        let third = teams.team(of: program)
+        let readsOnceWritten = reads.withLock { $0 }
+
+        #expect([first, second, third] == ["ORGEXAMPLE", "ORGEXAMPLE", "ORGEXAMPLE"])
+        #expect(readsOfTheSameFile == 1)
+        #expect(readsOnceWritten == 2)
+    }
+
+    @Test func readsTheTeamOfAProgramItCanNotIdentifyEveryTime() {
+        let reads = Mutex(0)
+        let teams = BackgroundItemOwnership.ProgramTeams { _ in
+            reads.withLock { $0 += 1 }
+            return nil
+        }
+
+        _ = teams.team(of: "/org.example/gone")
+        _ = teams.team(of: "/org.example/gone")
+
+        let timesRead = reads.withLock { $0 }
+        #expect(timesRead == 2)
+    }
+}

@@ -1,0 +1,344 @@
+import Foundation
+internal import PeelPrivileged
+
+enum LaunchdCleanup {
+    struct Job: Sendable, Hashable {
+        let label: String
+        let isDaemon: Bool
+        /// The file that declares it.
+        let plist: URL
+        var loadsInTheBackgroundSession = false
+
+        var domain: String { LaunchdCleanup.domain(isDaemon: isDaemon, background: loadsInTheBackgroundSession) }
+
+        /// Peel starts such a job again neither after a move nor on Put Back, as the Background Items page never
+        /// starts it: that would go over the person's choice in System Settings.
+        var isKeptOffBySystemSettings: Bool { !LoginItemsStatus.of(plist: plist).letsItRun }
+    }
+
+    /// A job launchd runs now whose program sits inside an app: one of the app's own background programs. `plist` is
+    /// the file it is started from when that is one launchd reads from a folder, so it can be started again.
+    struct Running: Sendable, Hashable {
+        let label: String
+        let isDaemon: Bool
+        let pid: pid_t
+        let plist: URL?
+        var loadsInTheBackgroundSession = false
+
+        var domain: String { LaunchdCleanup.domain(isDaemon: isDaemon, background: loadsInTheBackgroundSession) }
+
+        var job: Job? {
+            plist.map {
+                Job(
+                    label: label, isDaemon: isDaemon, plist: $0,
+                    loadsInTheBackgroundSession: loadsInTheBackgroundSession
+                )
+            }
+        }
+    }
+
+    /// A daemon's domain is the system's; an agent's is the GUI one, or the user's own for one that loads in the
+    /// Background session (`man launchctl`: the two "still have discrete sets of services").
+    static func domain(isDaemon: Bool, background: Bool) -> String {
+        isDaemon ? "system" : background ? "user/\(getuid())" : "gui/\(getuid())"
+    }
+
+    /// Stops jobs whose configuration has gone, so launchd doesn't keep them running or restart them, and answers
+    /// those it stopped: a job launchd did not have is not one.
+    @concurrent
+    static func stop(_ jobs: [Job], canUseHelper: Bool) async -> [Job] {
+        var stopped: [Job] = []
+        for job in jobs {
+            let loadedFrom = Launchctl.parseDetails(await Launchctl.run(["print", "\(job.domain)/\(job.label)"]).output)?.path
+            guard isLoaded(from: loadedFrom, job),
+                  await bootout(job.label, in: job.domain, isDaemon: job.isDaemon, canUseHelper: canUseHelper)
+            else { continue }
+            stopped.append(job)
+        }
+        return stopped
+    }
+
+    /// The jobs running now, in this user's domains and the system's, whose program sits inside `app`. An app Launch
+    /// Services opened is a job too (`application.`), which is quit as an app and never stopped as a job.
+    @concurrent
+    static func running(inside app: URL, environment: SearchEnvironment = .current) async -> [Running] {
+        let bundle = PathPattern.comparablePath(of: PathPattern.canonical(app))
+        var found: [Running] = []
+        for (isDaemon, background) in [(false, false), (false, true), (true, false)] {
+            let domain = domain(isDaemon: isDaemon, background: background)
+            let services = Launchctl.parseSystemServices(await Launchctl.run(["print", domain]).output) ?? [:]
+            for case let (label, pid?) in services where isAppsOwn(label) {
+                guard let program = RunningProgram.path(of: pid),
+                      PathComponents.isPath(PathPattern.comparablePath(of: URL(filePath: program)), inside: bundle)
+                else { continue }
+                let path = Launchctl.parseDetails(await Launchctl.run(["print", "\(domain)/\(label)"]).output)?.path
+                let plist = path.flatMap { jobs(for: [URL(filePath: $0)], environment: environment).first?.plist }
+                found.append(Running(
+                    label: label, isDaemon: isDaemon, pid: pid, plist: plist, loadsInTheBackgroundSession: background
+                ))
+            }
+        }
+        return found
+    }
+
+    /// Stops `jobs` and answers those it stopped, once their processes have ended or `patience` has passed.
+    @concurrent
+    static func stop(_ jobs: [Running], canUseHelper: Bool, patience: Duration = .seconds(10)) async -> [Running] {
+        let ends = ProcessEnds.of(jobs.map(\.pid))
+        var stopped: [Running] = []
+        for job in jobs
+        where await bootout(job.label, in: job.domain, isDaemon: job.isDaemon, canUseHelper: canUseHelper) {
+            stopped.append(job)
+        }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { for await _ in ends {} }
+            group.addTask { try? await Task.sleep(for: patience) }
+            await group.next()
+            group.cancelAll()
+        }
+        return stopped
+    }
+
+    /// Whether the job launchd runs under `job`'s label comes from `job`'s file: not when launchd names another file
+    /// that is still there, as when two files declare one label.
+    static func isLoaded(from loadedFrom: String?, _ job: Job) -> Bool {
+        guard let loadedFrom else { return true }
+        let other = URL(filePath: loadedFrom)
+        return PathPattern.comparablePath(of: other) == PathPattern.comparablePath(of: job.plist) || other.isMissing
+    }
+
+    /// Whether launchd has `job` loaded from its file now, or nil when its answer can't be read.
+    static func isLoaded(_ job: Job) async -> Bool? {
+        if let loadedStandIn { return loadedStandIn(job) }
+        let reply = await Launchctl.run(["print", "\(job.domain)/\(job.label)"])
+        return switch Launchctl.answer(status: reply.status, output: reply.output) {
+        case .details(let details): isLoaded(from: details.path, job)
+        case .gone: false
+        case .unreadable: nil
+        }
+    }
+
+    /// For a test: no test loads a job into launchd.
+    @TaskLocal static var loadedStandIn: (@Sendable (Job) -> Bool?)?
+
+    static func isAppsOwn(_ label: String) -> Bool {
+        !label.hasPrefix("application.") && PrivilegedPathPolicy.isValidLabel(label) && label != HelperIdentity.helperIdentifier
+            && !SystemDaemons.belongs(label, to: SystemDaemons.shipped)
+            && !SystemDaemons.belongs(label, to: SystemAgents.shipped)
+    }
+
+    private static func bootout(_ label: String, in domain: String, isDaemon: Bool, canUseHelper: Bool) async -> Bool {
+        if isDaemon {
+            guard canUseHelper, PrivilegedHelper.status == .enabled else { return false }
+            return await PrivilegedHelper.runDaemonCommand(.bootout, label: label) == nil
+        }
+        return await Launchctl.run(["bootout", "\(domain)/\(label)"]).status == 0
+    }
+
+    @concurrent
+    static func start(_ job: Job, canUseHelper: Bool) async {
+        if job.isDaemon {
+            guard canUseHelper, PrivilegedHelper.status == .enabled else { return }
+            _ = await PrivilegedHelper.runDaemonCommand(.bootstrap, label: job.label)
+        } else {
+            _ = await Launchctl.run(["bootstrap", job.domain, job.plist.path(percentEncoded: false)])
+        }
+    }
+
+    /// The jobs these plists declare. launchd knows a job by the `Label` inside its file, and the file name does
+    /// not always repeat it, so a file that cannot be read gives no job.
+    static func jobs(for urls: [URL], environment: SearchEnvironment = .current) -> [Job] {
+        // Only the folders launchd actually reads. A copy of a plist kept anywhere else, in a backup or in a
+        // folder that merely shares the name, must not make Peel stop the job that is really running.
+        let folders = environment.locations.filter { $0.kind == .launchAgents || $0.kind == .launchDaemons }
+        let daemons = Set(folders.filter { $0.kind == .launchDaemons }.map { PathPattern.comparablePath(of: $0.url) })
+        let all = Set(folders.map { PathPattern.comparablePath(of: $0.url) })
+
+        return urls.compactMap { url -> Job? in
+            guard url.path(percentEncoded: false).hasSuffix(".plist") else { return nil }
+            let parent = PathPattern.comparablePath(of: url.deletingLastPathComponent())
+            guard all.contains(parent) else { return nil }
+            // A label macOS itself uses would reach macOS's own job, whatever file declared it.
+            guard
+                let plist = BoundedRead.propertyList(at: url),
+                let label = plist["Label"] as? String, PrivilegedPathPolicy.isValidLabel(label),
+                !SystemDaemons.belongs(label, to: SystemDaemons.shipped),
+                !SystemDaemons.belongs(label, to: SystemAgents.shipped)
+            else { return nil }
+            return Job(
+                label: label, isDaemon: daemons.contains(parent), plist: url,
+                loadsInTheBackgroundSession: JobDefinition(plist)?.loadsInTheBackground == true
+            )
+        }
+    }
+}
+
+enum PreferenceCleanup {
+    /// Runs `defaults delete` for the preference domains of files that moved, so cfprefsd forgets them: it keeps
+    /// preferences in memory, and a removed plist can come back. Apple's guidance:
+    /// https://developer.apple.com/forums/thread/20595
+    /// `owner` is the bundle identifier of the app being reset. Its own domain is forgotten even when Apple wrote
+    /// the app; every other `com.apple.` domain is left alone.
+    @concurrent
+    static func forgetDomains(
+        for urls: [URL],
+        ownedBy owner: String?,
+        home: URL = .homeDirectory,
+        host: String = PreferenceCleanup.hostIdentifier,
+        // The files have already moved, and the removal is recorded only after this returns, so each call has a
+        // timeout: a `defaults` that never exits must not leave the removal unrecorded.
+        delete: @Sendable (Domain) async -> Void = {
+            _ = await Subprocess.run("/usr/bin/defaults", $0.command("delete"), timeout: 10)
+        }
+    ) async {
+        let files = files(for: urls, ownedBy: owner, home: home, host: host)
+        var forgotten: Set<Domain> = []
+        for domain in files.map(\.domain) where forgotten.insert(domain).inserted {
+            // A file already back before the delete is not one the delete wrote.
+            let freed = files.filter { $0.domain == domain && $0.url.isMissing }.map(\.url)
+            await delete(domain)
+            freed.forEach(deleteWrittenBack)
+        }
+    }
+
+    /// Deletes the empty file `defaults delete` writes where `file` was when cfprefsd still held its domain, which
+    /// would keep History from putting that file back. Only a file of this user holding an empty dictionary goes.
+    private static func deleteWrittenBack(at file: URL) {
+        guard case .success(let item) = OpenItem.at(file.path(percentEncoded: false)) else { return }
+        item.deleteFile(ownedBy: getuid(), ofAtMost: 1_024) { BoundedRead.propertyList(in: $0)?.isEmpty == true }
+    }
+
+    struct Domain: Sendable, Hashable {
+        let name: String
+        let isByHost: Bool
+
+        /// The arguments for `defaults`. Only `-currentHost` reaches a ByHost domain (`-host` gets the any-host
+        /// one), and only before the verb: after it, `defaults` takes it for the domain and the domain for a key.
+        func command(_ verb: String, _ file: String? = nil) -> [String] {
+            (isByHost ? ["-currentHost"] : []) + [verb, name] + (file.map { [$0] } ?? [])
+        }
+    }
+
+    /// The UUID the current Mac's ByHost files carry in their names. Empty when it cannot be read, so no file matches.
+    static let hostIdentifier: String = {
+        var bytes = [UInt8](repeating: 0, count: 16)
+        var wait = timespec(tv_sec: 1, tv_nsec: 0)
+        guard gethostuuid(&bytes, &wait) == 0 else { return "" }
+        return NSUUID(uuidBytes: bytes).uuidString
+    }()
+
+    static func domains(
+        for urls: [URL],
+        ownedBy owner: String? = nil,
+        home: URL = .homeDirectory,
+        host: String = PreferenceCleanup.hostIdentifier,
+        running: String? = Bundle.main.bundleIdentifier
+    ) -> [Domain] {
+        var seen: Set<Domain> = []
+        return files(for: urls, ownedBy: owner, home: home, host: host, running: running)
+            .map(\.domain)
+            .filter { seen.insert($0).inserted }
+    }
+
+    /// Each of `urls` whose domain `defaults delete` may forget, with that domain.
+    private static func files(
+        for urls: [URL],
+        ownedBy owner: String?,
+        home: URL,
+        host: String,
+        running: String? = Bundle.main.bundleIdentifier
+    ) -> [(url: URL, domain: Domain)] {
+        // Only the user's `Library/Preferences` and its `ByHost` folder, plus the settings file in the container
+        // of the app being reset. `defaults` reads a name as this user's domain, so a file from
+        // `/Library/Preferences` or a copy in a backup must not clear the settings in use.
+        let plain = PathPattern.comparablePath(of: home.appending(path: "Library/Preferences", directoryHint: .isDirectory))
+        let byHost = plain + "/ByHost"
+
+        var containerKept: [Domain: Bool] = [:]
+        return urls.compactMap { url -> (url: URL, domain: Domain)? in
+            let path = url.path(percentEncoded: false)
+            guard path.hasSuffix(".plist") else { return nil }
+            let parent = PathPattern.comparablePath(of: url.deletingLastPathComponent())
+            let isByHost = parent == byHost
+            let name = LeftoverMatcher.key(
+                from: url.lastPathComponent,
+                kind: isByHost ? .preferencesByHost : .preferences
+            )
+            guard
+                isByHost || parent == plain
+                    || isTheSettingsFile(name, in: parent, ofTheAppBeingReset: owner, home: home)
+            else { return nil }
+            guard isUsableName(name) else { return nil }
+            // Never the running app's own, as when Peel removes itself: while it runs, `defaults delete` makes
+            // cfprefsd write the domain back as an empty file.
+            guard running.map({ name.caseInsensitiveCompare($0) != .orderedSame }) ?? true else { return nil }
+            // A ByHost file is named `<domain>.<host UUID>.plist`. `-currentHost` always means the current Mac, so
+            // a file another Mac left behind names no domain here.
+            let fileHost = url.lastPathComponent.removingSuffix(".plist").dropFirst(name.count + 1)
+            guard !isByHost || (!host.isEmpty && fileHost.caseInsensitiveCompare(host) == .orderedSame) else {
+                return nil
+            }
+            // Apple's name whatever its case, since the disk ignores it, and behind a team or group prefix too.
+            guard !ProtectedData.isApplesName(name) || isOwned(name, by: owner) else { return nil }
+            let domain = Domain(name: name, isByHost: isByHost)
+            let isKept = containerKept[domain] ?? containerKeeps(domain, apartFrom: urls, home: home)
+            containerKept[domain] = isKept
+            return isKept ? nil : (url, domain)
+        }
+    }
+
+    /// Whether `name` is the settings file of the app being reset, inside that app's container. A sandboxed app
+    /// keeps its settings there, and `defaults` reads the app's domain from that file. No other file in a
+    /// container has a name `defaults` would find it by.
+    private static func isTheSettingsFile(
+        _ name: String,
+        in parent: String,
+        ofTheAppBeingReset owner: String?,
+        home: URL
+    ) -> Bool {
+        guard isOwned(name, by: owner) else { return false }
+        let container = PathPattern.comparablePath(of: home.appending(path: "Library/Containers/\(name)/Data/Library/Preferences", directoryHint: .isDirectory))
+        return parent.caseInsensitiveCompare(container) == .orderedSame
+    }
+
+    /// False for a name `defaults` would read as something other than one app's domain: an option, a path, a
+    /// hidden file, or a name with no dot. The global domain answers to `.GlobalPreferences`, `NSGlobalDomain`,
+    /// `Apple Global Domain`, and `kCFPreferencesAnyApplication`, and Apple's agents use one-word names
+    /// (`loginwindow`, `pbs`).
+    static func isUsableName(_ name: String) -> Bool {
+        !name.hasPrefix("-") && !name.hasPrefix(".") && !name.contains("/") && name.contains(".")
+    }
+
+    /// True when the app's container holds a settings file for `domain` that is not among `urls`, or when the
+    /// folder that would hold it cannot be read. `defaults` reads a name from the container when there is one,
+    /// so forgetting the domain would clear those settings, which is only right when those files are going too.
+    private static func containerKeeps(_ domain: Domain, apartFrom urls: [URL], home: URL) -> Bool {
+        var folder = home.appending(path: "Library/Containers/\(domain.name)/Data/Library/Preferences", directoryHint: .isDirectory)
+        if domain.isByHost {
+            folder.append(path: "ByHost", directoryHint: .isDirectory)
+        }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path(percentEncoded: false))
+        else {
+            // A folder that exists but cannot be read may hold the file, and an unknown answer is not safe. It
+            // does not matter whether TCC or the file permissions refused the read.
+            var info = stat()
+            return lstat(folder.path(percentEncoded: false), &info) == 0
+        }
+        let kind: SearchLocation.Kind = domain.isByHost ? .preferencesByHost : .preferences
+        let kept = names.filter {
+            $0.hasSuffix(".plist")
+                && LeftoverMatcher.key(from: $0, kind: kind).caseInsensitiveCompare(domain.name) == .orderedSame
+        }
+        guard !kept.isEmpty else { return false }
+        let going = urls.map(PathPattern.comparablePath)
+        return kept.contains { name in
+            let path = PathPattern.comparablePath(of: folder.appending(path: name))
+            return !going.contains { PathComponents.isPath(path, atOrInside: $0) }
+        }
+    }
+
+    static func isOwned(_ name: String, by owner: String?) -> Bool {
+        guard let owner, Identifier.isValid(owner) else { return false }
+        return name == owner || name.hasPrefix(owner + ".")
+    }
+}

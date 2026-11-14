@@ -1,0 +1,249 @@
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Testing
+
+struct TweakTests {
+    @Test func everyTweakSaysWhatItChanges() {
+        let identifiers = TweakCatalog.all.map(\.id)
+        #expect(Set(identifiers).count == identifiers.count)
+
+        for tweak in TweakCatalog.all {
+            #expect(!tweak.id.isEmpty)
+            #expect(!tweak.domain.isEmpty)
+            #expect(!tweak.key.isEmpty)
+            #expect(!tweak.key.contains(" "), "\(tweak.id) has a key with a space in it")
+        }
+    }
+
+    @Test func aGlobalKeyAProfileForcesReadsAsWhatTheProfileForces() throws {
+        let directory = try TemporaryDirectory()
+        let forced = directory.url.appending(path: "forced.plist")
+        let list: [String: Any] = ["NSAutomaticSpellingCorrectionEnabled": false, "AppleShowScrollBars": "WhenScrolling"]
+        try PropertyListSerialization.data(fromPropertyList: list, format: .xml, options: 0).write(to: forced)
+        let paths = ["/org.example/none.plist", forced.path(percentEncoded: false)]
+
+        let spelling = TweakStore.forcedGlobalValue("NSAutomaticSpellingCorrectionEnabled" as CFString, in: paths)
+        let scrollBars = TweakStore.forcedGlobalValue("AppleShowScrollBars" as CFString, in: paths)
+        let other = TweakStore.forcedGlobalValue("org.example.other" as CFString, in: paths)
+
+        #expect(spelling.map { TweakStore.matches($0, .boolean(false)) } == true)
+        #expect(scrollBars as? String == "WhenScrolling")
+        #expect(other == nil)
+    }
+
+    /// AppKit and HIToolbox read their keys once, when an app starts, so apps already open keep the old value.
+    /// The row says so rather than asking for a log out, which would work but is not needed.
+    /// Apple documents only a few of these keys; the rest are known from use alone, so a release can rename or ignore
+    /// one without a word. Each tweak says which it is, and a documented one names Apple's page.
+    @Test func everyTweakSaysWhereAppleDocumentsIt() {
+        var documented: Set<String> = []
+        for tweak in TweakCatalog.all {
+            guard case .apple(let page) = tweak.documentation else { continue }
+            documented.insert(tweak.id)
+            #expect(page.scheme == "https" && (page.host() ?? "").hasSuffix("apple.com"), "\(tweak.id): \(page)")
+        }
+        let applesOwn: Set = [
+            "dock-autohide", "dock-launchanim", "dock-static-only", "dock-show-recents", "dock-minimize-to-application",
+            "finder-network-stores",
+        ]
+        #expect(documented == applesOwn)
+    }
+
+    /// The Dock tweaks that change how a hidden Dock appears follow the switch that hides it, which is macOS's own
+    /// "Automatically hide and show the Dock", so neither needs a trip to System Settings.
+    @Test func theDockCanBeHiddenBesideHowItAppears() throws {
+        let hide = try #require(TweakCatalog.dock.first)
+        #expect(hide.id == "dock-autohide")
+        #expect(hide.domain == "com.apple.dock" && hide.key == "autohide")
+        #expect(hide.kind == .aSwitch(.boolean(true)))
+        #expect(hide.hasASystemControl && hide.restart == .dock)
+        #expect(TweakCatalog.dock.dropFirst().prefix(2).map(\.key) == ["autohide-delay", "autohide-time-modifier"])
+        #expect(TweakCatalog.dock.dropFirst().prefix(2).allSatisfy { $0.onlyWhile == hide.id })
+    }
+
+    /// A switch that works only under another names one that comes before it in its own group, so its row can sit
+    /// right under it.
+    @Test func aSwitchWorksOnlyUnderOneShownBeforeIt() throws {
+        for (index, tweak) in TweakCatalog.all.enumerated() {
+            guard let parent = tweak.onlyWhile else { continue }
+            let found = try #require(TweakCatalog.all.firstIndex { $0.id == parent }, "\(tweak.id) works under \(parent)")
+            #expect(found < index && TweakCatalog.all[found].group == tweak.group)
+            #expect(TweakCatalog.all[found].onlyWhile == nil)
+        }
+    }
+
+    @Test func dialogsOpenExpandedThroughTheKeysMacOSReads() {
+        let keys = TweakCatalog.all.filter { $0.domain == TweakStore.globalDomain }.map(\.key)
+        #expect(keys.contains("NSNavPanelExpandedStateForSaveMode"))
+        #expect(keys.contains("PMPrintingExpandedStateForPrint"))
+        #expect(!keys.contains("NSNavPanelExpandedStateForSaveMode2"))
+        #expect(!keys.contains("PMPrintingExpandedStateForPrint2"))
+    }
+
+    @Test func asksForALogOutOnlyWhereAppleSaysItIsNeeded() {
+        let logOut = TweakCatalog.all.filter { $0.restart == .logOut }.map(\.id)
+        #expect(logOut == ["finder-network-stores"], "a log out is asked for where reopening the app is enough")
+        #expect(TweakCatalog.all.first { $0.key == "AppleShowScrollBars" }?.restart == .relaunchApps)
+        // `launchanim` is "Animate opening applications" in System Settings (`DesktopSettings.appex`).
+        #expect(TweakCatalog.all.first { $0.key == "launchanim" }?.hasASystemControl == true)
+    }
+
+    /// Writing to these either fails silently or needs a permission Peel shouldn't ask for.
+    @Test func neverWritesToADomainThatWouldFailSilently() {
+        let forbidden = [
+            "com.apple.universalaccess",
+            "com.apple.Accessibility",
+            "com.apple.Safari",
+            "com.apple.mail",
+            "com.apple.Notes",
+            "com.apple.MobileSMS",
+        ]
+        for tweak in TweakCatalog.all {
+            #expect(!forbidden.contains(tweak.domain), "\(tweak.id) writes to \(tweak.domain)")
+            #expect(!tweak.domain.hasPrefix("/"), "\(tweak.id) points at a file rather than a domain")
+        }
+    }
+
+    /// A switch is on when the key reads as what the switch writes, so each has to read back as itself.
+    @Test func everySwitchReadsBackAsWhatItWrites() {
+        for tweak in TweakCatalog.all {
+            switch tweak.kind {
+            case .aSwitch(let value), .aSwitchForThisAppAlone(let value):
+                #expect(TweakStore.matches(TweakStore.property(value), value), "\(tweak.id) does not read back as what it writes")
+            case .folder, .name:
+                #expect(tweak.group == .screenshots, "\(tweak.id) is a folder or a name somewhere unexpected")
+            }
+        }
+    }
+
+    @Test func readsAValueBackAsTheSwitchThatWroteIt() {
+        #expect(TweakStore.matches(true as CFBoolean, .boolean(true)))
+        #expect(!TweakStore.matches(true as CFBoolean, .boolean(false)))
+        // cfprefsd hands back a number for a boolean written by the command line.
+        #expect(TweakStore.matches(1 as CFNumber, .boolean(true)))
+        #expect(TweakStore.matches(0 as CFNumber, .boolean(false)))
+        #expect(TweakStore.matches(0.0 as CFNumber, .number(0)))
+        #expect(!TweakStore.matches(0.5 as CFNumber, .number(0)))
+        #expect(TweakStore.matches("Always" as CFString, .text("Always")))
+        #expect(!TweakStore.matches("Never" as CFString, .text("Always")))
+        #expect(!TweakStore.matches("Always" as CFString, .boolean(true)))
+        // Written without `-bool`, these are strings, which macOS still reads as a boolean.
+        #expect(TweakStore.matches("YES" as CFString, .boolean(true)))
+        #expect(TweakStore.matches("1" as CFString, .boolean(true)))
+        #expect(TweakStore.matches("NO" as CFString, .boolean(false)))
+        // A number written without `-float` or `-int` is a string too, which macOS reads as the number it spells.
+        #expect(TweakStore.matches("0" as CFString, .number(0)))
+        #expect(TweakStore.matches("0.001" as CFString, .number(0.001)))
+        #expect(!TweakStore.matches("0.5" as CFString, .number(0)))
+        #expect(!TweakStore.matches("zero" as CFString, .number(0)))
+    }
+
+    @Test func tellsWhereAValueComesFromThatPeelCannotChange() {
+        let aSwitch = Tweak.Kind.aSwitch(.boolean(true))
+        let forThisApp = Tweak.Kind.aSwitchForThisAppAlone(.boolean(true))
+        func layers(
+            thisMac: Bool = false, own: Bool = false, account: Bool = false, app: Bool = false
+        ) -> TweakStore.Layers {
+            TweakStore.Layers(
+                thisMac: thisMac ? true as CFBoolean : nil, own: own ? true as CFBoolean : nil,
+                everyAccount: account ? true as CFBoolean : nil, everyApp: app ? true as CFBoolean : nil
+            )
+        }
+
+        #expect(TweakStore.heldElsewhere(of: aSwitch, isOn: true, in: layers(thisMac: true)) == .thisMac)
+        #expect(TweakStore.heldElsewhere(of: aSwitch, isOn: false, in: layers(thisMac: true, own: true)) == .thisMac)
+        #expect(TweakStore.heldElsewhere(of: aSwitch, isOn: true, in: layers(own: true, account: true)) == nil)
+        #expect(TweakStore.heldElsewhere(of: aSwitch, isOn: true, in: layers(account: true)) == .everyAccount)
+        #expect(TweakStore.heldElsewhere(of: aSwitch, isOn: true, in: layers(app: true)) == .everyApp)
+        #expect(TweakStore.heldElsewhere(of: aSwitch, isOn: false, in: layers(account: true)) == nil)
+        #expect(TweakStore.heldElsewhere(of: aSwitch, isOn: false, in: layers()) == nil)
+        #expect(TweakStore.heldElsewhere(of: .folder, isOn: true, in: layers(account: true)) == nil)
+        #expect(TweakStore.heldElsewhere(of: .folder, isOn: true, in: layers(thisMac: true)) == .thisMac)
+        #expect(TweakStore.heldElsewhere(of: forThisApp, isOn: true, in: layers(account: true)) == nil)
+        #expect(TweakStore.heldElsewhere(of: forThisApp, isOn: true, in: layers(thisMac: true)) == .thisMac)
+    }
+
+    @Test func readsThePersonsGlobalValueBeforeEveryAccountsAsMacOSDoes() {
+        let layers = TweakStore.Layers(
+            thisMac: nil, own: nil, everyAccount: false as CFBoolean, everyApp: true as CFBoolean
+        )
+
+        #expect(layers.inEffect as? Bool == true)
+        #expect(TweakStore.heldElsewhere(of: .aSwitch(.boolean(true)), isOn: true, in: layers) == .everyApp)
+    }
+
+    @Test func callsTheGlobalDomainWhatTheApiCallsIt() {
+        #expect(TweakStore.domain("NSGlobalDomain") == kCFPreferencesAnyApplication)
+        #expect(TweakStore.domain("com.apple.dock") == "com.apple.dock" as CFString)
+    }
+
+    /// Reading is safe on any Mac: a key nobody has set reads as unset rather than as off.
+    @Test func readsThisMacWithoutChangingIt() {
+        let store = TweakStore()
+        let nonsense = Tweak(
+            id: "test",
+            domain: "com.tuguidragos.Peel.NoSuchDomain",
+            key: "NoSuchKeyAtAll",
+            kind: .aSwitch(.boolean(true)),
+            restart: .none,
+            group: .dock,
+            hasASystemControl: false,
+            documentation: .undocumented
+        )
+
+        let state = store.state(of: nonsense)
+        #expect(!state.isOn)
+        #expect(!state.isManaged)
+        #expect(store.storedValue(of: nonsense) == nil)
+
+        // A tweak reads as on only when a value is stored for this user, a profile sets it, or it has a path.
+        for tweak in TweakCatalog.all {
+            let live = store.state(of: tweak)
+            #expect(!live.isOn || live.isManaged || store.storedValue(of: tweak) != nil || live.text != nil, "\(tweak.id) reads as on with nothing stored")
+            // A value from an administrator's file or the global domain counts as held elsewhere only while Peel's
+            // own layer holds nothing, since Peel's would win over it.
+            if let elsewhere = live.heldElsewhere, elsewhere != .thisMac {
+                #expect(store.storedValue(of: tweak) == nil, "\(tweak.id) is held \(elsewhere) over Peel's own value")
+            }
+        }
+    }
+
+    @Test func tellsWhetherThisMacHasSleepTurnedOff() {
+        // Read-only: it just has to answer without failing on any Mac.
+        _ = SleepSetting.isSleepDisabled()
+        #expect(SleepSetting.undoCommand.hasPrefix("sudo pmset"))
+    }
+
+    /// The global domain is read with the primitive CFPreferences functions, not the "App" ones. On the Mac
+    /// running the tests, Peel must see exactly what `defaults read -g` sees for every global tweak.
+    @Test func readsTheGlobalDomainTheSameWayDefaultsDoes() async throws {
+        let store = TweakStore()
+        let global = TweakCatalog.all.filter { $0.domain == TweakStore.globalDomain }
+        try #require(!global.isEmpty)
+
+        for tweak in global {
+            let peel = store.storedValue(of: tweak)
+            let defaults = await Self.defaultsValue(key: tweak.key)
+            #expect(
+                (peel == nil) == (defaults == nil),
+                "\(tweak.key): Peel read \(String(describing: peel)), defaults read \(String(describing: defaults))"
+            )
+            // `defaults` prints a boolean as 1 or 0 and everything else as it is stored.
+            if let peel = peel as? NSNumber, let defaults {
+                #expect(Double(defaults) == peel.doubleValue, "\(tweak.key): \(peel) vs \(defaults)")
+            } else if let peel = peel as? String, let defaults {
+                #expect(peel == defaults, "\(tweak.key): \(peel) vs \(defaults)")
+            }
+        }
+    }
+
+    /// What `defaults read -g` prints for `key`, run the way Peel runs every tool: with a time limit, and read
+    /// without the call that raises an exception Swift cannot catch.
+    private static func defaultsValue(key: String) async -> String? {
+        guard case .success(let output) = await Subprocess.run("/usr/bin/defaults", ["read", "-g", key], timeout: 10), output.status == 0 else {
+            return nil
+        }
+        return output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}

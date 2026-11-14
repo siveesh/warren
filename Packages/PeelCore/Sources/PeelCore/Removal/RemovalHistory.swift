@@ -1,0 +1,301 @@
+public import Foundation
+internal import PeelPrivileged
+
+public struct RemovalRecord: Sendable, Codable, Hashable, Identifiable {
+    public let id: UUID
+    /// Everything removed in one go shares a batch, so History can show it as one entry.
+    public let batch: UUID
+    public private(set) var originalURL: URL
+    public private(set) var trashedURL: URL
+    /// The disk the item moved on, when it isn't the startup disk. Nil in a record written before Peel kept it.
+    public let disk: TrashedDisk?
+    public let date: Date
+    /// Which item went to the Trash, so one that lands in the same place later is never taken for it. Nil in a record
+    /// written before Peel kept it.
+    public let identity: TrashedItem.Identity?
+    /// Nil when Peel could not measure the item. It is never read as zero.
+    public let size: Int64?
+    /// What the items belonged to: an app, an orphan group, a file name.
+    public let source: String
+    public let tool: String
+    /// A key for a source Peel names itself (a tool, a Space area, a kind of installer, or a count of apps), so
+    /// History can show it in the user's language. `source` then holds the English name, which `peel` prints.
+    public let sourceKey: String?
+    public let stoppedJob: String?
+    /// The version that took the item's place, which a Put Back moves to the Trash first.
+    public let replacedBy: TrashedItem.Identity?
+    /// True when the item shared most of its storage with another copy, so moving it freed only its own part.
+    public let sharedStorage: Bool?
+
+    public init(
+        id: UUID = UUID(),
+        batch: UUID,
+        item: TrashedItem,
+        size: Int64?,
+        source: String,
+        sourceKey: String? = nil,
+        tool: String,
+        sharedStorage: Bool? = nil,
+        disk: TrashedDisk? = nil
+    ) {
+        self.id = id
+        self.batch = batch
+        originalURL = item.originalURL
+        trashedURL = item.trashedURL
+        self.disk = disk ?? TrashedDisk(of: item)
+        date = item.date
+        identity = item.identity
+        self.size = size
+        self.source = source
+        self.sourceKey = sourceKey
+        self.tool = tool
+        stoppedJob = item.stoppedJob
+        replacedBy = item.replacedBy
+        self.sharedStorage = sharedStorage
+    }
+
+    /// Reads a negative size as zero, since any process of the user can rewrite the History file.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        batch = try container.decode(UUID.self, forKey: .batch)
+        originalURL = try container.decode(URL.self, forKey: .originalURL)
+        trashedURL = try container.decode(URL.self, forKey: .trashedURL)
+        disk = try? container.decodeIfPresent(TrashedDisk.self, forKey: .disk)
+        date = try container.decode(Date.self, forKey: .date)
+        identity = try container.decodeIfPresent(TrashedItem.Identity.self, forKey: .identity)
+        size = try container.decodeIfPresent(Int64.self, forKey: .size).map { max(0, $0) }
+        source = try container.decode(String.self, forKey: .source)
+        tool = try container.decode(String.self, forKey: .tool)
+        sourceKey = try container.decodeIfPresent(String.self, forKey: .sourceKey)
+        stoppedJob = try container.decodeIfPresent(String.self, forKey: .stoppedJob)
+        replacedBy = try container.decodeIfPresent(TrashedItem.Identity.self, forKey: .replacedBy)
+        sharedStorage = try container.decodeIfPresent(Bool.self, forKey: .sharedStorage)
+    }
+
+    public var trashedItem: TrashedItem {
+        TrashedItem(
+            originalURL: originalURL, trashedURL: trashedURL, date: date, identity: identity, stoppedJob: stoppedJob,
+            replacedBy: replacedBy
+        )
+    }
+
+    public var isStillInTrash: Bool {
+        trashedItem.isInTheTrash
+    }
+
+    /// Where the item stands now: in the Trash, gone from it, or not known when macOS won't let Peel look.
+    public var standing: TrashedItem.Standing {
+        trashedItem.standing
+    }
+
+    /// False while the disk whose Trash holds the item is not connected. The item may still be there, so the
+    /// record is not treated as missing. A disk is known by its volume, which stays with it when it is renamed, while
+    /// its name and place can be another disk's; a record written before Peel kept it, or one whose volume several
+    /// mounted disks answer to, goes by the name in its path.
+    public func isOnAConnectedDisk(_ disks: MountedDisks) -> Bool {
+        if let disk, !disks.isShared(disk.volume) { return disks.place(of: disk.volume) != nil }
+        let components = trashedURL.pathComponents
+        guard components.count > 2, components[1] == "Volumes" else { return true }
+        return URL(filePath: "/Volumes/" + components[2]).isThere
+    }
+
+    /// The record with both its places where its disk is mounted now: another disk can have taken the name it had.
+    public func located(on disks: MountedDisks) -> RemovalRecord {
+        guard let disk, let place = disks.place(of: disk.volume) else { return self }
+        let onTheDisk = { (path: String) in URL(filePath: place == "/" ? "/" + path : place + "/" + path) }
+        var located = self
+        located.trashedURL = onTheDisk(disk.path)
+        if let originalPath = disk.originalPath {
+            located.originalURL = onTheDisk(originalPath)
+        }
+        return located
+    }
+}
+
+/// The disk an item moved on: its volume's UUID, and where the item was on that disk.
+public struct TrashedDisk: Sendable, Codable, Hashable {
+    public let volume: String
+    /// The item's path from the top of the disk, without the place the disk was mounted at.
+    public let path: String
+    /// Where the item came from, from the top of the disk. Nil in a record written before Peel kept it.
+    public let originalPath: String?
+
+    init(volume: String, path: String, originalPath: String?) {
+        self.volume = volume
+        self.path = path
+        self.originalPath = originalPath
+    }
+
+    /// The disk `item` went to the Trash on, or nil for the startup disk, which is always there, or when macOS doesn't
+    /// say. The home's Trash is on the home's disk, which is there while anyone uses it, so nothing is asked for what
+    /// is in the home.
+    init?(of item: TrashedItem) {
+        let home = URL.homeDirectory.path(percentEncoded: false)
+        guard !PathComponents.isPath(item.trashedURL.path(percentEncoded: false), inside: home) else { return nil }
+        self.init(item, onTheDiskOf: item.trashedURL)
+    }
+
+    /// The disk `item` is about to go to the Trash on, read where it is now: its Trash is on the same disk.
+    init?(leaving item: TrashedItem) {
+        self.init(item, onTheDiskOf: item.originalURL)
+    }
+
+    private init?(_ item: TrashedItem, onTheDiskOf url: URL) {
+        guard let disk = DiskPlace.disk(of: url),
+              let path = DiskPlace.path(of: item.trashedURL, onTheDiskAt: disk.mount)
+        else { return nil }
+        self.init(
+            volume: disk.volume, path: path,
+            originalPath: DiskPlace.path(of: item.originalURL, onTheDiskAt: disk.mount)
+        )
+    }
+}
+
+/// A place on a disk other than the startup disk, known by the disk's volume rather than by the name it is mounted
+/// under, which another disk can take.
+public struct DiskPlace: Sendable, Codable, Hashable {
+    public let volume: String
+    /// The path from the top of the disk, without the place the disk is mounted at.
+    public let path: String
+
+    init(volume: String, path: String) {
+        self.volume = volume
+        self.path = path
+    }
+
+    /// Where `url` is, or nil for a place on the startup disk, which is always there, or when macOS doesn't say.
+    init?(of url: URL) {
+        guard let disk = Self.disk(of: url), let path = Self.path(of: url, onTheDiskAt: disk.mount) else { return nil }
+        self.init(volume: disk.volume, path: path)
+    }
+
+    /// Where the place is with the disks mounted as they are now, or nil while none of them, or more than one, has its
+    /// volume.
+    func url(on disks: MountedDisks, directoryHint: URL.DirectoryHint = .inferFromPath) -> URL? {
+        disks.place(of: volume).map { URL(filePath: $0 == "/" ? "/" + path : $0 + "/" + path, directoryHint: directoryHint) }
+    }
+
+    /// The volume of the disk `url` is on and where that disk is mounted, or nil for the startup disk.
+    static func disk(of url: URL) -> (volume: String, mount: URL)? {
+        let keys: Set<URLResourceKey> = [.volumeURLKey, .volumeUUIDStringKey, .volumeIsRootFileSystemKey]
+        guard let values = try? url.resourceValues(forKeys: keys), values.volumeIsRootFileSystem != true,
+              let volume = values.volumeUUIDString, let mount = values.volume
+        else { return nil }
+        return (volume, mount)
+    }
+
+    /// `url`'s path from the top of the disk mounted at `mount`, or nil when it isn't on that disk.
+    static func path(of url: URL, onTheDiskAt mount: URL) -> String? {
+        // The kernel's spelling, as the mount point is spelled: `resolvingSymlinksInPath` drops `/private`.
+        let place = MountedDisks.path(of: mount)
+        guard let located = PathPattern.located(url.path(percentEncoded: false)),
+              PathComponents.isPath(located, inside: place)
+        else { return nil }
+        return String(located.dropFirst(place.count).drop { $0 == "/" })
+    }
+}
+
+/// The disks mounted now, each by its volume's UUID, read once for whatever asks about many records.
+public struct MountedDisks: Sendable {
+    private let places: [String: String]
+    /// The volumes more than one mounted disk answers to, which say nothing of which disk is which: a disk and its
+    /// clone, or FAT and exFAT disks formatted in the same second, whose serial macOS takes from the clock.
+    private let shared: Set<String>
+
+    /// The disks mounted now, read off the main actor: macOS may wait on a disk that doesn't answer.
+    @concurrent
+    public static func read() async -> MountedDisks {
+        now()
+    }
+
+    public static func now() -> MountedDisks {
+        let key = URLResourceKey.volumeUUIDStringKey
+        let volumes = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [key], options: []) ?? []
+        let places = volumes.compactMap { url in
+            (try? url.resourceValues(forKeys: [key]).volumeUUIDString).flatMap(\.self).map { ($0, path(of: url)) }
+        }
+        let byVolume = Dictionary(grouping: places, by: \.0)
+        return MountedDisks(
+            places: byVolume.compactMapValues { $0.count == 1 ? $0[0].1 : nil },
+            shared: Set(byVolume.keys.filter { byVolume[$0, default: []].count > 1 })
+        )
+    }
+
+    /// Where the one disk with `volume` is mounted, or nil while none is, or while several are.
+    func place(of volume: String) -> String? {
+        places[volume]
+    }
+
+    func isShared(_ volume: String) -> Bool {
+        shared.contains(volume)
+    }
+
+    static func path(of url: URL) -> String {
+        let path = url.path(percentEncoded: false)
+        return path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+    }
+}
+
+extension [URL: Int64] {
+    /// The sizes History records, by item: those that were measured. An item whose size is not known is left out,
+    /// and is recorded as unknown rather than as zero.
+    public init(measured sizes: some Sequence<(URL, Int64?)>) {
+        self.init(sizes.compactMap { url, size in size.map { (url, $0) } }, uniquingKeysWith: { first, _ in first })
+    }
+}
+
+extension Sequence<RemovalRecord> {
+    /// The sum of the sizes, incomplete when one of them is not known.
+    public var totalSize: SizeTotal {
+        SizeTotal(map(\.size))
+    }
+
+    /// These records with, from `history`, each folder one of them sat in that went to the Trash too and whose place
+    /// is empty, such as a maker's folder an uninstall left empty: put back first, it comes back as it was.
+    public func withTheFoldersTheyLeft(in history: [RemovalRecord]) -> [RemovalRecord] {
+        var going = Array(self)
+        guard going.contains(where: { $0.originalURL.deletingLastPathComponent().isMissing }) else { return going }
+        var ids = Set(going.map(\.id))
+        let byPlace = Dictionary(grouping: history) { PathPattern.comparablePath(of: $0.originalURL) }
+        var index = 0
+        while index < going.count {
+            var folder = going[index].originalURL.deletingLastPathComponent()
+            while folder.pathComponents.count > 1, folder.isMissing {
+                let left = byPlace[PathPattern.comparablePath(of: folder)]?
+                    .filter { !ids.contains($0.id) && $0.trashedURL.isThere }
+                    .max { $0.date < $1.date }
+                if let left {
+                    going.append(left)
+                    ids.insert(left.id)
+                }
+                folder = folder.deletingLastPathComponent()
+            }
+            index += 1
+        }
+        return going
+    }
+
+    /// Shallowest first, so a folder is put back before anything that was inside it. A child put back first would
+    /// make a new folder at its parent's path, and the parent could then not be put back.
+    public var inPutBackOrder: [RemovalRecord] {
+        let depth = { (record: RemovalRecord) in
+            PathComponents.of(record.originalURL.path(percentEncoded: false)).count
+        }
+        return sorted { depth($0) < depth($1) }
+    }
+}
+
+/// Where the History file lives: the record of everything Peel moved to the Trash. Only `RemovalLog` reads and
+/// writes it, so the file is changed from one place.
+public enum RemovalHistory {
+    public static var defaultURL: URL {
+        PeelFolder.url.appending(path: "removals.json")
+    }
+
+    /// The record of what Peel refused to move. It is a file of its own because Put Back reads every row of the
+    /// History file as a request to move something back.
+    public static var refusalsURL: URL {
+        PeelFolder.url.appending(path: "refusals.json")
+    }
+}

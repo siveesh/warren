@@ -1,0 +1,629 @@
+import Foundation
+import Synchronization
+
+/// The places nothing may be removed from, wherever the request comes from. This lives beside the helper on
+/// purpose: a program running as root must not depend on its caller to tell it what is irreplaceable.
+public enum ProtectedData: Sendable {
+    /// The folders every account starts with. Each folder itself is never removed, whatever it holds, and an
+    /// app whose name matches one never claims it.
+    public static let accountFolders = [
+        "Applications", "Desktop", "Documents", "Downloads", "Library", "Movies", "Music", "Pictures", "Public",
+    ]
+
+    /// Folders in a user's home, most of them in Library, that hold work nothing can bring back. iCloud Drive
+    /// is the worst of them: a file removed there is removed from the user's other devices too.
+    public static let homeFolders = [
+        "Library/Mobile Documents",
+        "Library/CloudStorage",
+        "Library/Keychains",
+        "Library/Passes",
+        "Library/Spelling",
+        "Library/KeyboardServices",
+        "Library/Autosave Information",
+        "Library/Application Support/MobileSync",
+        "Library/Application Support/AddressBook",
+        "Library/Application Support/CallHistoryDB",
+        "Library/Mail",
+        "Library/Messages",
+        "Library/Safari",
+        "Library/Containers/com.apple.Safari/Data/Library/Safari",
+        "Library/Calendars",
+        "Library/Reminders",
+        "Library/Contacts",
+        "Library/Photos",
+        "Library/Shortcuts",
+        "Library/Group Containers/group.is.workflow.shortcuts",
+        "Library/Group Containers/group.is.workflow.my.app",
+        "Library/HomeKit",
+        "Library/Accounts",
+        "Library/Finance",
+        "Library/IdentityServices",
+        "Library/Application Support/CallHistoryTransactions",
+        "Library/Application Support/FaceTime",
+        "Library/Containers/com.apple.freeform",
+        "Library/Containers/com.apple.journal",
+        "Library/Containers/com.apple.Stickies/Data/Library/Stickies",
+        ".Trash",
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".password-store",
+    ]
+
+    /// Single keys and secrets, named one at a time rather than protecting the folder around each, since some
+    /// of those folders are caches worth cleaning: `~/.m2/repository` and `~/.android/avd` are large and come
+    /// back on their own. `holds(_:home:)` is what stops a folder from going and taking the key with it.
+    ///
+    /// - `debug.keystore` signs every Android debug build. Android Studio replaces a missing one with a new
+    ///   key, whose SHA-1 differs from the fingerprint Firebase and the Google Maps API have on file, and
+    ///   debug builds already installed refuse to update to a build signed with it.
+    /// - `settings-security.xml` holds Maven's master password, the only key to the encrypted passwords in
+    ///   `settings.xml`.
+    /// - `gradle.properties` is where Gradle's signing documentation says to keep `signing.keyId`,
+    ///   `signing.password`, and `signing.secretKeyRingFile`, rather than in a project.
+    /// - `.git-credentials` is git's credential store, which keeps passwords in plain text
+    ///   (`man git-credential-store`).
+    public static let homeKeys = [
+        ".android/debug.keystore",
+        ".m2/settings-security.xml",
+        ".gradle/gradle.properties",
+        ".git-credentials",
+    ]
+
+    /// Where desktop wallets and key tools keep their keys, as each project's own documentation or source says.
+    /// Losing one loses what it holds unless its seed phrase was kept somewhere else, so each is refused, and so
+    /// is every folder holding one, while what sits beside it and comes back on its own, such as a downloaded
+    /// blockchain, can still go. A whole folder is named where the keys lie at its top among everything else.
+    public static let walletKeys = [
+        "Library/Application Support/Bitcoin/wallets",
+        "Library/Application Support/Bitcoin/wallet.dat",
+        "Library/Application Support/Litecoin/wallets",
+        "Library/Application Support/Litecoin/wallet.dat",
+        "Library/Application Support/Dogecoin/wallet.dat",
+        "Library/Application Support/Namecoin/wallets",
+        "Library/Application Support/Namecoin/wallet.dat",
+        "Library/Application Support/Groestlcoin/wallets",
+        "Library/Application Support/Groestlcoin/wallet.dat",
+        "Library/Application Support/Liquid/wallets",
+        "Library/Application Support/Liquid/wallet.dat",
+        "Library/Application Support/Elements/wallets",
+        "Library/Application Support/Elements/wallet.dat",
+        "Library/Application Support/DashCore/wallets",
+        "Library/Application Support/DashCore/wallet.dat",
+        "Library/Application Support/DashCore/backups",
+        "Library/Application Support/PIVX/wallets",
+        "Library/Application Support/PIVX/wallet.dat",
+        "Library/Application Support/PIVX/backups",
+        "Library/Application Support/firo/wallet.dat",
+        "Library/Application Support/firo/backups",
+        "Library/Application Support/zcoin/wallet.dat",
+        "Library/Application Support/zcoin/backups",
+        "Library/Application Support/Zcash/wallet.dat",
+        "Library/Application Support/Zcash/zingo-wallet.dat",
+        "Library/Application Support/Zcash/zecwallet-light-wallet.dat",
+        ".zallet/wallet.db",
+        ".zallet/encryption-identity.txt",
+        "Library/Containers/me.hanh.ywallet.ywallet/Data/Library/Application Support/me.hanh.ywallet.ywallet/databases",
+        "Monero/wallets",
+        "Library/Application Support/MyMonero",
+        ".electrum/wallets",
+        ".electrum-ltc/wallets",
+        ".electrum-grs/wallets",
+        ".electron-cash/wallets",
+        ".electrum-dash/wallets",
+        ".electrum-abc/wallets",
+        ".electrum-sv/wallets",
+        ".electrum-nmc/wallets",
+        ".sparrow/wallets",
+        ".local/share/sparrow/wallets",
+        ".walletwasabi/client/Wallets",
+        ".walletwasabi/client/WalletBackups",
+        ".gingerwallet/client/Wallets",
+        ".gingerwallet/client/WalletBackups",
+        ".specter/wallets",
+        ".specter/devices",
+        ".ashigaru",
+        "Library/Application Support/bitcoin_safe",
+        "Library/Application Support/joinmarket/wallets",
+        "Library/Application Support/Bisq/btc_mainnet/wallet",
+        "Library/Application Support/Bisq/btc_mainnet/keys",
+        "Library/Application Support/Bisq2/db/private",
+        "Library/Application Support/Haveno/xmr_mainnet/wallet",
+        "Library/Application Support/Haveno/xmr_mainnet/keys",
+        "Library/Application Support/Haveno-reto/xmr_mainnet/wallet",
+        "Library/Application Support/Haveno-reto/xmr_mainnet/keys",
+        "Library/Application Support/Liana/bitcoin",
+        "Library/Application Support/Nunchuk",
+        "Library/Application Support/Blockstream/Green/wallets",
+        "Library/Application Support/Blockstream/Green/wallets2",
+        "Library/Containers/io.bluewallet.bluewallet/Data/Library/Caches/keyvalue.realm",
+        "Library/Containers/com.cypherstack.stackwallet/Data/Library/stackwallet",
+        "Library/stackwallet",
+        "Library/Application Support/Exodus/exodus.wallet",
+        "Library/Application Support/Exodus/Backups",
+        "Library/Application Support/atomic",
+        "Library/Application Support/@onekeyhq/desktop",
+        "Library/Application Support/frame/signers",
+        "Library/Application Support/rabby-desktop",
+        "Library/Application Support/umami",
+        "Library/Application Support/MyTonWallet",
+        "Library/Ethereum/keystore",
+        ".lighthouse/mainnet/validators",
+        ".lighthouse/mainnet/secrets",
+        ".lighthouse/mainnet/wallets",
+        "Library/Eth2Validators/prysm-wallet-v2",
+        "Library/Application Support/ethereum2/wallets",
+        "Library/Signer",
+        ".foundry/keystores",
+        ".ape/accounts",
+        ".brownie/accounts",
+        ".avalanche-cli/key",
+        ".avalanchego/staking",
+        "Library/Preferences/hardhat-nodejs",
+        ".phoenix/seed.dat",
+        ".eclair",
+        "Library/Application Support/Lnd/data",
+        ".lightning/bitcoin/hsm_secret",
+        ".lightning/bitcoin/lightningd.sqlite3",
+        ".lightning/bitcoin/emergency.recover",
+        "Library/Application Support/albyhub",
+        ".cashu",
+        ".config/solana/id.json",
+        ".config/stellar/identity",
+        ".config/soroban/identity",
+        ".sui/sui_config/sui.keystore",
+        ".aptos/config.yaml",
+        ".near-credentials",
+        ".starknet_accounts",
+        ".fuel/wallets",
+        ".tezos-client/secret_keys",
+        ".tezos-signer",
+        ".gaia/keyring-file",
+        ".gaia/keyring-test",
+        ".gaia/config/priv_validator_key.json",
+        ".osmosisd/keyring-file",
+        ".osmosisd/keyring-test",
+        ".osmosisd/config/priv_validator_key.json",
+        "Library/Application Support/Daedalus Mainnet/wallets",
+        "Library/Application Support/decrediton/wallets",
+        "Library/Application Support/Dcrwallet/mainnet/wallet.db",
+        "Library/Application Support/Dexc/mainnet/dexc.db",
+        "Library/Application Support/Dexc/mainnet/assetdb",
+        ".chia_keys",
+        ".grin/main/wallet_data",
+        ".grim/main/wallets",
+        ".kaspa",
+        "Library/Application Support/Kaspawallet",
+        "Library/Nano/wallets.ldb",
+        "Library/Nano/backup",
+    ]
+
+    /// iCloud's and File Provider's records of the files here and in the cloud, and macOS's own services' containers:
+    /// their services hold them open, and removing one or putting an old copy back leaves those records wrong.
+    static let cloudState = [
+        "Library/Application Support/CloudDocs",
+        "Library/Application Support/FileProvider",
+        "Library/Daemon Containers",
+        "Library/Caches/CloudKit",
+        "Library/Caches/com.apple.bird",
+        "Library/Caches/com.apple.cloudd",
+    ]
+
+    /// How File Provider's and CloudKit's caches begin, since Apple adds programs between releases. Lowercase.
+    private static let cloudStateCaches = ["com.apple.fileprovider", "com.apple.cloudkit"]
+
+    /// Every protected place named from a home folder (`homeFolders`, `homeKeys`, `walletKeys`, `cloudState`), which
+    /// `refuses`, `holds` and `RemovalGuard` all read, so a place added to one of them is protected by all three.
+    public static let homeTrees = homeFolders + homeKeys + walletKeys + cloudState
+
+    /// Hidden items in the home folder that belong to no single app: shells, git, and the folders many tools
+    /// share. Never removed on any app's behalf, but what sits inside `.config`, `.cache`, and `.local` still
+    /// can be, so this is an exact match and not a tree.
+    public static let sharedHomeItems = [
+        ".config", ".cache", ".local", ".CFUserTextEncoding",
+        ".kube", ".kube/config",
+        ".zshrc", ".zprofile", ".zshenv", ".zsh_history", ".zsh_sessions",
+        ".bashrc", ".bash_profile", ".bash_history", ".profile",
+        ".gitconfig", ".gitignore_global", ".netrc", ".npmrc",
+    ]
+
+    /// Folders outside any home that stay whole, for every account on the Mac: the system keychains and the Mac's
+    /// network settings, which nothing can bring back, and the settings configuration profiles put in Managed
+    /// Preferences, which are the profile's, not an app's.
+    public static let systemFolders = [
+        "/Library/Keychains", "/Library/Managed Preferences", "/Library/Preferences/SystemConfiguration",
+    ]
+    private static let systemFolderNames = systemFolders.map { PathComponents.of($0.lowercased()) }
+
+    /// The folders of the Mac's own `/Library` where macOS keeps its settings and jobs under Apple's name, beside
+    /// every vendor's. Lowercase.
+    private static let macOSsOwnLibraryFolders: Set<String> = [
+        "preferences", "launchdaemons", "launchagents", "privilegedhelpertools", "application support",
+    ]
+
+    /// True for a name Apple writes for its own things: `com.apple.` after an optional team and an optional
+    /// `group.`, `groups.`, or `systemgroup.`.
+    public static func isApplesName(_ name: String) -> Bool {
+        var name = Substring(name.lowercased())
+        if let dot = name.firstIndex(of: "."), name[..<dot].count == 10,
+           name[..<dot].allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) {
+            name = name[name.index(after: dot)...]
+        }
+        if let prefix = ["group.", "groups.", "systemgroup."].first(where: name.hasPrefix) {
+            name = name.dropFirst(prefix.count)
+        }
+        return name.hasPrefix("com.apple.")
+    }
+
+    /// True at or inside an item named as Apple names its own, or in Preferences and Application Support by a plain
+    /// name macOS keeps there (`SystemFolders`), directly in one of `macOSsOwnLibraryFolders`: a
+    /// setting or a job of macOS itself, which nothing but macOS makes again. Not an account's own Library, where such
+    /// a file holds the account's settings for an Apple app, which a reset clears. Expects the names lower-cased.
+    private static func isMacOSsOwnInLibrary(_ names: [String]) -> Bool {
+        guard names.count > 2, names[0] == "library", macOSsOwnLibraryFolders.contains(names[1]) else { return false }
+        if isApplesName(names[2]) { return true }
+        return switch names[1] {
+        case "preferences": SystemFolders.holds(names[2], in: .preferences)
+        case "application support": SystemFolders.holds(names[2], in: .applicationSupport)
+        default: false
+        }
+    }
+
+    /// True for a receipt of one of Apple's packages, which macOS keeps of its own software. The names arrive
+    /// lower-cased.
+    private static func isAnApplesReceipt(_ names: [String]) -> Bool {
+        names.count == 5 && names[0...3] == ["private", "var", "db", "receipts"] && isApplesName(names[4])
+    }
+
+    /// True at or inside one of Apple's own group containers, where the system's apps keep the user's data,
+    /// such as notes, reminders, recordings, and calendars. Apple moves them between releases, so they are
+    /// recognized by the shape of their name, not by a list. Expects the path in lowercase.
+    public static func isInAnApplesGroupContainer(_ spelling: String) -> Bool {
+        isInAnApplesGroupContainer(PathComponents.of(spelling))
+    }
+
+    private static func isInAnApplesGroupContainer(_ names: [String]) -> Bool {
+        names.indices.contains { index in
+            index + 2 < names.endIndex && names[index] == "library" && names[index + 1] == "group containers"
+                && isApplesName(names[index + 2])
+        }
+    }
+
+    /// True at or inside the `Data/Documents` folder of a sandboxed app's container, where the app keeps what
+    /// the user made. The path is compared folder by folder, split on the slash byte, because Swift reads a
+    /// slash and a combining mark after it as one `Character`. Expects the path in lowercase.
+    public static func isInAContainersDocuments(_ spelling: String) -> Bool {
+        let folders = PathComponents.of(spelling)
+        return folders.indices.contains { index in
+            index + 4 < folders.endIndex && folders[index] == "library" && folders[index + 1] == "containers"
+                && folders[index + 3] == "data" && folders[index + 4] == "documents"
+        }
+    }
+
+    /// True for a sandboxed app's container, or the `Data` folder inside it, while `Data/Documents` holds
+    /// anything or cannot be read. Moving either would take the user's documents along. It reads the disk, so
+    /// it needs the path as spelled on disk, not lowercased.
+    public static func holdsAContainersDocuments(_ path: String) -> Bool {
+        let components = PathComponents.of(path)
+        guard
+            let containers = components.lastIndex(where: { $0.lowercased() == "containers" }),
+            containers >= 1, components[containers - 1].lowercased() == "library",
+            components.count > containers + 1
+        else { return false }
+        let inside = components[(containers + 2)...]
+        guard inside.isEmpty || (inside.count == 1 && inside[inside.startIndex].lowercased() == "data") else { return false }
+
+        let documents = "/" + components[...(containers + 1)].joined(separator: "/") + "/Data/Documents"
+        var info = stat()
+        guard lstat(documents, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { return false }
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: documents) else { return true }
+        return names.contains { !isLeftByFinder($0) }
+    }
+
+    /// What Finder and macOS leave in a folder, which says nothing of what the folder holds.
+    public static func isLeftByFinder(_ name: String) -> Bool {
+        name == ".DS_Store" || name == ".localized"
+    }
+
+    /// Work that lives in a cache folder and nowhere else. A JetBrains IDE and Android Studio keep
+    /// `LocalHistory` beside their caches: the edits they recorded, which are in no repository. Deno keeps
+    /// `location_data` in its cache folder: `localStorage`, and the database behind `Deno.openKv()`. Raycast keeps
+    /// the images of its clipboard history, which it keeps on the Mac alone, in `Clipboard` inside its cache folder.
+    static let workKeptInCaches: Set<String> = ["localhistory", "location_data", "clipboard"]
+
+    /// Whether a path under a `Caches` folder is at or inside one of those folders, or holds one a level or two
+    /// down, and whether a Library's `Caches` folder holds one three levels down, which is how deep they sit
+    /// (`Caches/JetBrains/<product>/LocalHistory`). It reads the disk, so it needs the path as spelled on disk.
+    public static func holdsWorkKeptInACache(_ path: String) -> Finding {
+        let components = PathComponents.of(path).map { $0.lowercased() }
+        guard let caches = components.lastIndex(of: "caches") else { return .nothing }
+        if caches + 1 == components.count {
+            guard caches > 0, components[caches - 1] == "library" else { return .nothing }
+            return holdsWorkKeptInACache(path, levels: 3)
+        }
+        if components[(caches + 1)...].contains(where: workKeptInCaches.contains) { return .found }
+        return holdsWorkKeptInACache(path, levels: 2)
+    }
+
+    private static func holdsWorkKeptInACache(_ folder: String, levels: Int) -> Finding {
+        guard levels > 0 else { return .nothing }
+        guard let names = names(in: folder, followingLinks: true) else { return .notKnown }
+        var finding = Finding.nothing
+        for name in names {
+            if workKeptInCaches.contains(name.lowercased()) { return .found }
+            switch holdsWorkKeptInACache(folder + "/" + name, levels: levels - 1) {
+            case .found: return .found
+            case .notKnown: finding = .notKnown
+            case .nothing: break
+            }
+        }
+        return finding
+    }
+
+    /// What a look a level or two inside a folder found: what it looked for, nothing, or nothing known, because a
+    /// folder it had to look into is there and could not be listed.
+    public enum Finding: Sendable {
+        case found
+        case nothing
+        case notKnown
+    }
+
+    public static func names(in folder: String, followingLinks: Bool) -> [String]? {
+        listing(folder, followingLinks: followingLinks) { try FileManager.default.contentsOfDirectory(atPath: $0) }
+    }
+
+    /// What `list` gives for `folder`: none for a path that is not there or is no folder, a link to one included unless
+    /// `followingLinks`, and nil when listing a folder that is there fails.
+    static func listing<Entry>(
+        _ folder: String, followingLinks: Bool, _ list: (String) throws -> [Entry]
+    ) -> [Entry]? {
+        var info = stat()
+        guard (followingLinks ? stat(folder, &info) : lstat(folder, &info)) == 0 else {
+            return [ENOENT, ENOTDIR, ELOOP].contains(errno) ? [] : nil
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else { return [] }
+        return try? list(folder)
+    }
+
+    /// True for a file of the global preferences domain: `.GlobalPreferences.plist`, its `_m` twin, and the
+    /// ByHost one, which carries the Mac's host UUID in its name. They belong to no app. Expects the path in
+    /// lowercase.
+    public static func isGlobalPreferences(_ spelling: String) -> Bool {
+        let name = (spelling as NSString).lastPathComponent
+        guard name.hasPrefix(".globalpreferences"), name.hasSuffix(".plist") else { return false }
+        let folder = (spelling as NSString).deletingLastPathComponent
+        return folder.hasSuffix("/library/preferences") || folder.hasSuffix("/library/preferences/byhost")
+    }
+
+    private static let sharedHomeItemNames = Set(sharedHomeItems.map { PathComponents.of($0.lowercased()) })
+
+    /// True for one of `sharedHomeItems` exactly, never for anything inside one.
+    public static func isSharedHomeItem(_ path: String, home: String) -> Bool {
+        let home = ((home as NSString).standardizingPath).lowercased()
+        let homeNames = PathComponents.of(home)
+        return spellings(of: path).contains { spelling in
+            let names = PathComponents.of(spelling)
+            guard names.count > homeNames.count, names.starts(with: homeNames) else { return false }
+            return sharedHomeItemNames.contains(Array(names.dropFirst(homeNames.count)))
+        }
+    }
+
+    /// True when removing `path` would take something protected with it, as removing `~/.m2` would take
+    /// `~/.m2/settings-security.xml`. `refuses(_:home:)` asks the other question: whether the path is, or sits
+    /// inside, something protected. The two stay apart because scanners also use `refuses` to decide whether
+    /// to look inside a folder, and every folder from `/` down to the home folder holds something protected.
+    public static func holds(_ path: String, home: String) -> Bool {
+        holds(spellings: spellings(of: path), home: home)
+    }
+
+    /// `holds(_:home:)` for a path whose `spellings(of:)` are already worked out.
+    public static func holds(spellings: Set<String>, home: String) -> Bool {
+        spellings.contains { spelling in
+            let names = PathComponents.of(spelling)
+            let holdsIt = { (tree: [String]) in tree.count > names.count && tree.starts(with: names) }
+            for home in homes(of: names, given: home) where trees(under: home).sitInside(names) {
+                return true
+            }
+            return systemFolderNames.contains(where: holdsIt)
+        }
+    }
+
+    /// The protected trees under one home, looked up by a path's own names rather than compared with each tree.
+    /// Names compare as strings, so a composed letter still matches its decomposed spelling.
+    private struct Trees {
+        /// The trees name by name, from the root down.
+        private let root: Branch
+        /// Every folder a tree sits in, from the root down.
+        let ancestors: Set<[String]>
+
+        private struct Branch {
+            var endsATree = false
+            var beginnings: [String] = []
+            var next: [String: Branch] = [:]
+
+            mutating func add(_ names: ArraySlice<String>, beginnings: [String] = []) {
+                guard let name = names.first else {
+                    endsATree = endsATree || beginnings.isEmpty
+                    self.beginnings += beginnings
+                    return
+                }
+                next[name, default: Branch()].add(names.dropFirst(), beginnings: beginnings)
+            }
+        }
+
+        /// In each folder of `beginnings`, every name that begins with one of its starts is a tree too.
+        init(_ trees: [[String]], beginnings: [(folder: [String], starts: [String])] = []) {
+            var root = Branch()
+            for tree in trees {
+                root.add(tree[...])
+            }
+            for (folder, starts) in beginnings {
+                root.add(folder[...], beginnings: starts)
+            }
+            self.root = root
+            let above = { (names: [String]) in (0..<names.count).map { Array(names[..<$0]) } }
+            ancestors = Set(trees.flatMap(above) + beginnings.flatMap { above($0.folder) + [$0.folder] })
+        }
+
+        /// True when `names` is a tree or sits inside one.
+        func contain(_ names: [String]) -> Bool {
+            var branch = root
+            for name in names {
+                if branch.beginnings.contains(where: name.hasPrefix) { return true }
+                guard let next = branch.next[name] else { return false }
+                if next.endsATree { return true }
+                branch = next
+            }
+            return false
+        }
+
+        /// True when a tree sits inside `names`.
+        func sitInside(_ names: [String]) -> Bool {
+            ancestors.contains(names)
+        }
+    }
+
+    /// The protected trees for each home, built once, since `refuses` is asked of every entry a scan looks at.
+    /// A path can name any home under `/Users`, so the cache is capped rather than left to grow.
+    private static let treesByHome = Mutex<[String: Trees]>([:])
+
+    private static func trees(under home: String) -> Trees {
+        treesByHome.withLock { cache in
+            if let trees = cache[home] { return trees }
+            let names = { (path: String) in
+                PathComponents.of((home as NSString).appendingPathComponent(path).lowercased())
+            }
+            let trees = Trees(
+                homeTrees.map(names), beginnings: [(folder: names("Library/Caches"), starts: cloudStateCaches)]
+            )
+            if cache.count >= 32 { cache.removeAll() }
+            cache[home] = trees
+            return trees
+        }
+    }
+
+    /// Extensions of the libraries and packages that hold someone's whole photo, music, or video collection.
+    /// `photolibrary` and `aplibrary` are iPhoto's and Aperture's, which Photos still opens.
+    public static let extensions = [
+        "photoslibrary", "photolibrary", "migratedphotolibrary", "musiclibrary", "tvlibrary", "imovielibrary",
+        "fcpbundle", "aplibrary",
+    ]
+    private static let librarySuffixes = extensions.map { "." + $0 }
+
+    /// True for the lowercase name of one of those libraries or packages.
+    public static func isALibrary(_ name: String) -> Bool {
+        librarySuffixes.contains { name.hasSuffix($0) }
+    }
+
+    /// Whether a folder holds one of those libraries a level or two down, as in `<year>/<name>.photoslibrary`. A
+    /// library can sit anywhere, so no list of places can protect the folder around one, and this looks inside the
+    /// folder instead. It reads the disk.
+    public static func holdsALibrary(_ path: String) -> Finding {
+        guard let children = names(in: path, followingLinks: false) else { return .notKnown }
+        var finding = Finding.nothing
+        for child in children {
+            if isALibrary(child.lowercased()) { return .found }
+            let inside = path + "/" + child
+            var info = stat()
+            guard lstat(inside, &info) == 0 else {
+                if errno != ENOENT { finding = .notKnown }
+                continue
+            }
+            guard info.st_mode & S_IFMT == S_IFDIR else { continue }
+            guard let deeper = names(in: inside, followingLinks: false) else {
+                finding = .notKnown
+                continue
+            }
+            if deeper.contains(where: { isALibrary($0.lowercased()) }) { return .found }
+        }
+        return finding
+    }
+
+    /// The lowercase names a check should compare for `path`: as written, with its `.` and `..` read, and with
+    /// links resolved. macOS keeps `/var`, `/tmp`, and `/etc` as symbolic links into `/private`, and disks are
+    /// case-insensitive by default, so one file has several names. A check that knew only one of them could be
+    /// bypassed by writing another.
+    public static func spellings(of path: String) -> Set<String> {
+        var names = privateNames(of: path)
+        let standardized = (path as NSString).standardizingPath
+        if standardized != path {
+            names.formUnion(privateNames(of: standardized))
+        }
+        let resolved = (path as NSString).resolvingSymlinksInPath
+        if resolved != path {
+            names.formUnion(privateNames(of: resolved))
+        }
+        return Set(names.map { name in
+            let trimmed = name.count > 1 && name.hasSuffix("/") ? String(name.dropLast()) : name
+            return trimmed.lowercased()
+        })
+    }
+
+    private static let linkedIntoPrivate: Set<String> = ["var", "tmp", "etc"]
+
+    private static func privateNames(of path: String) -> Set<String> {
+        let names = PathComponents.of(path)
+        if let first = names.first, linkedIntoPrivate.contains(first) {
+            return [path, "/private" + path]
+        }
+        if names.count > 1, names[0] == "private", linkedIntoPrivate.contains(names[1]) {
+            return [path, String(path.dropFirst("/private".count))]
+        }
+        return [path]
+    }
+
+    /// True for a Mail plug-in directly in a home's `Library/Mail/Bundles`, or anything inside one: the one thing in
+    /// Mail's folder that holds no mail: it is code, and Apple said Mail plug-ins stop working in a later macOS
+    /// (WWDC21 session 10168).
+    public static func isAMailPlugIn(_ path: String, home: String) -> Bool {
+        let folders = spellings(of: home).map { PathComponents.of($0) + ["library", "mail", "bundles"] }
+        return privateNames(of: path).contains { spelling in
+            let names = PathComponents.of(spelling.lowercased())
+            return folders.contains { bundles in
+                names.count > bundles.count && names.starts(with: bundles) && names[bundles.count].hasSuffix(".mailbundle")
+            }
+        }
+    }
+
+    /// True for a path at or inside anything protected here: the home and system folders, the keys, a wallet
+    /// extension's storage, a media library, a global preferences file, one of Apple's group containers, or what
+    /// macOS keeps under Apple's name in `/Library`.
+    /// Running as root, the helper can see every account on the Mac, so a home folder is any folder directly
+    /// inside `/Users`, as well as the one given.
+    public static func refuses(_ path: String, home: String) -> Bool {
+        refuses(spellings: spellings(of: path), home: home)
+    }
+
+    /// `refuses(_:home:)` for a path whose `spellings(of:)` are already worked out.
+    public static func refuses(spellings: Set<String>, home: String) -> Bool {
+        spellings.contains { spelling in
+            let names = PathComponents.of(spelling)
+            if names.contains(where: isALibrary) || isInADisksTrash(names) { return true }
+            if isGlobalPreferences(spelling) || isInAnApplesGroupContainer(names) || isMacOSsOwnInLibrary(names)
+                || isAnApplesReceipt(names) {
+                return true
+            }
+            if isInsideAWalletExtension(names) { return true }
+
+            for home in homes(of: names, given: home) where trees(under: home).contain(names) {
+                if !isAMailPlugIn(spelling, home: home) { return true }
+            }
+            return systemFolderNames.contains { names.starts(with: $0) }
+        }
+    }
+
+    /// True at or inside the Trash macOS keeps at the top of a disk, `.Trashes`, as `~/.Trash` is the home's: what is
+    /// there is on its way out. The names arrive lower-cased.
+    private static func isInADisksTrash(_ names: [String]) -> Bool {
+        names.first == ".trashes" || (names.count > 2 && names[0] == "volumes" && names[2] == ".trashes")
+    }
+
+    /// The home the caller named, plus whichever account the path, given by its names, sits in.
+    private static func homes(of names: [String], given home: String) -> [String] {
+        var homes = [((home as NSString).standardizingPath).lowercased()]
+        if names.count >= 2, names[0] == "users" {
+            homes.append("/users/" + names[1])
+        }
+        return homes
+    }
+}

@@ -1,0 +1,896 @@
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Synchronization
+import Testing
+
+struct SpaceInventoryTests {
+    @Test func aStoppedScanStops() async throws {
+        let directory = try TemporaryDirectory()
+        let paths = SpaceInventory.definitions.flatMap(\.paths)
+        for path in paths {
+            try directory.directory(path.hasPrefix("/") ? String(path.dropFirst()) : path)
+        }
+        let unanswered = Unanswered()
+
+        let stop = try await unanswered.stop {
+            _ = await SpaceInventory.scan(
+                home: directory.url,
+                root: directory.url,
+                minimumSize: 1,
+                measure: unanswered.walk
+            )
+        }
+
+        #expect(stop.took < Unanswered.returnsForTheCancel)
+        #expect(stop.askedBefore < SpaceInventory.definitions.count)
+        #expect(stop.askedAfter == 0)
+    }
+
+    /// macOS empties it only in a safe boot (`man confstr`); its own files there, some unreadable, aren't measured.
+    @Test(.permissionsHold) func listsTheFolderMacOSGivesTheAccountForCaches() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("C/org.example.editor.helper/com.apple.metal/shaders.data", bytes: 400)
+        try directory.file("C/com.apple.WebKit.WebContent.Sandbox", bytes: 16)
+        try directory.setPermissions(0, of: "C/com.apple.WebKit.WebContent.Sandbox")
+        defer { try? directory.setPermissions(0o644, of: "C/com.apple.WebKit.WebContent.Sandbox") }
+        let userCache = directory.url.appending(path: "C", directoryHint: .isDirectory)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home"), root: directory.url.appending(path: "root"),
+            userCache: userCache, minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let item = try #require(report.items.first { $0.id == "user-caches" })
+        #expect(item.urls == [userCache])
+        #expect(item.handling == .trash)
+        #expect(item.leavesMacOSsOwn)
+        #expect(item.size.isComplete, "what macOS keeps was measured")
+    }
+
+    @Test func listsWhatFormulasKeepInHomebrewsVarAndWhatNoInstalledFormulaNames() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/opt/homebrew/var/mysql/ibdata1", bytes: 400_000)
+        try directory.file("root/opt/homebrew/var/redis-old/dump.rdb", bytes: 200_000)
+        try directory.file("root/opt/homebrew/var/log/mysql.log", bytes: 100_000)
+        try directory.file("root/opt/homebrew/var/homebrew/linked/mariadb", bytes: 16)
+        try directory.file(
+            "root/opt/homebrew/Cellar/mariadb/11.8.2/.brew/mariadb.rb", contents: Data(#"datadir = var/"mysql""#.utf8)
+        )
+        try directory.file("root/usr/local/var/postgres/PG_VERSION", bytes: 300_000)
+        try directory.file(
+            "root/usr/local/Cellar/postgresql@14/14.19/.brew/postgresql@14.rb", contents: Data(#"var/"postgres""#.utf8)
+        )
+        let root = directory.url.appending(path: "root", directoryHint: .isDirectory)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home"), root: root, minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let item = try #require(report.items.first { $0.id == "homebrew-data" })
+        #expect(item.isReadOnly)
+        #expect(item.listedPlaces.map(\.lastPathComponent) == ["mysql", "redis-old", "postgres"])
+        #expect(item.placeNotes.map { $0.key.lastPathComponent } == ["redis-old"])
+        #expect(item.placeNotes.values.allSatisfy { $0 == .namedByNoInstalledFormula })
+        #expect(Set(item.placeSizes.keys.map(\.lastPathComponent)) == ["mysql", "redis-old", "postgres"])
+        #expect(item.placeSizes.values.allSatisfy { $0.known > 0 })
+    }
+
+    @Test func listsTheYearsOfTeXLiveAndTheVersionsOfTheDotNetSDK() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/usr/local/texlive/2025/texmf-dist/ls-R", bytes: 300_000)
+        try directory.file("root/usr/local/texlive/2026/texmf-dist/ls-R", bytes: 300_000)
+        try directory.file("root/usr/local/share/dotnet/sdk/8.0.403/dotnet.dll", bytes: 200_000)
+        try directory.file("root/usr/local/share/dotnet/sdk/9.0.100/dotnet.dll", bytes: 200_000)
+        let root = directory.url.appending(path: "root", directoryHint: .isDirectory)
+        try directory.directory("root/Library/TeX")
+        try FileManager.default.createSymbolicLink(
+            at: root.appending(path: "Library/TeX/Root"), withDestinationURL: root.appending(path: "usr/local/texlive/2026")
+        )
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home"), root: root, minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let texLive = try #require(report.items.first { $0.id == "tex-live" })
+        #expect(texLive.isReadOnly && texLive.listedPlaces.map(\.lastPathComponent) == ["2025", "2026"])
+        #expect(texLive.placeNotes.map { $0.key.lastPathComponent } == ["2025"])
+        let sdks = try #require(report.items.first { $0.id == "dotnet-sdks" })
+        #expect(sdks.isReadOnly && sdks.listedPlaces.map(\.lastPathComponent) == ["8.0.403", "9.0.100"])
+        #expect(sdks.placeNotes.map { $0.key.lastPathComponent } == ["8.0.403"])
+        #expect(sdks.placeSizes.values.allSatisfy { $0.known > 0 })
+    }
+
+    @Test func reportsOnlyWhatIsBigEnough() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Logs/big.log", bytes: 400_000)
+        try directory.file(".colima/machine/disk.img", bytes: 16)
+
+        let root = directory.url.appending(path: "root", directoryHint: .isDirectory)
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: root, minimumSize: 100_000, measure: LeftoverScanner.walk
+        )
+        #expect(report.items.map(\.id) == ["logs"])
+        #expect(report.items.first?.handling == .trash)
+
+        let everything = await SpaceInventory.scan(
+            home: directory.url, root: root, minimumSize: 1, measure: LeftoverScanner.walk
+        )
+        #expect(Set(everything.items.map(\.id)) == ["logs", "colima"])
+
+        let keepingColima = await SpaceInventory.scan(
+            home: directory.url, root: root, minimumSize: 100_000, keeping: ["colima"], measure: LeftoverScanner.walk
+        )
+        #expect(Set(keepingColima.items.map(\.id)) == ["logs", "colima"], "an area open on its page left the list")
+    }
+
+    /// The folders Space exists to show are the ones most likely to run out of time. Such a folder stays in the
+    /// report, listed first, with an unknown size.
+    @Test func keepsAFolderThatDidNotAnswerInTime() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Logs/big.log", bytes: 400_000)
+        try directory.file("Library/Caches/com.example.app/blob", bytes: 400_000)
+
+        let root = directory.url.appending(path: "root", directoryHint: .isDirectory)
+        let report = await SpaceInventory.scan(home: directory.url, root: root, minimumSize: 100_000) { url in
+            url.lastPathComponent == "Caches" ? nil : await FileSize.contents(of: url)
+        }
+
+        #expect(report.items.map(\.id) == ["caches", "logs"])
+        #expect(report.items.first?.size.reading == .unknown)
+        #expect(report.items.last.map { $0.size.isComplete && $0.size.known >= 400_000 } == true)
+    }
+
+    /// An area macOS refused all of is kept, so the person learns Peel couldn't look there.
+    @Test(.permissionsHold) func keepsAFolderItCannotOpen() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Logs/big.log", bytes: 400_000)
+        try directory.setPermissions(0, of: "home/Library/Logs")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/Logs") }
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 100_000,
+            measure: LeftoverScanner.walk
+        )
+        #expect(report.items.map(\.id) == ["logs"])
+        #expect(report.items.first?.size.reading == .unknown)
+        #expect(!report.needsFullDiskAccess, "ordinary permissions were read as a refusal Full Disk Access would lift")
+    }
+
+    @Test(.permissionsHold) func judgesAnAreaRefusedInPartByWhatItSaw() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Logs/big.log", bytes: 400_000)
+        try directory.file("home/Library/Logs/private/kept.log", bytes: 64)
+        try directory.file("home/Library/Caches/com.example.app/blob", bytes: 3_000_000)
+        try directory.setPermissions(0, of: "home/Library/Logs/private")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/Logs/private") }
+        let scan = { (floor: Int64) in
+            await SpaceInventory.scan(
+                home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+                root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+                minimumSize: floor,
+                measure: LeftoverScanner.walk
+            )
+        }
+
+        let listed = await scan(100_000)
+        #expect(listed.items.map(\.id) == ["caches", "logs"], "a refusal sorts by what was seen")
+        #expect(listed.items.last.map { !$0.size.isComplete && $0.size.known >= 400_000 } == true)
+        #expect(await scan(1_000_000).items.map(\.id) == ["caches"], "a refusal says nothing of what wasn't seen")
+    }
+
+    @Test(.permissionsHold) func keepsASharedAreaItCannotListAsUnknown() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Library/Logs/org.example.tool/run.log", bytes: 400_000)
+        try directory.setPermissions(0, of: "root/Library/Logs")
+        defer { try? directory.setPermissions(0o755, of: "root/Library/Logs") }
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 100_000,
+            measure: LeftoverScanner.walk
+        )
+        #expect(report.items.map(\.id) == ["system-logs"])
+        #expect(report.items.first?.size.reading == .unknown)
+    }
+
+    @Test(.permissionsHold) func keepsWhatItMeasuredBesideAFolderItCannotOpen() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Library/Logs/org.example.tool/run.log", bytes: 400_000)
+        try directory.file("root/Library/Logs/DiagnosticReports/org.example.tool.ips", bytes: 16)
+        try directory.setPermissions(0, of: "root/Library/Logs/DiagnosticReports")
+        defer { try? directory.setPermissions(0o755, of: "root/Library/Logs/DiagnosticReports") }
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 100_000,
+            measure: LeftoverScanner.walk
+        )
+
+        let logs = try #require(report.items.first { $0.id == "system-logs" })
+        #expect(!logs.size.isComplete)
+        #expect(logs.size.known >= 400_000)
+    }
+
+    @Test(.permissionsHold) func keepsWhatItSawInAFolderItCouldNotReadAllThrough() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/org.example.app/blob", bytes: 400_000)
+        try directory.file("home/Library/Caches/org.example.app/closed/blob", bytes: 16)
+        try directory.setPermissions(0, of: "home/Library/Caches/org.example.app/closed")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/Caches/org.example.app/closed") }
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 100_000,
+            measure: LeftoverScanner.walk
+        )
+
+        let caches = try #require(report.items.first { $0.id == "caches" })
+        #expect(!caches.size.isComplete)
+        #expect(caches.size.known >= 400_000)
+    }
+
+    @Test func leavesOutWhatIsExcludedAndWhatItHolds() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Parallels/Example.pvm/disk.hdd", bytes: 400_000)
+        try directory.file("Library/Caches/org.example.kept/blob", bytes: 300_000)
+        try directory.file("Library/Caches/org.example.excluded/blob", bytes: 500_000)
+        let exclusions = Exclusions(paths: [
+            directory.url.appending(path: "Parallels"),
+            directory.url.appending(path: "Library/Caches/org.example.excluded"),
+        ])
+
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: directory.url, minimumSize: 1, exclusions: exclusions,
+            measure: LeftoverScanner.walk
+        )
+
+        #expect(!report.items.contains { $0.id == "parallels" })
+        let caches = try #require(report.items.first { $0.id == "caches" })
+        let kept = await FileSize.reclaimableSize(of: directory.url.appending(path: "Library/Caches/org.example.kept"))
+        #expect(caches.size == SizeTotal([kept]))
+    }
+
+    @Test func leavesOutWhatAnExcludedAppKeepsInItsOwnFolders() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Caches/org.example.kept/blob", bytes: 300_000)
+        try directory.file("Library/Caches/org.example.Notes/blob", bytes: 500_000)
+        try directory.file("Library/Containers/org.example.Notes/Data/Library/Caches/blob", bytes: 500_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: directory.url, minimumSize: 1,
+            exclusions: Exclusions(bundleIdentifiers: ["org.example.Notes"]), measure: LeftoverScanner.walk
+        )
+
+        let caches = try #require(report.items.first { $0.id == "caches" })
+        let kept = await FileSize.reclaimableSize(of: directory.url.appending(path: "Library/Caches/org.example.kept"))
+        #expect(caches.size == SizeTotal([kept]))
+        #expect(!report.items.flatMap(\.urls).contains { $0.path(percentEncoded: false).contains("org.example.Notes") })
+    }
+
+    @Test func doesNotCountWhatFinderLeavesWhereAnAreaMeasuresWhatItOffers() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Logs/DiagnosticReports/.DS_Store", bytes: 400_000)
+        try directory.file("home/Library/Logs/DiagnosticReports/Example.ips", bytes: 4_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let logs = try #require(report.items.first { $0.id == "logs" })
+        #expect(logs.size.known < 400_000)
+    }
+
+    @Test func countsTheFoldersAnAreaHasInContainersRatherThanNamingEach() async throws {
+        let directory = try TemporaryDirectory()
+        for index in 0..<3 {
+            let container = "home/Library/Containers/org.example.app\(index)/Data"
+            try directory.file("\(container)/Library/Caches/blob")
+            try directory.file("\(container)/tmp/blob")
+            try directory.file("\(container)/Library/Logs/run.log")
+        }
+        try directory.file("home/Library/Containers/org.example.only-tmp/Data/tmp/blob")
+        try directory.file("home/Library/Group Containers/group.org.example/Library/Caches/blob")
+        try directory.file("home/Library/Logs/org.example.tool/run.log")
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let containers = home.appending(path: "Library/Containers", directoryHint: .isDirectory)
+        let groups = home.appending(path: "Library/Group Containers", directoryHint: .isDirectory)
+
+        let report = await SpaceInventory.scan(
+            home: home, root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let caches = try #require(report.items.first { $0.id == "container-caches" })
+        #expect(caches.urls.count == 8)
+        #expect(caches.listedPlaces.isEmpty)
+        #expect(caches.inContainers == [
+            SpaceItem.ContainerFolders(parent: containers, folders: ["Caches", "tmp"], containers: 4, areGroups: false),
+            SpaceItem.ContainerFolders(parent: groups, folders: ["Caches"], containers: 1, areGroups: true),
+        ])
+        let logs = try #require(report.items.first { $0.id == "logs" })
+        #expect(logs.listedPlaces.map(\.lastPathComponent) == ["Logs"])
+        #expect(logs.inContainers == [
+            SpaceItem.ContainerFolders(parent: containers, folders: ["Logs"], containers: 3, areGroups: false),
+        ])
+    }
+
+    @Test func aPageAsksForAnAreasPlacesWithoutWorkingThemOutAgain() async throws {
+        let directory = try TemporaryDirectory()
+        for index in 0..<400 {
+            try directory.file("home/Library/Containers/org.example.app\(index)/Data/Library/Caches/blob")
+        }
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let caches = try #require(report.items.first { $0.id == "container-caches" })
+        #expect(caches.listedPlaces.isEmpty)
+        let took = processorTime {
+            for _ in 0..<100 { _ = caches.listedPlaces }
+        }
+        #expect(took < .milliseconds(100), "\(took)")
+    }
+
+    @Test func measuresAFewPlacesOfAnAreaAtATime() async throws {
+        let directory = try TemporaryDirectory()
+        for index in 0..<8 {
+            try directory.file("home/Library/Containers/org.example.app\(index)/Data/Library/Logs/run.log", bytes: 16)
+        }
+        let running = Mutex((now: 0, most: 0))
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1
+        ) { url in
+            guard url.path(percentEncoded: false).contains("/Data/Library/Logs") else { return await LeftoverScanner.walk(url) }
+            running.withLock { $0.now += 1; $0.most = max($0.most, $0.now) }
+            try? await Task.sleep(for: .milliseconds(100))
+            running.withLock { $0.now -= 1 }
+            return FolderContents(size: 4_000, holdsRepository: false)
+        }
+
+        #expect(report.items.first { $0.id == "logs" }?.size.known == 32_000)
+        #expect(running.withLock { $0.most } == LeftoverScanner.concurrentMeasurements)
+    }
+
+    @Test func anExcludedPlaceThatCannotBeMeasuredLeavesTheAreaUnknown() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Caches/org.example.kept/blob", bytes: 300_000)
+        try directory.file("Library/Caches/org.example.excluded/blob", bytes: 500_000)
+        let excluded = directory.url.appending(path: "Library/Caches/org.example.excluded")
+
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: directory.url, minimumSize: 1, exclusions: Exclusions(paths: [excluded])
+        ) { url in
+            url.lastPathComponent == excluded.lastPathComponent ? nil : await LeftoverScanner.walk(url)
+        }
+
+        #expect(report.items.first { $0.id == "caches" }?.size.reading == .unknown)
+    }
+
+    @Test(.permissionsHold) func anExcludedPlaceMacOSRefusesSaysNothingOfTime() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/org.example.kept/blob", bytes: 300_000)
+        try directory.file("home/Library/Logs/org.example.big/blob", bytes: 900_000)
+        try directory.file("home/Library/Caches/org.example.closed/blob", bytes: 16)
+        try directory.setPermissions(0, of: "home/Library/Caches/org.example.closed")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/Caches/org.example.closed") }
+        let excluded = directory.url.appending(path: "home/Library/Caches/org.example.closed")
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1, exclusions: Exclusions(paths: [excluded]), measure: LeftoverScanner.walk
+        )
+
+        #expect(report.items.first { $0.id == "caches" }?.size.reading == .unknown)
+        #expect(report.items.first?.id == "logs", "what ran out of time comes first, and this didn't")
+    }
+
+    @Test func leavesWhatOthersOwnToThem() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".colima/machine/disk.img", bytes: 4096)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url,
+            root: directory.url,
+            minimumSize: 1,
+            measure: LeftoverScanner.walk
+        )
+        let machines = try #require(report.items.first { $0.id == "colima" })
+        #expect(machines.isReadOnly)
+        #expect(machines.category == .virtualMachines)
+    }
+
+    /// macOS 26 keeps the downloaded aerials per user, not in the shared folder macOS 14 and 15 used.
+    @Test func findsTheAerialWallpapersWhereMacOS26KeepsThem() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Application Support/com.apple.wallpaper/aerials/videos/a.mov", bytes: 400_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url,
+            root: directory.url,
+            minimumSize: 100_000,
+            measure: LeftoverScanner.walk
+        )
+        #expect(report.items.map(\.id) == ["wallpapers"])
+    }
+
+    /// The simulator caches belong to Developer, which selects them, so Space leaves them out. The runtimes, the
+    /// larger part, sit outside the home folder and are counted here.
+    @Test func countsTheSimulatorRuntimesAndLeavesTheCachesToDeveloper() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Developer/CoreSimulator/Devices/one/data.bin", bytes: 400_000)
+        try directory.file("Library/Developer/CoreSimulator/Caches/dyld/shared.bin", bytes: 400_000)
+        try directory.file("Library/Developer/CoreSimulator/Images/runtime.dmg", bytes: 400_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url,
+            root: directory.url,
+            minimumSize: 100_000,
+            measure: LeftoverScanner.walk
+        )
+        let simulators = try #require(report.items.first { $0.id == "simulators" })
+        let paths = simulators.urls.map { $0.lastPathComponent }
+
+        #expect(paths.contains("Devices"))
+        #expect(paths.contains("Images"))
+        #expect(!paths.contains("Caches"), "the caches Developer selects are counted here as well")
+    }
+
+    @Test func countsTheRuntimesCoreSimulatorKeepsAsCryptexes() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Library/Developer/CoreSimulator/Cryptex/Images/bundle/runtime.dmg", bytes: 400_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 100_000,
+            measure: LeftoverScanner.walk
+        )
+
+        let simulators = try #require(report.items.first { $0.id == "simulators" })
+        #expect(simulators.urls.map { $0.path(percentEncoded: false) }.contains { $0.hasSuffix("Cryptex/Images/") })
+        #expect(simulators.size.known >= 400_000)
+    }
+
+    @Test func findsTheCachesAndLogsInEveryAppsContainer() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Containers/org.example.chat/Data/Library/Caches/blob", bytes: 8_000)
+        try directory.file("Library/Containers/org.example.chat/Data/Library/Logs/run.log", bytes: 8_000)
+        try directory.file("Library/Containers/org.example.notes/Data/Library/Caches/blob", bytes: 8_000)
+        try directory.directory("Library/Containers/org.example.empty/Data/Documents")
+        try directory.directory("Elsewhere/Data/Library/Caches")
+        try FileManager.default.createSymbolicLink(
+            at: directory.url.appending(path: "Library/Containers/org.example.link"),
+            withDestinationURL: directory.url.appending(path: "Elsewhere")
+        )
+
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: directory.url, minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let folders = { (id: String) in
+            report.items.first { $0.id == id }?.urls.map { $0.pathComponents.suffix(4).joined(separator: "/") } ?? []
+        }
+        let caches = ["org.example.chat/Data/Library/Caches", "org.example.notes/Data/Library/Caches"]
+        #expect(folders("container-caches") == caches)
+        #expect(folders("logs").contains("org.example.chat/Data/Library/Logs"))
+    }
+
+    @Test func findsTheCopiesMailKeepsOfTheAttachmentsYouOpen() async throws {
+        let directory = try TemporaryDirectory()
+        let container = "Library/Containers/com.apple.mail/Data/Library/Mail Downloads"
+        try directory.file("Library/Mail Downloads/0C6E/Invoice.pdf", bytes: 8_000)
+        try directory.file("\(container)/5A1F/Plan.pages", bytes: 8_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: directory.url, minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let attachments = try #require(report.items.first { $0.id == "mail-downloads" })
+        #expect(attachments.urls == [
+            directory.url.appending(path: "Library/Mail Downloads", directoryHint: .isDirectory),
+            directory.url.appending(path: container, directoryHint: .isDirectory),
+        ])
+        #expect(attachments.handling == .trash)
+        #expect(attachments.heldBack == .openedFromMail)
+    }
+
+    @Test func findsTheCachesOfEveryGroupContainerButApplesAndTheTemporaryFilesOfEveryContainer() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Group Containers/ABCDE12345.org.example.shared/Library/Caches/blob", bytes: 8_000)
+        try directory.file("Library/Group Containers/group.com.apple.notes/Library/Caches/blob", bytes: 8_000)
+        try directory.file("Library/Containers/org.example.chat/Data/tmp/upload.part", bytes: 8_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: directory.url, minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let folders = report.items.first { $0.id == "container-caches" }?.urls
+            .map { $0.pathComponents.suffix(3).joined(separator: "/") } ?? []
+        #expect(Set(folders) == ["ABCDE12345.org.example.shared/Library/Caches", "org.example.chat/Data/tmp"])
+    }
+
+    @Test func findsTheCacheBattleNetKeepsForEveryAccount() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Users/Shared/Blizzard/Battle.net/Cache/data.bin", bytes: 8_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let cache = try #require(report.items.first { $0.id == "battlenet-cache" })
+        #expect(cache.urls.map { $0.pathComponents.suffix(3).joined(separator: "/") } == ["Shared/Blizzard/Battle.net"])
+        #expect(cache.handling == .trash)
+        #expect(cache.heldBack == .sharedWithEveryone)
+    }
+
+    /// The caches apps keep for every account are measured without what macOS keeps there for its own services,
+    /// which belong to other accounts' processes and are never offered.
+    @Test func findsTheCachesAppsKeepForEveryAccountWithoutMacOSsOwn() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Library/Caches/org.example.updater/package.bin", bytes: 8_000)
+        try directory.file("root/Library/Caches/com.apple.iconservices.store/icons.bin", bytes: 50_000)
+        try directory.file("root/Library/Caches/ColorSync/profiles.bin", bytes: 50_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let caches = try #require(report.items.first { $0.id == "system-caches" })
+        #expect(caches.urls.map { $0.pathComponents.suffix(2).joined(separator: "/") } == ["Library/Caches"])
+        #expect(caches.handling == .trash)
+        #expect(caches.leavesMacOSsOwn)
+        #expect(caches.size.isComplete && caches.size.known >= 8_000 && caches.size.known < 50_000)
+    }
+
+    /// The logs every account shares are measured without what macOS writes there for its own services, and the
+    /// crash reports with those in the folders macOS files them into.
+    @Test func findsTheLogsAndReportsEveryAccountSharesWithoutMacOSsOwn() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Library/Logs/org.example.tool/run.log", bytes: 8_000)
+        try directory.file("root/Library/Logs/WindowServer/session.log", bytes: 50_000)
+        try directory.file("root/Library/Logs/DiagnosticReports/Example_2026-09-28.ips", bytes: 4_000)
+        try directory.file("root/Library/Logs/DiagnosticReports/Retired/panic-full.ips", bytes: 50_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            root: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            minimumSize: 1, measure: LeftoverScanner.walk
+        )
+
+        let logs = try #require(report.items.first { $0.id == "system-logs" })
+        #expect(logs.urls.map { $0.pathComponents.suffix(2).joined(separator: "/") } == [
+            "Library/Logs", "Logs/DiagnosticReports",
+        ])
+        #expect(logs.size.isComplete && logs.size.known >= 62_000 && logs.size.known < 100_000)
+    }
+
+    @Test func findsEveryPlaceOfEveryAreaItKnows() async throws {
+        let directory = try TemporaryDirectory()
+        let (home, root) = (try directory.directory("home"), try directory.directory("root"))
+        var expected: Set<String> = []
+        for definition in SpaceInventory.definitions {
+            let places = definition.paths.map { $0.hasPrefix("/") ? "root" + $0 : "home/" + $0 }
+                + definition.containerFolders.map { "home/Library/Containers/org.example.app/\($0)" }
+                + (definition.groupContainerFolder.map { ["home/Library/Group Containers/ABCDE12345.org.example.group/\($0)"] } ?? [])
+            for place in places {
+                try directory.file("\(place)/org.example.kept/content", bytes: 8_000)
+                expected.insert("\(definition.id): \(place)")
+            }
+        }
+
+        let report = await SpaceInventory.scan(home: home, root: root, minimumSize: 1, measure: LeftoverScanner.walk)
+
+        let inside = directory.url.lastPathComponent + "/"
+        let places = report.items.flatMap { item in
+            item.urls.map { url in
+                let path = url.path(percentEncoded: false).components(separatedBy: inside).last ?? ""
+                return (item: item, path: path.hasSuffix("/") ? String(path.dropLast()) : path)
+            }
+        }
+        let found = Set(places.map { "\($0.item.id): \($0.path)" })
+        #expect(expected.subtracting(found).isEmpty, "\(expected.subtracting(found).sorted())")
+        // A place in two areas, or inside a place measured whole, would count its bytes twice in the total. An area
+        // that leaves macOS's own, or offers only the files of a place of its own, measures what is in its places one
+        // by one, and passes over a place of its own.
+        let twice = places.filter { place in
+            places.contains { other in
+                let isAnotherArea = other.item.id != place.item.id
+                let measuresOneByOne = other.item.leavesMacOSsOwn || !other.item.onlyFilesIn.isEmpty
+                return (other.path == place.path && isAnotherArea)
+                    || (place.path.hasPrefix(other.path + "/") && (isAnotherArea || !measuresOneByOne))
+            }
+        }
+        #expect(twice.isEmpty, "counted twice: \(twice.map(\.path).sorted())")
+    }
+
+    @Test func everyDefinitionSaysWhatItIsAndWhoOwnsIt() {
+        for definition in SpaceInventory.definitions {
+            #expect(!definition.id.isEmpty)
+            let containers = !definition.containerFolders.isEmpty || definition.groupContainerFolder != nil
+            #expect(
+                !definition.paths.isEmpty || containers || definition.isTheUserCacheFolder || definition.places != nil
+            )
+        }
+        #expect(Set(SpaceInventory.definitions.map(\.id)).count == SpaceInventory.definitions.count)
+    }
+
+    @Test func showsASimulatorCommandOnlyWhenTheSimulatorToolKnowsIt() {
+        let outdated = SpaceInventory.Command(
+            "xcrun simctl runtime delete --outdated", needs: .simctlRuntimeOption("--outdated")
+        )
+        let unavailable = SpaceInventory.Command("xcrun simctl delete unavailable", needs: .simctl)
+        let knows = "delete (<identifier>|--notUsedSinceDays <days>|--unusable|--outdated) [--dry-run] [--keep-asset]"
+        let older = "delete (<identifier>|--notUsedSinceDays <days>|--unusable) [--dry-run] [--keep-asset]"
+
+        #expect(outdated.isKnown(simctlRuntimeHelp: knows))
+        #expect(!outdated.isKnown(simctlRuntimeHelp: older))
+        #expect(!outdated.isKnown(simctlRuntimeHelp: "delete [--outdatedOnly]"))
+        #expect(!outdated.isKnown(simctlRuntimeHelp: nil))
+        #expect(unavailable.isKnown(simctlRuntimeHelp: older))
+        #expect(!unavailable.isKnown(simctlRuntimeHelp: nil))
+        #expect(SpaceInventory.Command("colima delete --data").isKnown(simctlRuntimeHelp: nil))
+    }
+
+    /// An older simulator tool, which this Mac can't produce on demand, stands in as the help it prints.
+    @Test func theSimulatorsAreaGivesOnlyTheCommandsTheSimulatorToolKnows() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("Library/Developer/CoreSimulator/Devices")
+        let older = "delete (<identifier>|--notUsedSinceDays <days>|--unusable) [--dry-run] [--keep-asset]"
+
+        func commands(_ help: String?) async throws -> [String] {
+            let report = await SpaceInventory.scan(
+                home: directory.url, root: directory.url, minimumSize: 0, measure: LeftoverScanner.walk,
+                simctlRuntimeHelp: { help }
+            )
+            return try #require(report.items.first { $0.id == "simulators" }).commands
+        }
+
+        #expect(try await commands(older) == ["xcrun simctl delete unavailable"])
+        #expect(try await commands(nil).isEmpty)
+    }
+
+    @Test func readsTheRuntimeHelpOfTheSimulatorToolXcrunWouldRun() async {
+        let developer = await DeveloperFolder.active()
+        let xcrunFindsOne = developer.map {
+            FileManager.default.isExecutableFile(atPath: $0.appending(path: "usr/bin/simctl").path(percentEncoded: false))
+        } ?? false
+        let isInstalled = FileManager.default.isExecutableFile(atPath: Simctl.program.path(percentEncoded: false))
+
+        // Space gives `simctl` five seconds, and on a busy Mac it can take longer to reach CoreSimulator's service,
+        // so the test waits for its whole answer.
+        let help = await Simctl.runtimeHelp(within: nil)
+
+        if xcrunFindsOne && isInstalled {
+            #expect(help?.contains("Usage: simctl runtime") == true)
+        } else {
+            #expect(help == nil)
+        }
+    }
+
+    @Test func xcodeManagesTheSimulatorsAndLeavesThemForReview() throws {
+        let simulators = try #require(SpaceInventory.definitions.first { $0.id == "simulators" })
+        let home = URL(filePath: "/Users/someone/", directoryHint: .isDirectory)
+
+        let managedBy = try #require(simulators.managedBy)
+        #expect(managedBy.identifiers == ["com.apple.dt.Xcode"])
+        #expect(managedBy.leftBehind == .holdsSimulators)
+        #expect(simulators.placesInTheHome(home) == [
+            home.appending(path: "Library/Developer/CoreSimulator/Devices", directoryHint: .isDirectory)
+        ])
+    }
+
+    @Test func measuresTheMachinesAndBottlesEachToolKeeps() async throws {
+        let directory = try TemporaryDirectory()
+        let (home, root) = (try directory.directory("home"), try directory.directory("root"))
+        let places: [String: [String]] = [
+            "virtualbuddy": ["home/Library/Application Support/VirtualBuddy"],
+            "crossover": [
+                "home/Library/Application Support/CrossOver/Bottles", "root/Library/Application Support/CrossOver/Bottles",
+            ],
+            "whisky": ["home/Library/Containers/com.isaacmarovitz.Whisky/Bottles"],
+            "wine": ["home/.wine"],
+            "tart": ["home/.tart/vms"],
+            "lume": ["home/.lume"],
+            "anka": [
+                "home/Library/Application Support/Veertu/Anka/vm_lib",
+                "home/Library/Application Support/Veertu/Anka/state_lib",
+                "home/Library/Application Support/Veertu/Anka/img_lib",
+            ],
+            "rancher-desktop": ["home/Library/Application Support/rancher-desktop/lima"],
+            "apple-container": ["home/Library/Application Support/com.apple.container"],
+            "genymotion": ["home/.Genymobile/Genymotion/deployed"],
+        ]
+        for path in places.values.joined() {
+            try directory.file("\(path)/org.example.machine/disk.img", bytes: 8_000)
+        }
+
+        let report = await SpaceInventory.scan(home: home, root: root, minimumSize: 1, measure: LeftoverScanner.walk)
+
+        let inside = directory.url.lastPathComponent + "/"
+        for (id, paths) in places {
+            let item = try #require(report.items.first { $0.id == id }, "no area \(id)")
+            let found = item.urls.map { url in
+                let path = url.path(percentEncoded: false).components(separatedBy: inside).last ?? ""
+                return path.hasSuffix("/") ? String(path.dropLast()) : path
+            }
+            #expect(item.category == .virtualMachines && item.isReadOnly, "\(id)")
+            #expect(Set(found) == Set(paths), "\(id)")
+        }
+        let commands = Dictionary(uniqueKeysWithValues: report.items.map { ($0.id, $0.commands) })
+        #expect(commands["tart"] == ["tart delete <name>"])
+        #expect(commands["lume"] == ["lume delete <name>", "lume prune"])
+        #expect(commands["anka"] == ["anka delete <name>", "anka delete --cache"])
+        #expect(commands["apple-container"] == [
+            "container system df", "container prune", "container image prune --all", "container volume prune",
+        ])
+    }
+
+    @Test func theAppsThatMakeMachinesAndBottlesManageTheirAreas() throws {
+        let managed = [
+            "virtualbuddy": "codes.rambo.VirtualBuddy",
+            "crossover": "com.codeweavers.CrossOver",
+            "whisky": "com.isaacmarovitz.Whisky",
+            "rancher-desktop": "io.rancherdesktop.app",
+            "genymotion": "com.genymobile.genymotion",
+        ]
+        for (id, identifier) in managed {
+            let area = try #require(SpaceInventory.definitions.first { $0.id == id })
+            #expect(area.managedBy?.identifiers == [identifier], "\(id)")
+            #expect(area.managedBy?.leftBehind == .holdsVirtualMachines, "\(id)")
+        }
+        #expect(Set(SpaceInventory.managedAreaIdentifiers) == Set(managed.keys).union(["simulators"]))
+    }
+
+    @Test func knowsWhetherAnAppThatManagesAnAreaIsOnThisMac() {
+        let gone = SpaceInventory.ManagingApps(identifiers: ["org.example.gone"], leftBehind: .holdsSimulators)
+        let finder = SpaceInventory.ManagingApps(
+            identifiers: ["org.example.gone", "com.apple.finder"], leftBehind: .holdsSimulators
+        )
+
+        #expect(!gone.oneIsOnThisMac)
+        #expect(finder.oneIsOnThisMac)
+        #expect(finder.includes("COM.apple.Finder"))
+        #expect(!finder.includes("com.apple.finder.helper"))
+        #expect(!finder.includes(nil))
+    }
+
+    @Test func saysWhenTheAppsThatManageAnAreaAreGone() {
+        let home = URL(filePath: "/Users/someone/", directoryHint: .isDirectory)
+        func item(managedBy identifiers: [String]?) -> SpaceItem {
+            let area = SpaceInventory.Definition(
+                id: "machines",
+                category: .virtualMachines,
+                paths: ["Machines"],
+                handling: .readOnly,
+                managedBy: identifiers.map { .init(identifiers: $0, leftBehind: .holdsWorkMadeWithTheApp) }
+            )
+            let size = SizeTotal(known: 0, isComplete: true)
+            return SpaceInventory.item(area, urls: [], size: size, home: home, root: home, simctlRuntimeHelp: nil)
+        }
+
+        #expect(item(managedBy: ["org.example.gone"]).managingAppIsMissing)
+        #expect(!item(managedBy: ["com.apple.finder"]).managingAppIsMissing)
+        #expect(!item(managedBy: nil).managingAppIsMissing)
+    }
+
+    @Test func anAreaNothingLooksAfterIsRemovedByHand() {
+        let home = URL(filePath: "/Users/someone/", directoryHint: .isDirectory)
+        let gone = SpaceInventory.Definition(
+            id: "machines", category: .virtualMachines, paths: ["Machines"], handling: .readOnly,
+            managedBy: .init(identifiers: ["org.example.gone"], leftBehind: .holdsWorkMadeWithTheApp)
+        )
+        let size = SizeTotal(known: 0, isComplete: true)
+
+        let byHand = Set(SpaceInventory.definitions.filter(\.isRemovedByHand).map(\.id))
+        let item = SpaceInventory.item(gone, urls: [], size: size, home: home, root: home, simctlRuntimeHelp: nil)
+
+        #expect(byHand == ["homebrew-data", "tex-live", "dotnet-sdks", "wine"])
+        #expect(item.isRemovedByHand, "an area whose apps are gone is cleared in Finder")
+    }
+
+    @Test func showsRustToolchainsAndAndroidNDKsForTheirToolsToRemove() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc", bytes: 400_000)
+        try directory.file("Library/Android/sdk/ndk/27.2.12479018/source.properties", bytes: 400_000)
+
+        let report = await SpaceInventory.scan(
+            home: directory.url, root: directory.url, minimumSize: 100_000, measure: LeftoverScanner.walk
+        )
+
+        let rust = try #require(report.items.first { $0.id == "rust-toolchains" })
+        #expect(rust.isReadOnly)
+        #expect(rust.commands == ["rustup toolchain list", "rustup toolchain uninstall <name>"])
+        let ndk = try #require(report.items.first { $0.id == "android-ndk" })
+        #expect(ndk.isReadOnly)
+        #expect(ndk.commands == [#"~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager --uninstall "ndk;<version>""#])
+    }
+
+    @Test func colimaIsToldToDeleteItsDataDiskToo() throws {
+        let colima = try #require(SpaceInventory.definitions.first { $0.id == "colima" })
+        #expect(colima.commands.map(\.line) == ["colima delete --data"])
+    }
+
+    @Test func onlyAnAreaPeelLeavesAloneGivesCommands() {
+        for definition in SpaceInventory.definitions where !definition.commands.isEmpty {
+            #expect(definition.handling == .readOnly, "\(definition.id)")
+        }
+    }
+
+    /// Space says it leaves a read only area to the app that made it, so nothing in one is what Developer
+    /// selects for the person to remove.
+    @Test func noReadOnlyAreaHoldsWhatDeveloperSelects() {
+        let selected: Set<DeveloperEnvironment.ContentKind> = [.buildData, .downloads, .cache, .logs]
+        for area in SpaceInventory.definitions where area.handling == .readOnly {
+            for path in area.paths {
+                for tool in DeveloperCaches.definitions {
+                    for folder in tool.folders where selected.contains(folder.kind) {
+                        let isInside = PathComponents.isPath(folder.path, atOrInside: path)
+                        #expect(!isInside, "\(area.id) holds \(folder.path)")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Space empties a folder's contents and never the folder, whose name macOS expects to find. So the guard
+    /// must refuse each folder and allow a plain item inside it, or the row would be offered and free nothing.
+    @Test func whatSpaceCanEmptyIsRefusedItselfAndAllowedInside() throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let root = directory.url.appending(path: "root", directoryHint: .isDirectory)
+        let guardian = RemovalGuard(environment: SearchEnvironment(homeDirectory: home, rootDirectory: root))
+        var checked = 0
+
+        for definition in SpaceInventory.definitions where definition.handling == .trash {
+            for path in definition.paths {
+                let folder = path.hasPrefix("/")
+                    ? root.appending(path: String(path.dropFirst()), directoryHint: .isDirectory)
+                    : home.appending(path: path, directoryHint: .isDirectory)
+                #expect(!guardian.allowsRemoval(of: folder), "\(definition.id)'s \(path) could be moved whole")
+                #expect(
+                    guardian.allowsRemoval(of: folder.appending(path: "com.example.app", directoryHint: .isDirectory)),
+                    "the guard refuses what is inside \(definition.id)'s \(path), so emptying it frees nothing"
+                )
+                checked += 1
+            }
+        }
+        #expect(checked > 0, "nothing in the table can be emptied, so the test proves nothing")
+    }
+
+    @Test func knowsNoPurgeableSpaceForAVolumeItCannotRead() {
+        #expect(DiskSpace.purgeable(of: URL(filePath: "/Volumes/org.example.missing")) == nil)
+        #expect(DiskSpace.purgeable(of: .homeDirectory) != nil)
+    }
+
+    /// Scanning the real Mac must work and change nothing. It walks the real home folder, so it runs only when
+    /// asked for (`PEEL_TEST_THIS_MAC=1`).
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["PEEL_TEST_THIS_MAC"] != nil))
+    func measuresThisMacWithoutComplaining() async {
+        let report = await SpaceInventory.scan()
+        let disk = await DiskSpace.read()
+        #expect(disk.storage.total > 0)
+        #expect(disk.storage.free <= disk.storage.total)
+        #expect((disk.purgeable ?? 0) <= disk.storage.total)
+        #expect(report.snapshots?.allSatisfy { !$0.name.isEmpty } == true)
+        #expect(report.items.allSatisfy { !$0.urls.isEmpty })
+    }
+}

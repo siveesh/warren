@@ -1,0 +1,1433 @@
+import Foundation
+import Synchronization
+@testable import PeelCore
+import PeelPrivileged
+import Testing
+
+struct HomebrewTests {
+    @Test func takesThePrefixAndTheCellarHomebrewAnswers() {
+        let installation = Homebrew.installation(
+            versionAnswer: "Homebrew 7.0.9\n", prefixAnswer: "/usr/local\n", cellarAnswer: "/usr/local/Homebrew/Cellar\n"
+        )
+        #expect(installation?.version == "7.0.9")
+        #expect(installation?.prefix.path(percentEncoded: false) == "/usr/local")
+        #expect(installation?.cellar.path(percentEncoded: false) == "/usr/local/Homebrew/Cellar/")
+        #expect(installation?.caskroom.path(percentEncoded: false) == "/usr/local/Caskroom/")
+        #expect(installation?.repository.path(percentEncoded: false) == "/usr/local")
+        let withRepository = Homebrew.installation(
+            versionAnswer: "Homebrew 7.0.9\n", prefixAnswer: "/usr/local\n", cellarAnswer: "/usr/local/Cellar\n",
+            repositoryAnswer: "/usr/local/Homebrew\n"
+        )
+        #expect(withRepository?.repository.path(percentEncoded: false) == "/usr/local/Homebrew/")
+        #expect(Homebrew.installation(versionAnswer: "Homebrew 7.0.9\n", prefixAnswer: nil, cellarAnswer: "/c\n") == nil)
+        #expect(Homebrew.installation(versionAnswer: "Homebrew 7.0.9\n", prefixAnswer: "/p\n", cellarAnswer: "c\n") == nil)
+    }
+
+    @Test func countsAFormulaInstalledAsHomebrewDoes() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Cellar/exampletool/1.0/bin/exampletool")
+        try directory.file("Cellar/.hidden/1.0/bin/x")
+        try directory.directory("Cellar/emptied")
+        try directory.file("Cellar/stray")
+        try directory.file("elsewhere/rack/1.0/bin/x")
+        try directory.file("elsewhere/keg/bin/y")
+        let cellar = directory.url.appending(path: "Cellar", directoryHint: .isDirectory)
+        try FileManager.default.createSymbolicLink(
+            at: cellar.appending(path: "linked"), withDestinationURL: directory.url.appending(path: "elsewhere/rack")
+        )
+        try directory.directory("Cellar/kegged")
+        try FileManager.default.createSymbolicLink(
+            at: cellar.appending(path: "kegged/2.0"), withDestinationURL: directory.url.appending(path: "elsewhere/keg")
+        )
+
+        #expect(Homebrew.formulae(inCellar: cellar) == ["exampletool", "kegged"])
+        #expect(Homebrew.formulae(inCellar: directory.url.appending(path: "none", directoryHint: .isDirectory)) == [])
+    }
+
+    @Test(.permissionsHold) func formulaeAreNotKnownWhenTheCellarCannotBeListed() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Cellar/exampletool/1.0/bin/exampletool")
+        try directory.setPermissions(0, of: "Cellar")
+        defer { try? directory.setPermissions(0o755, of: "Cellar") }
+
+        #expect(Homebrew.formulae(inCellar: directory.url.appending(path: "Cellar", directoryHint: .isDirectory)) == nil)
+    }
+
+    @Test func aCommandForTerminalKeepsTheFormulaeTheExclusionsCover() {
+        #expect(Homebrew.terminalCommand("brew upgrade --cask example", keeping: []) == "brew upgrade --cask example")
+        #expect(
+            Homebrew.terminalCommand("brew uninstall --cask example", keeping: ["openssl@3", "o'dd"])
+                == "HOMEBREW_NO_CLEANUP_FORMULAE='openssl@3,o'\\''dd' brew uninstall --cask example"
+        )
+    }
+
+    @Test func namesSbinBesideBinForEveryPlaceHomebrewInstallsItself() throws {
+        let path = try #require(Homebrew.environment(autoUpdate: false)["PATH"])
+        let folders = path.split(separator: ":").map(String.init)
+        for prefix in Homebrew.usualPrefixes {
+            #expect(folders.contains("/\(prefix)/bin"))
+            #expect(folders.contains("/\(prefix)/sbin"))
+        }
+    }
+
+    @Test func givesHomebrewTheHomeWithoutTheSlashAtItsEnd() {
+        let home = URL(filePath: "/Users/someone/", directoryHint: .isDirectory)
+        #expect(Homebrew.environment(autoUpdate: false, home: home)["HOME"] == "/Users/someone")
+    }
+
+    @Test func asksForEachLineAsItGoesExceptOfTheHealthCheck() {
+        #expect(Homebrew.environment(autoUpdate: false)["CI"] == "1")
+        // `brew doctor` reads `CI` as a CI run and skips its check of the taps' branches (`diagnostic.rb`).
+        #expect(Homebrew.environment(autoUpdate: false, writesLinesAsTheyGo: false)["CI"] == nil)
+    }
+
+    @Test(.permissionsHold) func knowsWhichFolderStopsThisAccountChangingHomebrew() throws {
+        let directory = try TemporaryDirectory()
+        let repository = try directory.directory("homebrew")
+        let cellar = repository.appending(path: "Cellar", directoryHint: .isDirectory)
+
+        #expect(Homebrew.unwritableFolder(cellar: cellar, repository: repository) == nil, "a Cellar not made yet")
+        try directory.directory("homebrew/Cellar")
+        #expect(Homebrew.unwritableFolder(cellar: cellar, repository: repository) == nil)
+        try directory.setPermissions(0o555, of: cellar)
+        #expect(Homebrew.unwritableFolder(cellar: cellar, repository: repository) == cellar)
+        try directory.setPermissions(0o755, of: cellar)
+        try directory.setPermissions(0o555, of: repository)
+        defer { try? directory.setPermissions(0o755, of: repository) }
+        #expect(Homebrew.unwritableFolder(cellar: cellar, repository: repository) == repository)
+    }
+
+    @Test(.permissionsHold) func saysWhoseFolderStopsThisAccountAndWhatGivesItBack() throws {
+        let directory = try TemporaryDirectory()
+        let repository = try directory.directory("homebrew")
+        let path = PathPattern.comparablePath(of: repository)
+        let installation = HomebrewInstallation(version: "7.0.0", prefix: repository, repository: repository)
+        #expect(installation.judgedForThisAccount().mayBeChangedByThisAccount)
+        try directory.setPermissions(0o555, of: repository)
+        defer { try? directory.setPermissions(0o755, of: repository) }
+
+        let own = try #require(installation.judgedForThisAccount().unwritable)
+        #expect(own.owner == .thisAccount)
+        #expect(own.command == "chmod u+w '\(path)'")
+        let another = try #require(installation.judgedForThisAccount(user: getuid() + 1).unwritable)
+        #expect(another.owner == .another(NSUserName()))
+        #expect(another.command == nil)
+        let system = URL(filePath: "/usr/share", directoryHint: .isDirectory)
+        let roots = HomebrewInstallation(version: "7.0.0", prefix: system, repository: system)
+        let root = try #require(roots.judgedForThisAccount().unwritable)
+        #expect(root.owner == .root)
+        #expect(root.command == "sudo chown -R '\(NSUserName())' '/usr/share'")
+    }
+
+    @Test func aDisabledPackageWaitsForNoUpgrade() {
+        func package(_ stage: HomebrewRetirement.Stage?) -> HomebrewPackage {
+            HomebrewPackage(
+                name: "tool", kind: .cask, installedVersion: "1.0", latestVersion: "2.0", isOutdated: true,
+                retirement: stage.map { HomebrewRetirement(stage: $0, reason: nil, disableDate: nil, replacement: nil) }
+            )
+        }
+
+        #expect(package(nil).waitsForAnUpgrade && package(nil).joinsUpgradeAll)
+        #expect(package(.deprecated).waitsForAnUpgrade && package(.deprecated).joinsUpgradeAll)
+        #expect(!package(.disabled).waitsForAnUpgrade)
+        #expect(!package(.disabled).joinsUpgradeAll)
+        #expect(package(.disabled).whyHomebrewCannotCompare == .disabled)
+        #expect(UpdateChecker.homebrewStatus(of: package(.disabled), appVersion: "1.0", at: .now) == nil)
+    }
+
+    @Test func anExcludedPackageIsLeftOutOfUpgradeAll() throws {
+        let directory = try TemporaryDirectory()
+        let app = try directory.directory("Applications/Sample.app")
+        try directory.file("Applications/Other.app/Contents/Info.plist")
+        func cask(_ name: String) -> HomebrewPackage {
+            HomebrewPackage(name: name, kind: .cask, installedVersion: "1.0", latestVersion: "2.0", isOutdated: true)
+        }
+        let sample = InstalledApp(url: app, bundleIdentifier: "org.example.sample", name: "Sample")
+        let casks = [cask("sample"), cask("other")]
+        let appsOf = { (package: HomebrewPackage) in package.name == "sample" ? [sample] : [] }
+        let names = { (exclusions: Exclusions) in
+            exclusions.joiningUpgradeAll(casks, appsOf: appsOf, installation: nil).map(\.name)
+        }
+
+        #expect(names(Exclusions()) == ["sample", "other"])
+        #expect(names(Exclusions(paths: [app])) == ["other"])
+        #expect(names(Exclusions(bundleIdentifiers: ["org.example.sample"])) == ["other"])
+        #expect(names(.unreadable(because: nil)).isEmpty)
+        #expect(names(.notYetRead).isEmpty)
+    }
+
+    @Test func anAnswerForTheListStandsUntilWhatItGoesByChanges() throws {
+        let directory = try TemporaryDirectory()
+        let installation = HomebrewInstallation(version: "7.0.0", prefix: directory.url, repository: directory.url)
+        let package = HomebrewPackage(name: "sample", kind: .cask)
+        let excluded = Exclusions(bundleIdentifiers: ["org.example.kept"])
+        var answers = ExclusionAnswers()
+        func answer(_ exclusions: Exclusions, apps: [InstalledApp] = []) -> Bool? {
+            answers.answer(exclusions, of: package, apps: apps, installation: installation)
+        }
+
+        #expect(answer(excluded) == false)
+        try directory.directory("Caskroom/sample/1.0/org.example.kept")
+        #expect(answer(excluded) == false, "the disk was read again")
+        #expect(excluded.excludes(package, apps: [], installation: installation) == true)
+
+        let app = InstalledApp(url: try directory.directory("Sample.app"), bundleIdentifier: "org.example.s", name: "Sample")
+        #expect(answer(excluded, apps: [app]) == true, "another app was answered as the one before")
+        #expect(answer(Exclusions()) == false, "other exclusions were answered as the ones before")
+    }
+
+    @Test func peelsOwnCaskIsLeftToPeelsOwnUpdates() {
+        func cask(quitting identifiers: [String] = [], apps: [String] = []) -> HomebrewPackage {
+            HomebrewPackage(
+                name: "peel", kind: .cask, installedVersion: "1.0", latestVersion: "2.0", isOutdated: true,
+                appTargets: apps, quitIdentifiers: identifiers
+            )
+        }
+        let peels = cask(quitting: ["com.tuguidragos.Peel"])
+        let running = cask(apps: [Bundle.main.bundleURL.path(percentEncoded: false)])
+        let other = cask(quitting: ["org.example.app"], apps: ["/Applications/Example.app"])
+
+        #expect(peels.isPeelItself && running.isPeelItself && !other.isPeelItself)
+        #expect(peels.waitsForAnUpgrade)
+        #expect(!peels.joinsUpgradeAll, "Upgrade All would have Peel quit itself first")
+        #expect(!running.joinsUpgradeAll)
+        #expect(other.joinsUpgradeAll)
+    }
+
+    @Test func knowsWhenSudoAskedForAPassword() {
+        let sudo = """
+            ==> Running installer for zoom with sudo; the password may be necessary.
+            sudo: a terminal is required to read the password; either use the -S option to read from standard input \
+            or configure an askpass helper
+            sudo: a password is required
+            Error: Failure while executing; `/usr/bin/sudo -u root -E -- /usr/sbin/installer -pkg zoom.pkg` exited with 1.
+            """
+        let network = """
+            curl: (6) Could not resolve host: formulae.brew.sh
+            Error: Failure while executing; `/usr/bin/curl --disable --globoff` exited with 6.
+            """
+        let build = """
+            Error: An exception occurred within a child process:
+              BuildError: Failed executing: make install
+            """
+
+        #expect(Homebrew.askedForAPassword(in: sudo))
+        #expect(!Homebrew.askedForAPassword(in: network))
+        #expect(!Homebrew.askedForAPassword(in: build))
+    }
+
+    /// `man brew`: unless `HOMEBREW_NO_INSTALL_CLEANUP` is set, `brew upgrade` runs `brew cleanup` by itself, for
+    /// the upgraded packages and every 30 days for all of them, which deletes old versions and downloads for good.
+    /// Peel deletes those only through Clean Up, which asks first, so no call it makes may clean up on its own.
+    @Test func anUpgradeNeverCleansUpOnItsOwn() {
+        for autoUpdate in [true, false] {
+            #expect(Homebrew.environment(autoUpdate: autoUpdate)["HOMEBREW_NO_INSTALL_CLEANUP"] == "1")
+        }
+    }
+
+    @Test func eachCleanUpAsksHomebrewForWhatItsHelpDocuments() async throws {
+        #expect(Homebrew.Cleanup.standard.arguments == ["cleanup"])
+        #expect(Homebrew.Cleanup.olderThan(days: 30).arguments == ["cleanup", "--prune=30"])
+        #expect(Homebrew.Cleanup.everyDownload.arguments == ["cleanup", "--scrub"])
+        #expect(Homebrew.repairTapsArguments == ["tap", "--repair"])
+    }
+
+    @Test(.homebrewOnThisMac) func homebrewsHelpDocumentsEachCleanUpOption() async throws {
+        // No time limit: at a low priority on a busy machine Ruby alone can outlast one, and what this checks is
+        // Homebrew's words.
+        let cleanup = try await Homebrew.execute(["cleanup", "--help"], autoUpdate: false, timeout: nil).transcript()
+        #expect(cleanup.contains("--prune") && cleanup.contains("--scrub"))
+        let tap = try await Homebrew.execute(["tap", "--help"], autoUpdate: false, timeout: nil).transcript()
+        #expect(tap.contains("--repair"))
+    }
+
+    @Test func whatHomebrewWritesIsShownInTheOrderItWroteIt() async throws {
+        let directory = try TemporaryDirectory()
+        let brew = try directory.file("bin/brew", contents: Data("""
+            #!/usr/bin/ruby
+            if ENV["CI"]
+              $stdout.sync = true
+              $stderr.sync = true
+            end
+            puts "==> Upgrading example"
+            $stderr.puts "Error: It seems the App source is not there."
+            puts "==> Summary"
+            exit 1
+            """.utf8))
+        try directory.setPermissions(0o755, of: brew)
+
+        let shown = try await Homebrew.execute(
+            ["upgrade"], autoUpdate: false, timeout: 30, inWritingOrder: true, executable: brew
+        )
+        let read = try await Homebrew.execute(["upgrade"], autoUpdate: false, timeout: 30, executable: brew)
+
+        #expect(shown.output == "==> Upgrading example\nError: It seems the App source is not there.\n==> Summary\n")
+        #expect(read.standardOutput == "==> Upgrading example\n==> Summary\n")
+        #expect(read.standardError == "Error: It seems the App source is not there.\n")
+    }
+
+    @Test func readsWhenHomebrewLastCheckedForNewVersions() throws {
+        let repository = try TemporaryDirectory()
+        let fetchHead = try repository.file(".git/FETCH_HEAD", contents: Data("main of https://github.com/Homebrew/brew\n".utf8))
+        let checked = Date(timeIntervalSince1970: 1_792_315_250)
+        let path = fetchHead.path(percentEncoded: false)
+        try FileManager.default.setAttributes([.modificationDate: checked], ofItemAtPath: path)
+        #expect(Homebrew.lastUpdateCheck(inRepository: repository.url) == checked)
+
+        let linked = try TemporaryDirectory()
+        try linked.directory(".git")
+        try FileManager.default.createSymbolicLink(at: linked.url.appending(path: ".git/FETCH_HEAD"), withDestinationURL: fetchHead)
+        #expect(Homebrew.lastUpdateCheck(inRepository: linked.url) == nil, "Homebrew's `find -type f` passes over a link")
+
+        let folder = try TemporaryDirectory()
+        try folder.directory(".git/FETCH_HEAD")
+        #expect(Homebrew.lastUpdateCheck(inRepository: folder.url) == nil)
+        let empty = try TemporaryDirectory()
+        #expect(Homebrew.lastUpdateCheck(inRepository: empty.url) == nil)
+    }
+
+    @Test func namesASettingsFileHomebrewRunFromPeelDoesNotRead() throws {
+        let settings = try TemporaryDirectory()
+        let system = settings.url.appending(path: "etc/homebrew/brew.env")
+        let prefix = settings.url.appending(path: "prefix", directoryHint: .isDirectory)
+        let unread = { (home: URL) in Homebrew.unreadSettingsFile(home: home, system: system, prefix: prefix) }
+        let home = try TemporaryDirectory()
+        #expect(unread(home.url) == nil)
+        try home.directory(".config/homebrew/brew.env")
+        #expect(unread(home.url) == nil, "a folder is no settings file")
+
+        let other = try TemporaryDirectory()
+        let file = try other.file(".config/homebrew/brew.env", contents: Data("https_proxy=http://proxy.example:8080\n".utf8))
+        #expect(unread(other.url)?.path(percentEncoded: false) == file.path(percentEncoded: false))
+        let config = other.url.appending(path: ".config", directoryHint: .isDirectory).path(percentEncoded: false)
+        try settings.file("prefix/etc/homebrew/brew.env", contents: Data("HOMEBREW_XDG_CONFIG_HOME=\(config)\n".utf8))
+        #expect(unread(other.url) == nil, "Homebrew's own settings send it to that file")
+    }
+
+    @Test func datesTheLastCheckByTheDefinitionsHomebrewReadsFromItsAPI() throws {
+        let repository = try TemporaryDirectory()
+        let fetchHead = try repository.file(".git/FETCH_HEAD", contents: Data("main\n".utf8))
+        let fetched = Date(timeIntervalSince1970: 1_792_315_250)
+        let date = { (when: Date, file: URL) in
+            let path = file.path(percentEncoded: false)
+            try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: path)
+        }
+        try date(fetched, fetchHead)
+        let cache = try TemporaryDirectory()
+        let packages = try cache.file("api/internal/packages.arm64_tahoe.jws.json", bytes: 64)
+        let confirmed = fetched.addingTimeInterval(7 * 24 * 60 * 60)
+        try date(confirmed, packages)
+        let check = { (readsTheTaps: Bool) in
+            Homebrew.lastUpdateCheck(inRepository: repository.url, cache: cache.url, readsTheTaps: readsTheTaps)
+        }
+
+        #expect(check(false) == confirmed)
+        #expect(check(true) == fetched)
+        let older = fetched.addingTimeInterval(-6 * 24 * 60 * 60)
+        try date(older, packages)
+        #expect(check(false) == older, "a fetch of Homebrew's own code that left its definitions as they were")
+        let pinned = Calendar(identifier: .gregorian).date(from: DateComponents(year: 1970, month: 1, day: 1))
+        try date(try #require(pinned), packages)
+        #expect(check(false) == fetched, "a download Homebrew couldn't verify")
+    }
+
+    @Test func datesTheLastCheckByTheSettingsFilesBrewReadsForPeel() async throws {
+        let folder = try TemporaryDirectory()
+        let fetchHead = try folder.file("repository/.git/FETCH_HEAD", contents: Data("main\n".utf8))
+        let packages = try folder.file("cache/api/internal/packages.arm64_tahoe.jws.json", bytes: 64)
+        let fetched = Date(timeIntervalSince1970: 1_792_315_250)
+        for (when, file) in [(fetched, fetchHead), (fetched.addingTimeInterval(60 * 60), packages)] {
+            let path = file.path(percentEncoded: false)
+            try FileManager.default.setAttributes([.modificationDate: when], ofItemAtPath: path)
+        }
+        let settings = folder.url.appending(path: "settings", directoryHint: .isDirectory).path(percentEncoded: false)
+        try folder.file("prefix/etc/homebrew/brew.env", contents: Data("HOMEBREW_XDG_CONFIG_HOME=\(settings)\n".utf8))
+        try folder.file("settings/homebrew/brew.env", contents: Data("HOMEBREW_NO_INSTALL_FROM_API=1\n".utf8))
+        let answers = ["--repository": "repository", "--cache": "cache", "--prefix": "prefix"].mapValues {
+            folder.url.appending(path: $0, directoryHint: .isDirectory).path(percentEncoded: false)
+        }
+
+        let checked = await Homebrew.lastUpdateCheck(
+            home: folder.url.appending(path: "home", directoryHint: .isDirectory),
+            system: folder.url.appending(path: "etc/homebrew/brew.env")
+        ) { answers[$0.joined(separator: " ")] }
+
+        #expect(checked == fetched, "the person's settings, in the folder the prefix's file names, make it read its taps")
+    }
+
+    @Test func readsTheLastCheckOfTheHomebrewOnThisMac() async throws {
+        guard Homebrew.executableURL != nil else {
+            #expect(await Homebrew.lastUpdateCheck() == nil)
+            return
+        }
+        let answer = try await Homebrew.execute(["--repository"], autoUpdate: false, timeout: 30).answer()
+        let repository = try #require(Homebrew.folder(answering: answer))
+        let fetchHead = repository.appending(path: ".git/FETCH_HEAD").path(percentEncoded: false)
+        let attributes = try? FileManager.default.attributesOfItem(atPath: fetchHead)
+        let isAFile = attributes?[.type] as? FileAttributeType == .typeRegular
+        let fetched = isAFile ? attributes?[.modificationDate] as? Date : nil
+        let cache = try await Homebrew.execute(["--cache"], autoUpdate: false, timeout: 30).answer()
+        let confirmed = Homebrew.folder(answering: cache).map(Homebrew.definitionsChecks(inCache:)) ?? []
+        let read = await Homebrew.lastUpdateCheck()
+
+        #expect((read == nil) == (fetched == nil && confirmed.isEmpty))
+        if let read {
+            #expect(([fetched] + confirmed).compactMap(\.self).contains { abs(read.timeIntervalSince($0)) < 0.001 })
+        }
+    }
+
+    @Test(.homebrewWithItsDefinitions) func everyInstalledPackageCarriesHomebrewsLastCheck() async throws {
+        let read = await Homebrew.lastUpdateCheck()
+
+        #expect(try await Homebrew.installedPackages().allSatisfy { $0.lastUpdateCheck == read })
+    }
+
+    @Test func anUpgradeNeverWaitsForAnAnswer() {
+        for autoUpdate in [true, false] {
+            #expect(Homebrew.environment(autoUpdate: autoUpdate)["HOMEBREW_NO_ASK"] == "1")
+            #expect(Homebrew.environment(autoUpdate: autoUpdate)["HOMEBREW_NO_UPGRADE_QUIT_CASKS"] == "1")
+        }
+    }
+
+    @Test(.permissionsHold) func keepsNoListItCannotReadWhole() throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("Cellar/wget/1.25.0")
+        try directory.directory("Cellar/jq/1.8.1/kept/org.example.excluded")
+        let excludingWget = Exclusions(paths: [directory.url.appending(path: "Cellar/wget")])
+        let excludingAnApp = Exclusions(bundleIdentifiers: ["org.example.excluded"])
+        defer {
+            try? directory.setPermissions(0o755, of: "Cellar")
+            try? directory.setPermissions(0o755, of: "Cellar/jq/1.8.1")
+        }
+
+        let cellar = directory.url.appending(path: "Cellar")
+        try directory.setPermissions(0, of: "Cellar")
+        #expect(excludingWget.keptFormulae(inCellar: cellar) == .failure(.init(folder: cellar)))
+        try directory.setPermissions(0o755, of: "Cellar")
+        try directory.setPermissions(0, of: "Cellar/jq/1.8.1")
+        let jq = cellar.appending(path: "jq", directoryHint: .isDirectory)
+        #expect(excludingAnApp.keptFormulae(inCellar: cellar) == .failure(.init(folder: jq)))
+        #expect(excludingWget.keptFormulae(inCellar: directory.url.appending(path: "Missing/Cellar")) == .success([]))
+    }
+
+    /// `brew cleanup` and the autoremove that `brew uninstall` runs delete formulae and their old versions for good,
+    /// so the formulae the exclusions cover are named in `HOMEBREW_NO_CLEANUP_FORMULAE`, which Homebrew's own
+    /// documentation says makes it refuse to clean up or autoremove them.
+    @Test func homebrewIsToldToKeepTheFormulaeTheExclusionsCover() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("Cellar/wget/1.25.0")
+        try directory.directory("Cellar/jq/1.8.1")
+        try directory.directory("Cellar/python@3.13/3.13.7")
+        let exclusions = Exclusions(paths: [
+            directory.url.appending(path: "Cellar/jq"), directory.url.appending(path: "Cellar/python@3.13/3.13.7"),
+        ])
+
+        let kept = try exclusions.keptFormulae(inCellar: directory.url.appending(path: "Cellar")).get()
+        #expect(kept == ["jq", "python@3.13"])
+        let unreadable = Exclusions.unreadable(because: nil)
+        #expect(unreadable.keptFormulae(inCellar: directory.url.appending(path: "Cellar")) == .success(["jq", "python@3.13", "wget"]))
+
+        let attempt = try await Homebrew.execute(
+            ["-c", "printf %s \"$HOMEBREW_NO_CLEANUP_FORMULAE\""], autoUpdate: false, keeping: kept, timeout: 10,
+            executable: URL(filePath: "/bin/sh")
+        )
+        #expect(attempt.standardOutput == "jq,python@3.13")
+    }
+
+    /// `bin/brew` reads its `brew.env` files after Peel's environment, and one can replace the list, so Peel asks
+    /// `brew config` what is in effect before it lets Homebrew delete anything.
+    @Test func readsWhichFormulaeHomebrewKeepsFromItsOwnSettings() {
+        let config = """
+        HOMEBREW_VERSION: 7.0.4
+        HOMEBREW_NO_CLEANUP_FORMULAE: jq,python@3.13
+        HOMEBREW_NO_ANALYTICS: set
+        """
+        #expect(Homebrew.keptFormulae(inConfig: config) == ["jq", "python@3.13"])
+        #expect(Homebrew.keptFormulae(inConfig: "HOMEBREW_VERSION: 7.0.4\n").isEmpty)
+    }
+
+    /// Formulae and casks are upgraded in two calls, and the second is made even when the first never finished,
+    /// as when it ran out of time: the casks were otherwise never tried, and the report left them out.
+    @Test func upgradesTheCasksEvenWhenTheFormulaeNeverFinished() async {
+        let packages = [
+            HomebrewPackage(name: "wget", kind: .formula, installedVersion: "1.0"),
+            HomebrewPackage(name: "firefox", kind: .cask, installedVersion: "1.0"),
+        ]
+        let asked = Mutex<[String]>([])
+
+        do {
+            _ = try await Homebrew.upgrade(packages) { arguments throws(Homebrew.CommandFailure) in
+                asked.withLock { $0.append(arguments[1]) }
+                guard arguments[1] == "--cask" else { throw Homebrew.CommandFailure(output: "The formulae ran out of time.") }
+                return Homebrew.Attempt(status: 0, standardOutput: "firefox was upgraded.\n", standardError: "")
+            }
+            Issue.record("a batch that never finished read as a success")
+        } catch {
+            #expect(error.output == "The formulae ran out of time.\nfirefox was upgraded.\n")
+        }
+        #expect(asked.withLock { $0 } == ["--formula", "--cask"])
+    }
+
+    @Test func aPackagesNameIsOneWordOfACommandForTerminal() {
+        #expect(Homebrew.lastWord(naming: "postgresql@16") == "postgresql@16")
+        #expect(Homebrew.lastWord(naming: "example/tap/gtk+3") == "example/tap/gtk+3")
+        #expect(Homebrew.lastWord(naming: "example/tap/a;b") == "'example/tap/a;b'")
+        #expect(Homebrew.lastWord(naming: "a'b") == #"'a'\''b'"#)
+        #expect(Homebrew.lastWord(naming: "-h") == "-- -h")
+    }
+
+    @Test func aPackagesNameReachesBrewAsANameWhateverItBeginsWith() async throws {
+        let packages = [HomebrewPackage(name: "--greedy", kind: .cask, installedVersion: "1.0")]
+        let asked = Mutex<[[String]]>([])
+
+        _ = try await Homebrew.upgrade(packages) { arguments throws(Homebrew.CommandFailure) in
+            asked.withLock { $0.append(arguments) }
+            return Homebrew.Attempt(status: 0, standardOutput: "", standardError: "")
+        }
+
+        #expect(asked.withLock { $0 } == [["upgrade", "--cask", "--", "--greedy"]])
+    }
+
+    /// Homebrew reads its own `brew.env` files after Peel's environment, and a line there with no value, such as
+    /// `HOMEBREW_NO_INSTALL_CLEANUP=`, turns Peel's setting off (`bin/brew` and `env_config.rb`, 7.0.4). `brew config`
+    /// lists what is in effect: these are its answers in Peel's environment with such a file, as it wrote them.
+    @Test func readsWhatHomebrewsOwnSettingsUndo() {
+        let plain = """
+        HOMEBREW_VERSION: 7.0.4-17-g2f1c682
+        HOMEBREW_PREFIX: /opt/homebrew
+        HOMEBREW_NO_ANALYTICS: set
+        HOMEBREW_NO_AUTO_UPDATE: set
+        HOMEBREW_NO_COLOR: set
+        HOMEBREW_NO_ENV_HINTS: set
+        HOMEBREW_NO_INSTALL_CLEANUP: set
+        """
+        let emptied = """
+        HOMEBREW_VERSION: 7.0.4-17-g2f1c682
+        HOMEBREW_PREFIX: /opt/homebrew
+        HOMEBREW_NO_COLOR: set
+        HOMEBREW_NO_ENV_HINTS: set
+        """
+        let forced = plain.replacingOccurrences(of: "HOMEBREW_NO_ANALYTICS", with: "HOMEBREW_FORCE_API_AUTO_UPDATE: set\nHOMEBREW_NO_ANALYTICS")
+
+        #expect(Homebrew.Overrides(config: plain).isEmpty)
+        #expect(Homebrew.Overrides(config: emptied) == [.cleansUp, .sendsAnalytics, .updatesItself])
+        #expect(Homebrew.Overrides(config: forced) == [.updatesItself])
+        #expect(Homebrew.Overrides(config: plain + "\nHOMEBREW_NO_AUTOREMOVE: set") == [.keepsDependencies])
+        #expect(Homebrew.Overrides(config: plain + "\nHOMEBREW_NO_AUTOREMOVE: false").isEmpty)
+    }
+
+    /// A stop is the person's: once the formulae were stopped, the casks are not started.
+    @Test func aStoppedUpgradeStartsNothingMore() async {
+        let packages = [
+            HomebrewPackage(name: "wget", kind: .formula, installedVersion: "1.0"),
+            HomebrewPackage(name: "firefox", kind: .cask, installedVersion: "1.0"),
+        ]
+        let asked = Mutex<[String]>([])
+
+        let run = Task { () -> String? in
+            do throws(Homebrew.CommandFailure) {
+                _ = try await Homebrew.upgrade(packages) { arguments throws(Homebrew.CommandFailure) in
+                    asked.withLock { $0.append(arguments[1]) }
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    throw Homebrew.CommandFailure(output: "Stopped before it finished.")
+                }
+                return nil
+            } catch {
+                return error.output
+            }
+        }
+
+        #expect(await run.value == "Stopped before it finished.\n")
+        #expect(asked.withLock { $0 } == ["--formula"])
+    }
+
+    /// Homebrew writes warnings to stderr and still exits 0, for example for a formula from a tap that uses a
+    /// deprecated method. So the answer is read from stdout alone: JSON with a warning after it is not JSON.
+    @Test func readsAnAnswerFromWhatWasPrintedAsTheAnswer() throws {
+        let json = #"{"formulae": [], "casks": [{"token": "sample", "installed": "2.1.0", "version": "2.1.0", "outdated": false}]}"#
+        let warned = Homebrew.Attempt(status: 0, standardOutput: json, standardError: "Warning: Calling plist_options is deprecated!\n")
+
+        #expect(try Homebrew.parseInstalled(Data(warned.answer().utf8))?.map(\.name) == ["sample"])
+        #expect(try warned.transcript().hasSuffix("is deprecated!\n"), "what the user is shown keeps the warning")
+
+        let failed = Homebrew.Attempt(status: 1, standardOutput: "", standardError: "Error: No such keg\n")
+        #expect(throws: Homebrew.CommandFailure.self) { try failed.answer() }
+        #expect(throws: Homebrew.CommandFailure.self) { try failed.transcript() }
+    }
+
+    @Test func aBrewThatFailsWithoutPrintingAnythingLeavesNoWords() {
+        let silent = Homebrew.Attempt(status: 1, standardOutput: "", standardError: "\n")
+        let failure = #expect(throws: Homebrew.CommandFailure.self) { try silent.answer() }
+        #expect(failure?.output == nil)
+        #expect(Homebrew.CommandFailure(output: " \t\n").output == nil)
+        #expect(Homebrew.CommandFailure(output: "Error: No such keg\n").output == "Error: No such keg\n")
+    }
+
+    @Test func anUpgradeThatFailedWithoutAWordAddsNoEmptyLine() async {
+        let packages = [
+            HomebrewPackage(name: "wget", kind: .formula, installedVersion: "1.0"),
+            HomebrewPackage(name: "firefox", kind: .cask, installedVersion: "1.0"),
+        ]
+        do {
+            _ = try await Homebrew.upgrade(packages) { arguments throws(Homebrew.CommandFailure) in
+                guard arguments[1] == "--cask" else { throw Homebrew.CommandFailure(output: "") }
+                return Homebrew.Attempt(status: 0, standardOutput: "firefox was upgraded.\n", standardError: "")
+            }
+            Issue.record("a batch that failed read as a success")
+        } catch {
+            #expect(error.output == "firefox was upgraded.\n")
+        }
+    }
+
+    @Test func readsWhatACaskPlacesAndWhatItsUninstallStanzaRemoves() throws {
+        let json = """
+        {"formulae": [], "casks": [{"token": "sample", "version": "1", "outdated": false, "artifacts": [
+          {"uninstall": [{"quit": "org.example.sample", "trash": "~/Library/Application Support/Sample",
+                          "delete": ["/Library/Sample"], "rmdir": "/Library/Empty"}]},
+          {"app": ["Sample.app"], "target": "/Applications/Sample.app"},
+          {"binary": ["/Applications/Sample.app/Contents/MacOS/sample", {"target": "sample"}],
+           "target": "/opt/homebrew/bin/sample"},
+          {"font": ["Sample.ttf"], "target": "/Users/org.example/Library/Fonts/Sample.ttf"},
+          {"manpage": ["sample.1"], "target": "/opt/homebrew/share/man/man1/sample.1"},
+          {"zap": [{"trash": "~/Library/Application Support/SampleZap"}]}
+        ]}]}
+        """
+        let cask = try #require(Homebrew.parseInstalled(Data(json.utf8))?.first)
+
+        #expect(cask.appTargets == ["/Applications/Sample.app"])
+        #expect(cask.commandLinks == ["/opt/homebrew/bin/sample"])
+        #expect(cask.otherTargets == [
+            "/Users/org.example/Library/Fonts/Sample.ttf", "/opt/homebrew/share/man/man1/sample.1",
+        ])
+        #expect(cask.uninstallPatterns == ["~/Library/Application Support/Sample", "/Library/Sample", "/Library/Empty"])
+    }
+
+    /// Homebrew is the account's own: any of its programs can rewrite it. A command that only reads must not reach
+    /// what was given to Peel, while an upgrade or an uninstall, which the person asks for, replaces or removes apps
+    /// with Peel's App Management.
+    @Test(arguments: [(["info", "--json=v2", "--installed"], false), (["upgrade", "--cask", "sample"], true)])
+    func aHomebrewCommandAnswersForItselfUnlessItChangesApps(arguments: [String], changesApps: Bool) async throws {
+        let system = try #require(Subprocess.Responsibility.system)
+        let directory = try TemporaryDirectory()
+        let home = try directory.directory("home")
+        let started = directory.url.appending(path: "started")
+        let goOn = directory.url.appending(path: "go-on")
+        let brew = try directory.file("prefix/bin/brew", contents: Data("""
+            #!/bin/sh
+            echo $$ > \(started.path(percentEncoded: false).quotedForTheShell).new
+            /bin/mv \(started.path(percentEncoded: false).quotedForTheShell).new \(started.path(percentEncoded: false).quotedForTheShell)
+            while [ ! -e \(goOn.path(percentEncoded: false).quotedForTheShell) ]; do /bin/sleep 0.05; done
+
+            """.utf8))
+        try directory.setPermissions(0o755, of: brew)
+        let start = try ProgramStart(in: directory.url, started: started, goOn: goOn, system: system)
+        await Homebrew.$standIn.withValue(brew) {
+            async let attempt: Void = {
+                _ = try? await Homebrew.execute(
+                    arguments, autoUpdate: false, timeout: 120, home: home, changesApps: changesApps
+                )
+                start.runEnded()
+            }()
+
+            let answer = await start.answer
+            await attempt
+
+            #expect(answer != nil, "brew ended before it named itself")
+            #expect(answer.map { $0.responsible == $0.pid } == !changesApps)
+        }
+    }
+
+    @Test func aBrewChosenOutsideWhereHomebrewInstallsItselfChangesNothingAsPeel() async throws {
+        let directory = try TemporaryDirectory()
+        let home = try directory.directory("home")
+        let ran = directory.url.appending(path: "ran")
+        let brew = try directory.file("opt/brew/bin/brew", contents: Data("""
+            #!/bin/sh
+            /usr/bin/touch \(ran.path(percentEncoded: false).quotedForTheShell)
+
+            """.utf8))
+        try directory.setPermissions(0o755, of: brew)
+
+        await #expect(throws: Homebrew.CommandFailure(output: Homebrew.changesOnlyWhereHomebrewInstallsItself)) {
+            _ = try await Homebrew.execute(
+                ["upgrade", "--cask", "org.example.app"], autoUpdate: false, timeout: 60, executable: brew, home: home,
+                changesApps: true
+            )
+        }
+        #expect(ran.isMissing)
+        _ = try await Homebrew.execute(["info"], autoUpdate: false, timeout: 60, executable: brew, home: home)
+        #expect(!ran.isMissing)
+    }
+
+    @Test func homebrewsChangesGoToTerminalOnlyForABrewChosenElsewhere() {
+        #expect(!Homebrew.leavesChangesToTerminal(running: nil))
+        #expect(!Homebrew.leavesChangesToTerminal(running: URL(filePath: "/opt/homebrew/bin/brew")))
+        #expect(!Homebrew.leavesChangesToTerminal(running: URL(filePath: "/usr/local/bin/brew")))
+        #expect(Homebrew.leavesChangesToTerminal(running: URL(filePath: "/opt/brew/bin/brew")))
+        #expect(Homebrew.leavesChangesToTerminal(running: URL(filePath: "/opt/homebrew/bin/../../brew/bin/brew")))
+    }
+
+    @Test func aCommandForTerminalNamesABrewChosenElsewhereByItsPath() {
+        #expect(Homebrew.wordForTerminal(running: nil) == "brew")
+        #expect(Homebrew.wordForTerminal(running: URL(filePath: "/opt/homebrew/bin/brew")) == "brew")
+        #expect(Homebrew.wordForTerminal(running: URL(filePath: "/usr/local/bin/brew")) == "brew")
+        #expect(Homebrew.wordForTerminal(running: URL(filePath: "/opt/brew/bin/brew")) == "/opt/brew/bin/brew")
+        #expect(Homebrew.wordForTerminal(running: URL(filePath: "/opt/homebrew/bin/../../brew/bin/brew")) == "/opt/brew/bin/brew")
+        #expect(Homebrew.wordForTerminal(running: URL(filePath: "/Users/me/my brew/bin/brew")) == "'/Users/me/my brew/bin/brew'")
+    }
+
+    /// Read where the casks Homebrew knows are read, on a thread of Swift's pool, whose stack is small.
+    @Test func leavesOutWhatAStanzaNestsDeeperThanAnyCaskWrites() async throws {
+        let deep = String(repeating: "[", count: 400) + #""~/Library/Deep""# + String(repeating: "]", count: 400)
+        let json = """
+        {"formulae": [], "casks": [{"token": "sample", "version": "1", "outdated": false, "artifacts": [
+          {"zap": [{"trash": ["~/Library/Sample", \(deep)], "rmdir": [[["~/Library/Folder"]]]}]}
+        ]}]}
+        """
+
+        let packages = await Task.detached { Homebrew.parseInstalled(Data(json.utf8)) }.value
+
+        let cask = try #require(packages?.first)
+        #expect(cask.leftoverPatterns == ["~/Library/Sample"])
+        #expect(cask.emptyFolderPatterns == ["~/Library/Folder"])
+    }
+
+    @Test func parsesInstalledFormulaeAndCasks() throws {
+        let json = """
+        {
+          "formulae": [
+            {"name": "openssl@3", "desc": "Cryptography and SSL/TLS Toolkit", "homepage": "https://openssl-library.org",
+             "installed": [{"version": "3.5.2", "installed_on_request": false}], "versions": {"stable": "3.5.3"}, "revision": 2,
+             "outdated": true, "pinned": false, "dependencies": ["ca-certificates"]},
+            {"name": "bat", "full_name": "sharkdp/tap/bat", "desc": "Clone of cat(1)", "homepage": "https://github.com/sharkdp/bat",
+             "installed": [{"version": "0.26.1", "installed_on_request": true}], "versions": {"stable": "0.26.1"},
+             "outdated": false, "pinned": true, "dependencies": ["libgit2", "oniguruma"]}
+          ],
+          "casks": [
+            {"token": "sample", "desc": "A sample app", "homepage": "https://example.org/sample",
+             "installed": "2.1.0", "version": "2.1.0", "outdated": false}
+          ]
+        }
+        """
+        let packages = try #require(Homebrew.parseInstalled(Data(json.utf8)))
+
+        #expect(packages.map(\.id) == ["formula/bat", "formula/openssl@3", "cask/sample"])
+        let openssl = try #require(packages.first { $0.name == "openssl@3" })
+        #expect(openssl.isOutdated)
+        #expect(openssl.installedVersion == "3.5.2")
+        // The revision is part of the version Homebrew installs. Without it, an installed `1.11.1_4` would look
+        // newer than the latest `1.11.1`.
+        #expect(openssl.latestVersion == "3.5.3_2")
+        #expect(packages.first { $0.name == "bat" }?.latestVersion == "0.26.1")
+        #expect(!openssl.isInstalledOnRequest)
+        #expect(openssl.dependencies == ["ca-certificates"])
+        #expect(packages.first { $0.name == "bat" }?.isPinned == true)
+        #expect(packages.first { $0.name == "bat" }?.fullName == "sharkdp/tap/bat")
+        #expect(openssl.fullName == "openssl@3", "an older Homebrew says no full name, and the short one stands in")
+        #expect(packages.last?.kind == .cask)
+        #expect(packages.last?.installedVersion == "2.1.0")
+    }
+
+    /// A tap's definition can name any address as a package's homepage, and the Mac would open it with whatever app
+    /// claims its scheme, so only a web page is kept.
+    @Test func keepsAHomepageOnlyWhenItIsAWebPage() throws {
+        let json = """
+        {
+          "formulae": [
+            {"name": "plain", "homepage": "http://example.org/plain", "installed": [], "versions": {"stable": "1.0"}},
+            {"name": "local", "homepage": "file:///Applications/Example.app", "installed": [], "versions": {"stable": "1.0"}}
+          ],
+          "casks": [
+            {"token": "secure", "homepage": "https://example.org/secure", "version": "1.0"},
+            {"token": "custom", "homepage": "x-example://open", "version": "1.0"}
+          ]
+        }
+        """
+        let packages = try #require(Homebrew.parseInstalled(Data(json.utf8)))
+        func homepage(_ name: String) -> String? { packages.first { $0.name == name }?.homepage?.absoluteString }
+
+        #expect(packages.count == 4)
+        #expect(homepage("plain") == "http://example.org/plain")
+        #expect(homepage("secure") == "https://example.org/secure")
+        #expect(homepage("local") == nil)
+        #expect(homepage("custom") == nil)
+    }
+
+    @Test func readsACaskWhoseAppUpdatesItselfAndWhetherHomebrewLeavesItToTheApp() throws {
+        let json = """
+        {
+          "formulae": [],
+          "casks": [
+            {"token": "editor", "installed": "1.142.0", "version": "1.143.1", "outdated": false, "auto_updates": true},
+            {"token": "viewer", "installed": "2.0", "version": "2.0", "outdated": false, "auto_updates": null}
+          ]
+        }
+        """
+        let packages = try #require(Homebrew.parseInstalled(Data(json.utf8)))
+        let config = """
+        HOMEBREW_VERSION: 7.0.9-159-g3073d6a8c3
+        HOMEBREW_PREFIX: /opt/homebrew
+        HOMEBREW_NO_ANALYTICS: set
+        HOMEBREW_NO_AUTO_UPDATE: set
+        HOMEBREW_NO_INSTALL_CLEANUP: set
+        HOMEBREW_NO_UPGRADE_AUTO_UPDATES_CASKS: set
+        """
+        let settings = Homebrew.Overrides(config: config)
+
+        #expect(packages.map(\.appUpdatesItself) == [true, false])
+        #expect(settings == [.leavesAppsThatUpdateThemselves])
+        #expect(packages.map { $0.noting(settings).whyHomebrewCannotCompare } == [.leftToTheApp, nil])
+        #expect(packages.map { $0.noting([]).whyHomebrewCannotCompare } == [nil, nil])
+    }
+
+    /// Homebrew pins a cask as it pins a formula (`brew pin --cask`, since 6.0.0), and says so in the cask's JSON, as
+    /// 7.0.4 writes it. A pinned cask is left out of Upgrade All, since `brew upgrade` refuses to upgrade it.
+    @Test func readsAPinnedCask() throws {
+        let json = """
+        {
+          "formulae": [],
+          "casks": [
+            {"token": "sample", "installed": "2.1.0", "version": "2.2.0", "outdated": true, "pinned": true, "pinned_version": "2.1.0"},
+            {"token": "other", "installed": "1.0", "version": "1.1", "outdated": true, "pinned": false, "pinned_version": null}
+          ]
+        }
+        """
+        let packages = try #require(Homebrew.parseInstalled(Data(json.utf8)))
+
+        #expect(packages.first { $0.name == "sample" }?.isPinned == true)
+        #expect(packages.first { $0.name == "other" }?.isPinned == false)
+    }
+
+    /// Homebrew runs some steps of a cask as root with `sudo`, which asks for a password only a terminal can give
+    /// (`cask/artifact/pkg.rb` and `abstract_uninstall.rb`, 7.0.4). The artifacts are written as `brew info
+    /// --json=v2` writes Zoom's, Adobe AIR's, and a plain app's.
+    @Test func knowsWhichCasksNeedAnAdministrator() throws {
+        let json = """
+        {
+          "formulae": [],
+          "casks": [
+            {"token": "meeting", "installed": "6.0", "version": "6.1", "outdated": true, "artifacts": [
+              {"uninstall": [{"launchctl": ["org.example.meeting.updater"], "pkgutil": "org.example.meeting.pkg",
+                              "delete": ["/Library/Internet Plug-Ins/Meeting.plugin"]}]},
+              {"pkg": ["MeetingInstaller.pkg"]}]},
+            {"token": "runtime", "installed": "51.1", "version": "51.2", "outdated": true, "artifacts": [
+              {"uninstall": [{"script": {"executable": "Runtime Installer.app/Contents/MacOS/Runtime Installer",
+                                         "args": ["-uninstall"], "sudo": true}, "rmdir": ["/Applications/Runtime"]}]},
+              {"installer": [{"script": {"executable": "Runtime Installer.app/Contents/MacOS/Runtime Installer",
+                                         "args": ["-silent"], "sudo": true}}]}]},
+            {"token": "player", "installed": "3.0", "version": "3.0", "outdated": false, "artifacts": [
+              {"app": ["Player.app"]},
+              {"uninstall": [{"launchctl": "org.example.player.helper", "quit": "org.example.player"}]},
+              {"zap": [{"trash": ["~/Library/Application Support/Player"], "delete": "/Library/Player"}]}]},
+            {"token": "helper", "installed": "1.0", "version": "1.1", "outdated": true, "artifacts": [
+              {"installer": [{"script": {"executable": "Install Helper", "sudo": false}}]},
+              {"uninstall": [{"kext": "org.example.helper.driver"}]}]}
+          ]
+        }
+        """
+        let packages = try #require(Homebrew.parseInstalled(Data(json.utf8)))
+        let needs = { (name: String) in
+            packages.first { $0.name == name }.map {
+                [$0.upgradeNeedsAnAdministrator, $0.uninstallNeedsAnAdministrator]
+            }
+        }
+
+        #expect(needs("meeting") == [true, true], "an installer package and `pkgutil` both run with sudo")
+        #expect(needs("runtime") == [true, true], "scripts run with sudo")
+        #expect(needs("player") == [false, false], "launchctl goes on without sudo, and zap is not what uninstalling runs")
+        #expect(needs("helper") == [true, true], "a kernel extension is unloaded with sudo, when upgrading too")
+    }
+
+    /// An upgrade someone follows shows what Homebrew wrote, its last words when stopped included, then Peel's own
+    /// sentence where it stopped. `/bin/sh` stands in for `brew`, since a real upgrade would change this Mac's
+    /// packages.
+    @Test func aFollowedRunSaysWhereItWasStopped() async throws {
+        let written = Mutex(Data())
+        let (pieces, arrived) = AsyncStream.makeStream(of: Void.self)
+        let run = Task {
+            try await Homebrew.execute(
+                ["-c", "trap 'echo stopping; kill $!; exit 143' TERM; echo first; sleep 3600 & wait"], autoUpdate: false,
+                timeout: nil,
+                onOutput: { piece in
+                    written.withLock { $0.append(piece) }
+                    arrived.yield()
+                },
+                executable: URL(filePath: "/bin/sh")
+            )
+        }
+        for await _ in pieces { break }
+        run.cancel()
+
+        await #expect(throws: Homebrew.CommandFailure.self) { try await run.value }
+        #expect(String(decoding: written.withLock { $0 }, as: UTF8.self) == "first\nstopping\nStopped before it finished.\n")
+    }
+
+    /// The JSON follows what Homebrew 7.0.4 reports for packages it has stopped or will stop offering. A package
+    /// can be deprecated and disabled at once (disabled wins), a deprecated one carries the day it will be
+    /// disabled, and a reason is one of Homebrew's keywords or a sentence a maintainer wrote.
+    @Test func readsWhatHomebrewNoLongerOffers() throws {
+        let json = """
+        {
+          "formulae": [
+            {"name": "aces_container", "installed": [{"version": "1.0.2"}], "versions": {"stable": "1.0.2"},
+             "deprecated": true, "deprecation_date": "2026-06-05", "deprecation_reason": "repo_archived",
+             "deprecation_replacement_formula": "openimageio", "disabled": false, "disable_date": "2027-06-05"},
+            {"name": "aescrypt-packetizer", "installed": [{"version": "3.16"}], "versions": {"stable": "3.16"},
+             "deprecated": true, "deprecation_date": "2025-03-17", "deprecation_reason": "switched to a commercial license in v4",
+             "disabled": true, "disable_date": "2026-03-17", "disable_reason": "switched to a commercial license in v4"},
+            {"name": "abricate", "installed": [{"version": "1.0.1"}], "versions": {"stable": "1.0.1"},
+             "deprecated": false, "deprecation_date": "2027-03-31", "disabled": false}
+          ],
+          "casks": [
+            {"token": "1kc-razer", "installed": "1.0", "version": "1.0",
+             "deprecated": false, "disabled": true, "disable_date": "2026-09-01", "disable_reason": "fails_gatekeeper_check",
+             "disable_replacement_cask": "razer-synapse"},
+            {"token": "active-trader-pro", "installed": "2.0", "version": "2.0",
+             "deprecated": true, "deprecation_date": "2025-12-17", "deprecation_reason": "discontinued", "disabled": false,
+             "disable_date": "2026-12-17"},
+            {"token": "sample", "installed": "2.1.0", "version": "2.1.0"}
+          ]
+        }
+        """
+        let packages = try #require(Homebrew.parseInstalled(Data(json.utf8)))
+        func retirement(_ name: String) -> HomebrewRetirement? { packages.first { $0.name == name }?.retirement }
+        func day(_ text: String) -> Date { try! Date(text, strategy: .iso8601.year().month().day()) }
+
+        #expect(
+            retirement("aces_container")
+                == HomebrewRetirement(
+                    stage: .deprecated,
+                    reason: .repositoryArchived,
+                    disableDate: day("2027-06-05"),
+                    replacement: .formula("openimageio")
+                )
+        )
+        #expect(
+            retirement("aescrypt-packetizer")
+                == HomebrewRetirement(
+                    stage: .disabled,
+                    reason: .written("switched to a commercial license in v4"),
+                    disableDate: day("2026-03-17"),
+                    replacement: nil
+                )
+        )
+        #expect(
+            retirement("1kc-razer")
+                == HomebrewRetirement(
+                    stage: .disabled,
+                    reason: .failsGatekeeperCheck,
+                    disableDate: day("2026-09-01"),
+                    replacement: .cask("razer-synapse")
+                )
+        )
+        #expect(
+            retirement("active-trader-pro")
+                == HomebrewRetirement(
+                    stage: .deprecated,
+                    reason: .discontinued,
+                    disableDate: day("2026-12-17"),
+                    replacement: nil
+                )
+        )
+        #expect(retirement("abricate") == nil, "a deprecation dated ahead has not happened yet")
+        #expect(retirement("sample") == nil)
+    }
+
+    /// Every reason keyword Homebrew 7.0.4 declares in `deprecate_disable.rb` is recognized, and any other text
+    /// is kept as written.
+    @Test func knowsEveryReasonHomebrewNames() {
+        let words = [
+            "discontinued", "moved_to_mas", "no_longer_available", "no_longer_meets_criteria", "unmaintained",
+            "fails_gatekeeper_check", "unreachable", "does_not_build", "no_license", "repo_archived", "repo_removed",
+            "unsupported", "deprecated_upstream", "versioned_formula", "checksum_mismatch",
+        ]
+        let reasons = words.map(HomebrewRetirement.Reason.init)
+        #expect(Set(reasons).count == words.count)
+        #expect(!reasons.contains { if case .written = $0 { true } else { false } })
+        #expect(HomebrewRetirement.Reason("needs deprecated `blast`") == .written("needs deprecated `blast`"))
+    }
+
+    @Test func rejectsUnexpectedOutput() {
+        #expect(Homebrew.parseInstalled(Data("Error: Unknown command".utf8)) == nil)
+    }
+
+    @Test func readsTheVersionAReleasedHomebrewReports() {
+        let installation = HomebrewInstallation(version: "7.0.4", prefix: URL(filePath: "/opt/homebrew"))
+
+        #expect(installation.reportsHealthAsJSON)
+        #expect(installation.checksVulnerabilities)
+    }
+
+    /// A Homebrew installed from git reports how far past the tag it is, which is not part of the version.
+    @Test func readsTheVersionACheckedOutHomebrewReports() {
+        let installation = HomebrewInstallation(version: "7.0.4-2-g4ad6fe9", prefix: URL(filePath: "/opt/homebrew"))
+
+        #expect(installation.reportsHealthAsJSON)
+        #expect(installation.checksVulnerabilities)
+    }
+
+    /// `brew doctor --json` arrived in 6.0.12 but left out every check that still answered in prose, so it could
+    /// print `[]` for a broken installation. From 6.0.13 every check is included.
+    @Test func keepsJSONDiagnosticsForTheVersionThatMadeThemWhole() {
+        #expect(!HomebrewInstallation(version: "6.0.12", prefix: URL(filePath: "/opt/homebrew")).reportsHealthAsJSON)
+        #expect(HomebrewInstallation(version: "6.0.13", prefix: URL(filePath: "/opt/homebrew")).reportsHealthAsJSON)
+        #expect(!HomebrewInstallation(version: "4.6.9", prefix: URL(filePath: "/usr/local")).reportsHealthAsJSON)
+        #expect(HomebrewInstallation(version: "8.1.0", prefix: URL(filePath: "/opt/homebrew")).reportsHealthAsJSON)
+    }
+
+    /// Before 4.4.25 `brew bundle` lived in a tap, which asking for it would download.
+    @Test func asksForABrewfileOnlyOnceBundleIsPartOfHomebrew() async {
+        let prefix = URL(filePath: "/opt/homebrew")
+        let older = HomebrewInstallation(version: "4.4.24", prefix: prefix)
+
+        #expect(!older.writesABrewfile)
+        #expect(HomebrewInstallation(version: "4.4.25", prefix: prefix).writesABrewfile)
+        #expect(HomebrewInstallation(version: "7.0.6-82-g8e858db", prefix: prefix).writesABrewfile)
+        await #expect(throws: Homebrew.CommandFailure.self) { try await Homebrew.brewfile(from: older) }
+    }
+
+    @Test(.homebrewWithItsDefinitions) func homebrewsBrewfileNamesEveryPackageInstalledOnRequest() async throws {
+        let installation = try #require(await Homebrew.installation())
+        let brewfile = try await Homebrew.brewfile(from: installation)
+
+        for package in try await Homebrew.installedPackages() where package.isInstalledOnRequest {
+            let line = "\(package.kind == .cask ? "cask" : "brew") \"\(package.fullName)\""
+            #expect(brewfile.split(separator: "\n").contains { $0.hasPrefix(line) }, "\(line) is missing")
+        }
+    }
+
+    /// `brew vulns` arrived in 6.0.11, one release before the JSON diagnostics.
+    @Test func keepsTheVulnerabilityScanForTheVersionThatAddedIt() {
+        #expect(!HomebrewInstallation(version: "6.0.10", prefix: URL(filePath: "/opt/homebrew")).checksVulnerabilities)
+        #expect(HomebrewInstallation(version: "6.0.11", prefix: URL(filePath: "/opt/homebrew")).checksVulnerabilities)
+        #expect(!HomebrewInstallation(version: "5.9.99", prefix: URL(filePath: "/usr/local")).checksVulnerabilities)
+        #expect(HomebrewInstallation(version: "6.1", prefix: URL(filePath: "/opt/homebrew")).checksVulnerabilities)
+    }
+
+    @Test func survivesAVersionItCannotRead() {
+        let installation = HomebrewInstallation(version: "unknown", prefix: URL(filePath: "/opt/homebrew"))
+
+        #expect(!installation.reportsHealthAsJSON)
+        #expect(!installation.checksVulnerabilities)
+    }
+
+    @Test func readsWhatACleanUpWouldFree() {
+        let output = """
+        Would remove: /opt/homebrew/Cellar/x265/4.2 (12 files, 17MB)
+        Would remove (broken link): /opt/homebrew/bin/sample
+        ==> This operation would free approximately 61.2MB of disk space.
+        """
+
+        #expect(Homebrew.reclaimableBytes(in: output, countsInThousands: true) == 61_200_000)
+    }
+
+    /// `brew cleanup` autoremoves too (Homebrew 7.0.4's `cleanup.rb`), and its dry run names each formula it would
+    /// uninstall under one headline, which Clean Up's confirmation repeats.
+    @Test func readsWhichFormulaeACleanUpWouldAutoremove() {
+        let output = """
+        Would remove: /opt/homebrew/Cellar/x265/4.2 (12 files, 17MB)
+        ==> Would autoremove 2 unneeded formulae:
+        libfoo
+        org/tap/bar
+        Would remove: /Users/me/Library/Caches/Homebrew/downloads/abc--x265-4.2.bottle.tar.gz (2MB)
+        ==> This operation would free approximately 61.2MB of disk space.
+        """
+
+        #expect(Homebrew.autoremovedFormulae(in: output) == ["libfoo", "org/tap/bar"])
+        let nothingToAutoremove = "==> This operation would free approximately 3KB of disk space."
+        #expect(Homebrew.autoremovedFormulae(in: nothingToAutoremove).isEmpty)
+    }
+
+    /// Homebrew drops the decimal on a round number, and its largest unit is GB. From 5.0.0 it counts in thousands
+    /// (`utils/formatter.rb` divides by 1000.0). Earlier versions count in 1024s, whatever the unit says.
+    @Test func readsEveryUnitACleanUpUses() {
+        #expect(Homebrew.reclaimableBytes(in: "would free approximately 512B of disk space.", countsInThousands: true) == 512)
+        #expect(Homebrew.reclaimableBytes(in: "would free approximately 3KB of disk space.", countsInThousands: true) == 3_000)
+        #expect(Homebrew.reclaimableBytes(in: "would free approximately 1.5GB of disk space.", countsInThousands: true) == 1_500_000_000)
+        #expect(Homebrew.reclaimableBytes(in: "would free approximately 3KB of disk space.", countsInThousands: false) == 3_072)
+        #expect(Homebrew.reclaimableBytes(in: "would free approximately 1.5GB of disk space.", countsInThousands: false) == Int64(1.5 * 1024 * 1024 * 1024))
+        #expect(HomebrewInstallation(version: "5.0.0", prefix: URL(filePath: "/opt/homebrew")).countsInThousands)
+        #expect(!HomebrewInstallation(version: "4.6.20", prefix: URL(filePath: "/opt/homebrew")).countsInThousands)
+    }
+
+    /// Homebrew prints the total only when it is not zero (`unless cleanup.disk_cleanup_size.zero?` in
+    /// `cmd/cleanup.rb`) and lists each file it would remove (`Would remove: <path> (<size>)` in `cleanup.rb`), so a
+    /// dry run that lists no file has nothing to free. A broken link or an empty folder takes no room.
+    @Test func aCleanUpThatListsNothingFreesNothing() {
+        #expect(Homebrew.reclaimableBytes(in: "", countsInThousands: true) == 0)
+        #expect(Homebrew.reclaimableBytes(in: "Would remove (broken link): /opt/homebrew/bin/old\n", countsInThousands: true) == 0)
+        #expect(Homebrew.reclaimableBytes(in: "Would remove: /Users/me/Library/Caches/Homebrew/foo--1.0.tar.gz (1.2MB)\n", countsInThousands: true) == nil)
+    }
+
+    @Test func leavesTheFigureOutWhenHomebrewDoesNotGiveOne() {
+        #expect(Homebrew.reclaimableBytes(in: "would free approximately lots of disk space.", countsInThousands: true) == nil)
+        // A figure too large for an `Int64` counts as no figure, instead of crashing the app.
+        #expect(Homebrew.reclaimableBytes(in: "would free approximately 99999999999999999999GB of disk space.", countsInThousands: true) == nil)
+    }
+
+    @Test func readsWhatHomebrewFoundWrong() throws {
+        let json = """
+        {
+          "tier": 1,
+          "findings": [
+            {
+              "text": "Broken symlinks were found:\\n  /opt/homebrew/bin/sample\\n",
+              "tier": 1,
+              "affects": [],
+              "links": [],
+              "remediation": {"commands": ["brew cleanup"], "text": "Remove them with `brew cleanup`\\n"}
+            },
+            {"text": "An unrelated note.", "tier": 2, "affects": [], "links": []}
+          ]
+        }
+        """
+        let report = try JSONDecoder().decode(Homebrew.DoctorReport.self, from: Data(json.utf8))
+        let findings = report.findings.map(\.finding)
+
+        #expect(findings.count == 2)
+        #expect(findings[0].text == "Broken symlinks were found:\n  /opt/homebrew/bin/sample")
+        #expect(findings[0].remedy == "Remove them with `brew cleanup`")
+        #expect(findings[0].commands == ["brew cleanup"])
+        #expect(findings[1].remedy == nil)
+        #expect(findings[1].commands.isEmpty)
+    }
+
+    @Test func knowsWhichFormulaeWereCheckedAtTheCurrentFormula() throws {
+        let json = """
+        {
+          "findings": [
+            {
+              "formula": "libfoo", "version": "1.0", "tag": "v2.0", "repo_url": "https://example.org/libfoo",
+              "vulnerabilities": [
+                {"id": "CVE-2026-1", "severity": "HIGH", "summary": "Overflow", "aliases": [], "fixed_versions": []}
+              ],
+              "patched": []
+            },
+            {
+              "formula": "libbar", "version": "3.1", "tag": "v3.1", "repo_url": "https://example.org/libbar",
+              "vulnerabilities": [
+                {"id": "CVE-2026-2", "severity": "LOW", "summary": "Leak", "aliases": [], "fixed_versions": []}
+              ],
+              "patched": []
+            }
+          ],
+          "skipped_formulae": [],
+          "checked": 3,
+          "complete": false,
+          "outdated_without_sbom": ["libfoo", "libquiet"],
+          "unscanned_formulae": {}
+        }
+        """
+        let report = try JSONDecoder().decode(Homebrew.VulnsReport.self, from: Data(json.utf8)).report
+
+        #expect(report.checkedTheCurrentFormula == ["libfoo", "libquiet"])
+        #expect(report.advisories.first { $0.formula == "libfoo" }?.checkedTheCurrentFormula == true)
+        #expect(report.advisories.first { $0.formula == "libbar" }?.checkedTheCurrentFormula == false)
+    }
+
+    @Test func readsWhatAVulnerabilityScanFound() throws {
+        let json = """
+        {
+          "findings": [
+            {
+              "formula": "libssh2", "version": "1.11.1", "tag": "libssh2-1.11.1",
+              "repo_url": "https://github.com/libssh2/libssh2",
+              "vulnerabilities": [
+                {"id": "CVE-2019-17498", "severity": "UNKNOWN", "summary": "Out-of-bounds read", "aliases": [], "fixed_versions": []},
+                {"id": "CVE-2020-22218", "severity": "MEDIUM", "summary": "Memory corruption", "aliases": [], "fixed_versions": []}
+              ],
+              "patched": []
+            },
+            {
+              "formula": "openssl@3", "version": "3.6.3", "tag": "openssl-3.6.3",
+              "repo_url": "https://github.com/openssl/openssl",
+              "vulnerabilities": [
+                {"id": "CVE-2026-14456", "severity": "HIGH", "summary": "Unbounded memory growth", "aliases": [], "fixed_versions": ["f089acd"]},
+                {"id": "CVE-2026-14999", "severity": "CRITICAL", "summary": "Remote code execution", "aliases": [], "fixed_versions": []},
+                {"id": "CVE-2026-14001", "severity": "critical", "summary": "Certificate check bypass", "aliases": [], "fixed_versions": []},
+                {"id": "CVE-2026-14100", "severity": "LOW", "summary": "Timing side channel", "aliases": [], "fixed_versions": []}
+              ],
+              "patched": []
+            }
+          ],
+          "skipped_formulae": ["mpg123", "ca-certificates"]
+        }
+        """
+        let report = try JSONDecoder().decode(Homebrew.VulnsReport.self, from: Data(json.utf8)).report
+
+        #expect(report.advisories.map(\.formula) == ["openssl@3", "libssh2"])
+        #expect(report.skipped == ["ca-certificates", "mpg123"])
+
+        let openssl = try #require(report.advisories.first)
+        #expect(openssl.version == "3.6.3")
+        #expect(openssl.highestSeverity == .critical)
+        #expect(openssl.vulnerabilities.map(\.id) == ["CVE-2026-14001", "CVE-2026-14999", "CVE-2026-14456", "CVE-2026-14100"])
+        #expect(openssl.vulnerabilities.map(\.severity) == [.critical, .critical, .high, .low])
+        #expect(openssl.vulnerabilities.first?.summary == "Certificate check bypass")
+
+        let libssh2 = try #require(report.advisories.last)
+        #expect(libssh2.highestSeverity == .medium)
+        #expect(libssh2.vulnerabilities.map(\.severity) == [.medium, .unknown])
+    }
+
+    @Test func readsTheAliasesAndTheFixOfEachVulnerability() throws {
+        let commit = String(repeating: "f089acdf", count: 5)
+        let longCommit = String(repeating: "d3c1b116", count: 8)
+        let json = """
+        {"findings": [{"formula": "uv", "version": "0.12.7", "vulnerabilities": [
+          {"id": "CVE-2026-1", "severity": "HIGH", "summary": "", "aliases": ["GHSA-2cv4-cqwr-gwf7"], "fixed_versions": ["\(commit)", "0.12.8"]},
+          {"id": "CVE-2026-2", "severity": "HIGH", "summary": "", "aliases": [], "fixed_versions": ["\(commit)", "\(longCommit)"]},
+          {"id": "CVE-2026-3", "severity": "HIGH", "summary": "", "aliases": [], "fixed_versions": []}
+        ], "patched": []}]}
+        """
+
+        let report = try JSONDecoder().decode(Homebrew.VulnsReport.self, from: Data(json.utf8)).report
+        let vulnerabilities = try #require(report.advisories.first).vulnerabilities
+
+        #expect(vulnerabilities.map(\.aliases) == [["GHSA-2cv4-cqwr-gwf7"], [], []])
+        #expect(vulnerabilities.map(\.fix) == [.versions(["0.12.8"]), .commits, .notListed])
+    }
+
+    @Test func tellsWhenTheInstalledPackagesChanged() {
+        let openssl = HomebrewPackage(name: "openssl@3", kind: .formula, installedVersion: "3.6.3")
+        let offered = HomebrewPackage(
+            name: "openssl@3", kind: .formula, installedVersion: "3.6.3", latestVersion: "3.6.4", isOutdated: true
+        )
+        let upgraded = HomebrewPackage(name: "openssl@3", kind: .formula, installedVersion: "3.6.4")
+        let curl = HomebrewPackage(name: "curl", kind: .formula, installedVersion: "8.17.0")
+
+        #expect([openssl, curl].installsTheSame(as: [curl, offered]))
+        #expect(![openssl].installsTheSame(as: [upgraded]))
+        #expect(![openssl].installsTheSame(as: [openssl, curl]))
+        #expect(![openssl, curl].installsTheSame(as: [curl]))
+    }
+
+    @Test func listsIdentifiersInTheOrderOfTheirNumbers() throws {
+        let json = """
+        {"findings": [{"formula": "libssh2", "version": "1.11.1", "vulnerabilities": [
+          {"id": "OSV-2025-433", "severity": "UNKNOWN"}, {"id": "CVE-2026-66032", "severity": "UNKNOWN"},
+          {"id": "OSV-2025-90", "severity": "UNKNOWN"}, {"id": "CVE-2026-7598", "severity": "UNKNOWN"}
+        ], "patched": []}]}
+        """
+
+        let report = try JSONDecoder().decode(Homebrew.VulnsReport.self, from: Data(json.utf8)).report
+
+        #expect(
+            report.advisories.first?.vulnerabilities.map(\.id)
+                == ["CVE-2026-7598", "CVE-2026-66032", "OSV-2025-90", "OSV-2025-433"]
+        )
+    }
+
+    /// From 6.0.11 to 6.0.18 the scan answers with a list, and from 6.0.19 with an object that holds one. Both
+    /// shapes are read, so an older Homebrew's answer is not thrown away as a failure.
+    @Test func readsTheScanAnOlderHomebrewWrites() throws {
+        let older = #"[{"formula":"libssh2","version":"1.11.0","vulnerabilities":[{"id":"CVE-2023-48795","severity":"MEDIUM","summary":"Terrapin"}],"patched":[]}]"#
+
+        let report = try JSONDecoder().decode(Homebrew.VulnsReport.self, from: Data(older.utf8)).report
+
+        #expect(report.advisories.map(\.formula) == ["libssh2"])
+        #expect(report.skipped.isEmpty)
+        #expect(report.advisories.first?.vulnerabilities.first?.aliases == [])
+        #expect(report.advisories.first?.vulnerabilities.first?.fix == .notListed)
+    }
+
+    /// The scan keeps a formula whose every vulnerability is patched, with nothing open under it. Listing it
+    /// would show an empty entry under "Known Vulnerabilities" instead of saying none were found.
+    @Test func leavesOutAFormulaWithNothingOpen() throws {
+        let json = #"{"findings":[{"formula":"curl","version":"8.0","vulnerabilities":[],"patched":[{"id":"CVE-1"}]}]}"#
+
+        #expect(try JSONDecoder().decode(Homebrew.VulnsReport.self, from: Data(json.utf8)).report.advisories.isEmpty)
+    }
+
+    @Test func survivesAScanWithNothingInIt() throws {
+        let report = try JSONDecoder()
+            .decode(Homebrew.VulnsReport.self, from: Data(#"{"findings": []}"#.utf8))
+            .report
+
+        #expect(report.advisories.isEmpty)
+        #expect(report.skipped.isEmpty)
+    }
+
+    /// From 6.0.0 Homebrew keeps its copy of the definitions in one file, named for the platform it reads it for.
+    /// Earlier versions keep one file for formulae and one for casks. Either layout counts as a local copy.
+    @Test func findsHomebrewsCopyOfItsDefinitionsInEitherLayout() throws {
+        let newer = try TemporaryDirectory()
+        try newer.file("api/internal/packages.arm64_tahoe.jws.json")
+        #expect(Homebrew.hasLocalDefinitions(inCache: newer.url, tag: "arm64_tahoe", readsTheTaps: false))
+
+        let older = try TemporaryDirectory()
+        try older.file("api/formula.jws.json")
+        #expect(!Homebrew.hasLocalDefinitions(inCache: older.url, tag: "arm64_tahoe", readsTheTaps: false))
+        try older.file("api/cask.jws.json")
+        #expect(Homebrew.hasLocalDefinitions(inCache: older.url, tag: "arm64_tahoe", readsTheTaps: false))
+
+        let empty = try TemporaryDirectory()
+        try empty.directory("api/internal")
+        #expect(!Homebrew.hasLocalDefinitions(inCache: empty.url, tag: "arm64_tahoe", readsTheTaps: false))
+    }
+
+    /// After a move to a newer macOS, only the file for the old platform is left. Homebrew reads the new one and
+    /// downloads it when missing, so the old one is no local copy.
+    @Test func aCopyForAnotherPlatformIsNoLocalCopy() throws {
+        let cache = try TemporaryDirectory()
+        try cache.file("api/internal/packages.arm64_tahoe.jws.json")
+
+        #expect(!Homebrew.hasLocalDefinitions(inCache: cache.url, tag: "arm64_27", readsTheTaps: false))
+    }
+
+    @Test func namesTheCopyForThisMacAsHomebrewDoes() {
+        let table = """
+              RELEASES = T.let({
+                golden_gate: "27",
+                tahoe:       "26",
+                sequoia:     "15",
+                catalina:    "10.15",
+              }.freeze, T::Hash[Symbol, String])
+
+              RELEASE_ALIASES = T.let({
+                "10.16" => "11",
+              }.freeze, T::Hash[String, String])
+            """
+
+        #expect(Homebrew.definitionsTag(releases: table, macOS: 26, onAppleSilicon: true) == "arm64_tahoe")
+        #expect(Homebrew.definitionsTag(releases: table, macOS: 27, onAppleSilicon: true) == "arm64_golden_gate")
+        #expect(Homebrew.definitionsTag(releases: table, macOS: 26, onAppleSilicon: false) == "tahoe")
+        #expect(Homebrew.definitionsTag(releases: table, macOS: 28, onAppleSilicon: true) == nil)
+        #expect(Homebrew.definitionsTag(releases: "", macOS: 26, onAppleSilicon: true) == nil)
+    }
+
+    @Test(.homebrewOnThisMac) func homebrewsOwnTableNamesThisMacOS() async throws {
+        let home = try TemporaryDirectory()
+        let repository = try #require(
+            await Homebrew.answerWithoutTheAPI(["--repository"], home: home.url).flatMap(Homebrew.folder(answering:))
+        )
+
+        let tag = try #require(Homebrew.definitionsTag(repository: repository))
+        #expect(tag.wholeMatch(of: /(arm64_)?[a-z][a-z0-9_]*/) != nil)
+    }
+
+    @Test func withoutThePlatformsNameAnyCopyCounts() throws {
+        let cache = try TemporaryDirectory()
+        try cache.directory("api/internal")
+        #expect(!Homebrew.hasLocalDefinitions(inCache: cache.url, tag: nil, readsTheTaps: false))
+
+        try cache.file("api/internal/packages.arm64_tahoe.jws.json")
+        #expect(Homebrew.hasLocalDefinitions(inCache: cache.url, tag: nil, readsTheTaps: false))
+    }
+
+    @Test func namesThePersonsSettingsFolderAsBinBrewDoes() throws {
+        let folder = try TemporaryDirectory()
+        let home = folder.url.appending(path: "home", directoryHint: .isDirectory)
+        let system = folder.url.appending(path: "etc/homebrew/brew.env")
+        let prefix = folder.url.appending(path: "prefix", directoryHint: .isDirectory)
+
+        #expect(Homebrew.userConfiguration(home: home, system: system, prefix: prefix).path(percentEncoded: false)
+            == home.appending(path: ".homebrew/").path(percentEncoded: false))
+        try folder.file("prefix/etc/homebrew/brew.env", contents: Data("HOMEBREW_XDG_CONFIG_HOME=/srv/settings\n".utf8))
+        #expect(Homebrew.userConfiguration(home: home, system: system, prefix: prefix).path(percentEncoded: false)
+            == "/srv/settings/homebrew/")
+        try folder.file("prefix/etc/homebrew/brew.env", contents: Data("HOMEBREW_XDG_CONFIG_HOME=\"/srv/settings\"\n".utf8))
+        let workingFolder = URL(filePath: FileManager.default.currentDirectoryPath, directoryHint: .isDirectory)
+        #expect(Homebrew.userConfiguration(home: home, system: system, prefix: prefix).path(percentEncoded: false)
+            == workingFolder.appending(path: "\"/srv/settings\"/homebrew/").path(percentEncoded: false),
+            "bin/brew takes the value as written, quotes included, from the folder it runs in")
+    }
+
+    /// With `HOMEBREW_NO_INSTALL_FROM_API`, Homebrew reads its taps and never the API files, so its taps are the
+    /// local copy.
+    @Test func readingTheTapsNeedsNoAPICopy() throws {
+        let cache = try TemporaryDirectory()
+
+        #expect(Homebrew.hasLocalDefinitions(inCache: cache.url, tag: "arm64_tahoe", readsTheTaps: true))
+    }
+
+    @Test(.homebrewOnThisMac) func askingAboutTheDefinitionsDownloadsNothing() async throws {
+        let home = try TemporaryDirectory()
+
+        #expect(await !Homebrew.hasLocalDefinitions(home: home.url))
+        let api = home.url.appending(path: "Library/Caches/Homebrew/api")
+        #expect(!FileManager.default.fileExists(atPath: api.path(percentEncoded: false)), "Homebrew went online")
+    }
+
+    @Test(.homebrewOnThisMac) func askingAboutTheDefinitionsRunsNoDeveloperCommand() async throws {
+        let home = try TemporaryDirectory()
+        let repository = try #require(
+            await Homebrew.answerWithoutTheAPI(["--repository"], home: home.url).flatMap(Homebrew.folder(answering:))
+        )
+        let folder = repository.appending(path: "Library/Homebrew/dev-cmd").path(percentEncoded: false)
+        let developerCommands = Set(try FileManager.default.contentsOfDirectory(atPath: folder).map {
+            ($0 as NSString).deletingPathExtension
+        })
+        let asked = Mutex<[String]>([])
+
+        _ = await Homebrew.hasLocalDefinitions(home: home.url) { arguments in
+            asked.withLock { $0.append(arguments.first ?? "") }
+            return await Homebrew.answerWithoutTheAPI(arguments, home: home.url)
+        }
+        #expect(developerCommands.contains("ruby"))
+        #expect(!asked.withLock(\.self).isEmpty)
+        #expect(asked.withLock { $0.filter(developerCommands.contains) }.isEmpty)
+    }
+
+    @Test func knowsFromBrewEnvWhetherHomebrewFetchesItsListsBeforeAnswering() throws {
+        let directory = try TemporaryDirectory()
+        func settings(_ text: String) throws -> [URL] {
+            [try directory.file("\(UUID().uuidString).env", contents: Data(text.utf8))]
+        }
+
+        #expect(!Homebrew.fetchesItsListsFirst(settingsIn: []))
+        #expect(!Homebrew.fetchesItsListsFirst(settingsIn: try settings("HOMEBREW_NO_ANALYTICS=1\n")))
+        #expect(Homebrew.fetchesItsListsFirst(settingsIn: try settings("HOMEBREW_FORCE_API_AUTO_UPDATE=1\n")))
+        #expect(Homebrew.fetchesItsListsFirst(settingsIn: try settings("HOMEBREW_NO_AUTO_UPDATE=\n")))
+        #expect(!Homebrew.fetchesItsListsFirst(settingsIn: try settings("HOMEBREW_NO_AUTO_UPDATE=1\n")))
+        #expect(!Homebrew.fetchesItsListsFirst(settingsIn: try settings("HOMEBREW_NO_AUTO_UPDATE=0\n")))
+        #expect(!Homebrew.fetchesItsListsFirst(settingsIn: try settings("HOMEBREW_FORCE_API_AUTO_UPDATE=\n")))
+        #expect(!Homebrew.fetchesItsListsFirst(settingsIn: try settings("HOMEBREW_FORCE_API_AUTO_UPDATE=0\n")))
+    }
+
+    @Test func readsTheTapsOnlyWhereTheLastBrewEnvLineSaysSo() throws {
+        let folder = try TemporaryDirectory()
+        let system = try folder.file("etc/homebrew/brew.env", contents: Data("# a comment\nHOMEBREW_NO_ANALYTICS=1\n".utf8))
+        let prefix = try folder.file("prefix/brew.env", contents: Data("  HOMEBREW_NO_INSTALL_FROM_API=1\t\n".utf8))
+        let user = try folder.file("home/.homebrew/brew.env", contents: Data("HOMEBREW_NO_INSTALL_FROM_API=\n".utf8))
+        let unfinished = try folder.file("other/brew.env", contents: Data("HOMEBREW_NO_INSTALL_FROM_API=1".utf8))
+        let missing = folder.url.appending(path: "nowhere/brew.env")
+
+        #expect(!Homebrew.readsTheTaps(settingsIn: [system, missing]))
+        #expect(Homebrew.readsTheTaps(settingsIn: [system, prefix]))
+        #expect(!Homebrew.readsTheTaps(settingsIn: [system, prefix, user]))
+        #expect(!Homebrew.readsTheTaps(settingsIn: [unfinished]), "a last line with no line end is never read")
+    }
+
+    @Test func namesTheFoldersOfTheSettingsFilesBrewReadsForPeel() throws {
+        let folder = try TemporaryDirectory()
+        let home = folder.url.appending(path: "home", directoryHint: .isDirectory)
+        let prefix = folder.url.appending(path: "prefix", directoryHint: .isDirectory)
+        let system = folder.url.appending(path: "etc/homebrew/brew.env")
+        func named() -> [String] {
+            Homebrew.settingsFolders(home: home, system: system, prefix: prefix).map(PathPattern.comparablePath(of:))
+        }
+        let inFolder = { (path: String) in PathPattern.comparablePath(of: folder.url.appending(path: path)) }
+
+        #expect(named() == ["etc/homebrew", "prefix/etc/homebrew", "home/.homebrew"].map(inFolder))
+        let settings = folder.url.appending(path: "settings").path(percentEncoded: false)
+        try folder.file("etc/homebrew/brew.env", contents: Data(
+            "HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1\nHOMEBREW_XDG_CONFIG_HOME=\(settings)\n".utf8
+        ))
+        #expect(named() == ["etc/homebrew", "prefix/etc/homebrew", "settings/homebrew"].map(inFolder))
+    }
+
+    @Test func readsTheSystemsSettingsLastWhenTheyTakePriority() throws {
+        let folder = try TemporaryDirectory()
+        let priority = Data("HOMEBREW_SYSTEM_ENV_TAKES_PRIORITY=1\n".utf8)
+        let system = try folder.file("etc/homebrew/brew.env", contents: priority)
+        let prefix = folder.url.appending(path: "prefix", directoryHint: .isDirectory)
+        let user = folder.url.appending(path: "home/.homebrew", directoryHint: .isDirectory)
+
+        let files = Homebrew.settingsFiles(system: system, prefix: prefix, userConfiguration: user)
+        #expect(files.map(\.lastPathComponent) == ["brew.env", "brew.env", "brew.env", "brew.env"])
+        #expect(files.first == system && files.last == system)
+        try folder.file("etc/homebrew/brew.env", contents: Data("HOMEBREW_NO_ANALYTICS=1\n".utf8))
+        #expect(Homebrew.settingsFiles(system: system, prefix: prefix, userConfiguration: user).count == 3)
+    }
+}

@@ -1,0 +1,227 @@
+import Foundation
+@testable import PeelCore
+import Synchronization
+import Testing
+
+struct RunningCopiesTests {
+    @Test func anExtensionInsideTheAppIsNoProcessToQuit() {
+        let app = URL(filePath: "/Applications/Example.app", directoryHint: .isDirectory)
+        func process(_ path: String) -> RunningCopies.Process {
+            RunningCopies.Process(
+                identifier: 1, bundleIdentifier: "org.example.app", bundleURL: URL(filePath: path, directoryHint: .isDirectory)
+            )
+        }
+
+        #expect(process("/Applications/Example.app/Contents/PlugIns/Finder.appex").isAnExtension(inside: app))
+        #expect(!process("/Applications/Example.app").isAnExtension(inside: app))
+        #expect(!process("/Applications/Example.app/Contents/Library/LoginItems/Helper.app").isAnExtension(inside: app))
+        #expect(!process("/Applications/Other.app/Contents/PlugIns/Finder.appex").isAnExtension(inside: app))
+    }
+
+    @Test func whatQuitsBeforeAnAppMovesLeavesOutItsExtensionsAndItsJobs() async {
+        let app = InstalledApp(
+            url: URL(filePath: "/Applications/Example.app", directoryHint: .isDirectory),
+            bundleIdentifier: "org.example.app",
+            name: "Example"
+        )
+        func process(_ identifier: pid_t, at path: String) -> RunningCopies.Process {
+            RunningCopies.Process(
+                identifier: identifier, bundleIdentifier: "org.example.app",
+                bundleURL: app.url.appending(path: path, directoryHint: .isDirectory)
+            )
+        }
+        let (theApp, finder, agent) = (
+            process(1, at: ""), process(2, at: "Contents/PlugIns/Finder.appex"),
+            process(3, at: "Contents/Library/LoginItems/Agent.app")
+        )
+        let asked = Mutex(0)
+        let jobs: @Sendable ([URL]) async -> Set<pid_t> = { _ in
+            asked.withLock { $0 += 1 }
+            return [agent.identifier]
+        }
+
+        let all = await RunningCopies.toQuit(
+            beforeMoving: app, among: [theApp, finder, agent], installedApps: [app], keptByJobs: jobs
+        )
+        let onlyTheExtension = await RunningCopies.toQuit(
+            beforeMoving: app, among: [finder], installedApps: [app], keptByJobs: jobs
+        )
+
+        #expect(all.map(\.identifier) == [theApp.identifier])
+        #expect(onlyTheExtension.isEmpty)
+        #expect(asked.withLock { $0 } == 1)
+    }
+
+    private let chrome = InstalledApp(
+        url: URL(filePath: "/Applications/Google Chrome.app", directoryHint: .isDirectory),
+        bundleIdentifier: "com.google.Chrome",
+        name: "Google Chrome",
+        embeddedBundleIdentifiers: ["com.google.Keystone.Agent"]
+    )
+    private let canary = InstalledApp(
+        url: URL(filePath: "/Applications/Google Chrome Canary.app", directoryHint: .isDirectory),
+        bundleIdentifier: "com.google.Chrome.canary",
+        name: "Google Chrome Canary"
+    )
+
+    private func process(_ identifier: String, at path: String?, pid: pid_t = 1) -> RunningCopies.Process {
+        RunningCopies.Process(identifier: pid, bundleIdentifier: identifier, bundleURL: path.map { URL(filePath: $0) })
+    }
+
+    private func belonging(_ running: [RunningCopies.Process]) -> [String] {
+        RunningCopies.belonging(to: chrome, among: running, installedApps: [chrome, canary])
+            .compactMap(\.bundleIdentifier)
+    }
+
+    @Test func aCasksAppsAndWhatItNamesToQuitAreQuitFirst() {
+        let cask = HomebrewPackage(name: "google-chrome", kind: .cask, quitIdentifiers: ["org.example.Updater"])
+        let running = [
+            process("com.google.Chrome", at: "/Applications/Google Chrome.app", pid: 1),
+            process("com.google.Chrome.helper", at: "/Applications/Google Chrome.app/Contents/Frameworks/Helper.app", pid: 2),
+            process("org.example.updater", at: "/Library/Example/Updater.app", pid: 3),
+            process("com.google.Chrome.canary", at: "/Applications/Google Chrome Canary.app", pid: 4),
+            RunningCopies.Process(identifier: 5, bundleIdentifier: "org.example.Updater", bundleURL: nil, mayBeQuit: false),
+        ]
+
+        let quit = RunningCopies.belonging(
+            toCask: cask, apps: [chrome], among: running, installedApps: [chrome, canary]
+        )
+
+        #expect(quit.map(\.identifier) == [1, 2, 3])
+    }
+
+    /// What runs from inside the app counts whatever its name begins with. A slash and a combining mark after it
+    /// are one `Character`, so to a comparison of characters a helper named that way ran from nowhere, and the
+    /// app's files could move while it ran.
+    @Test func whatRunsFromInsideTheAppCountsWhateverItsNameBeginsWith() {
+        #expect(belonging([process("org.example.unrelated", at: "/Applications/Google Chrome.app/\u{301}Helper.app")]) == ["org.example.unrelated"])
+    }
+
+    /// The app, what runs from inside it, what it embeds, and what continues its identifier all count, so
+    /// nothing rewrites the app's files while they move.
+    @Test func takesTheAppAndWhatItShips() {
+        #expect(belonging([
+            process("com.google.Chrome", at: "/Applications/Google Chrome.app"),
+            process("com.google.Chrome.helper", at: "/Applications/Google Chrome.app/Contents/Frameworks/Helper.app"),
+            process("com.google.Keystone.Agent", at: "/Library/Google/GoogleSoftwareUpdate/Agent.app"),
+            process("com.google.Chrome.framework.AlertNotificationService", at: nil),
+        ]) == ["com.google.Chrome", "com.google.Chrome.helper", "com.google.Keystone.Agent", "com.google.Chrome.framework.AlertNotificationService"])
+    }
+
+    /// A component many apps carry, such as an updater's downloader, runs from inside each of them, and what runs
+    /// from inside another installed app is that app's.
+    @Test func aComponentRunningFromInsideAnotherInstalledAppIsThatApps() {
+        func app(_ name: String) -> InstalledApp {
+            InstalledApp(
+                url: URL(filePath: "/Applications/\(name).app", directoryHint: .isDirectory),
+                bundleIdentifier: "org.example.\(name.lowercased())", name: name,
+                embeddedBundleIdentifiers: ["org.example.updater.Downloader"]
+            )
+        }
+        let first = app("First"), second = app("Second")
+        let downloader = "Contents/Frameworks/Updater.framework/Versions/B/XPCServices/Downloader.xpc"
+        let running = [
+            process("org.example.updater.Downloader", at: "/Applications/Second.app/\(downloader)", pid: 2),
+            process("org.example.updater.Downloader", at: "/Applications/First.app/\(downloader)", pid: 3),
+            process("org.example.updater.Downloader", at: nil, pid: 4),
+        ]
+
+        let toQuit = RunningCopies.belonging(to: first, among: running, installedApps: [first, second])
+
+        #expect(toQuit.map(\.identifier) == [3, 4])
+    }
+
+    @MainActor @Test(.anotherAccountRunsAnApp) func leavesOutWhatThisAccountCannotQuit() {
+        let running = RunningCopies.current
+        let unquittable = running.filter { kill($0.identifier, 0) != 0 && errno == EPERM }
+        for case let (process, bundle?) in unquittable.map({ ($0, $0.bundleURL) }) {
+            let app = InstalledApp(url: bundle, bundleIdentifier: process.bundleIdentifier, name: "")
+
+            let toQuit = RunningCopies.belonging(to: app, among: running, installedApps: [app])
+
+            #expect(!toQuit.contains { $0.identifier == process.identifier })
+        }
+    }
+
+    @Test func anAppWithNoIdentifierIsKnownByWhereItRuns() {
+        let editor = InstalledApp(url: URL(filePath: "/Applications/Plain Editor.app"), bundleIdentifier: nil, name: "Plain Editor")
+        let running = [
+            RunningCopies.Process(identifier: 1, bundleIdentifier: nil, bundleURL: URL(filePath: "/Applications/Plain Editor.app")),
+            RunningCopies.Process(identifier: 2, bundleIdentifier: nil, bundleURL: URL(filePath: "/Applications/Other.app")),
+            RunningCopies.Process(identifier: 3, bundleIdentifier: "org.example.other", bundleURL: nil),
+        ]
+
+        #expect(RunningCopies.belonging(to: editor, among: running, installedApps: [editor]).map(\.identifier) == [1])
+    }
+
+    /// Chrome Canary continues Chrome's identifier and is another installed app, not a helper of Chrome's.
+    @Test func leavesAnotherInstalledAppWhoseNameContinuesThisOne() {
+        #expect(belonging([
+            process("com.google.Chrome.canary", at: "/Applications/Google Chrome Canary.app"),
+            process("com.google.Chrome.canary.helper", at: "/Applications/Google Chrome Canary.app/Contents/Frameworks/Helper.app"),
+        ]).isEmpty)
+    }
+
+    /// The app with the longer identifier wins: Canary's helper also continues Chrome's identifier, but is Canary's.
+    @Test func givesAHelperToTheAppWithTheLongerName() {
+        let helper = process("com.google.Chrome.canary.helper", at: nil)
+
+        #expect(RunningCopies.belonging(to: canary, among: [helper], installedApps: [chrome, canary]) == [helper])
+        #expect(RunningCopies.belonging(to: chrome, among: [helper], installedApps: [chrome, canary]).isEmpty)
+    }
+
+    /// An identifier the bundle embeds can also be an installed app of its own, and then that app owns the process.
+    @Test func leavesAnEmbeddedNameThatIsAnotherInstalledApp() {
+        let agent = InstalledApp(url: URL(filePath: "/Applications/Keystone.app", directoryHint: .isDirectory), bundleIdentifier: "com.google.Keystone.Agent", name: "Keystone")
+        let running = [process("com.google.Keystone.Agent", at: "/Applications/Keystone.app")]
+
+        #expect(RunningCopies.belonging(to: chrome, among: running, installedApps: [chrome, agent]).isEmpty)
+    }
+
+    /// A process running from `/Applications` does not belong to an old copy in Downloads: quitting it would
+    /// close the copy in use.
+    @Test func leavesACopyOfTheAppRunningFromSomewhereElse() {
+        let old = InstalledApp(url: URL(filePath: "/Users/x/Downloads/Google Chrome.app", directoryHint: .isDirectory), bundleIdentifier: "com.google.Chrome", name: "Google Chrome")
+        let running = [process("com.google.Chrome", at: "/Applications/Google Chrome.app/")]
+
+        #expect(RunningCopies.belonging(to: old, among: running, installedApps: [chrome, old]).isEmpty)
+        #expect(RunningCopies.belonging(to: chrome, among: running, installedApps: [chrome, old]).count == 1)
+        // A reset clears settings both copies write, so for a reset the other copy counts.
+        #expect(
+            RunningCopies.belonging(to: old, among: running, installedApps: [chrome, old], sharingItsSettings: true)
+                .count == 1
+        )
+    }
+
+    /// An app that continues the identifier and runs from somewhere Peel does not list apps, such as Chrome Canary
+    /// on another disk, is an app of its own. What runs from inside a Library, as an agent does, is the app's.
+    @Test func leavesAnAppOfItsOwnThatContinuesTheIdentifierWhereverItRuns() {
+        let running = [
+            process("com.google.Chrome.canary", at: "/Volumes/Disk/Google Chrome Canary.app"),
+            process("com.google.Chrome.agent", at: "/Users/x/Library/Application Support/Google/Agent.app"),
+        ]
+
+        let mac = SearchEnvironment(
+            homeDirectory: URL(filePath: "/Users/x", directoryHint: .isDirectory),
+            rootDirectory: URL(filePath: "/", directoryHint: .isDirectory)
+        )
+
+        let belonging = RunningCopies.belonging(to: chrome, among: running, installedApps: [chrome], environment: mac)
+
+        #expect(belonging.map(\.bundleIdentifier) == ["com.google.Chrome.agent"])
+    }
+
+    /// Bundle identifiers are case insensitive, so a process written in other capitals is still the app's.
+    @Test func readsIdentifiersWithoutCase() {
+        let chromeInCapitals = process("COM.GOOGLE.CHROME", at: "/Applications/Google Chrome.app")
+        #expect(belonging([chromeInCapitals]) == ["COM.GOOGLE.CHROME"])
+        #expect(belonging([process("com.google.chrome.helper", at: nil)]) == ["com.google.chrome.helper"])
+        #expect(belonging([process("com.google.keystone.agent", at: nil)]) == ["com.google.keystone.agent"])
+        #expect(belonging([process("COM.GOOGLE.CHROME.CANARY", at: nil)]).isEmpty)
+    }
+
+    /// If it is not known where a process runs from, a matching identifier counts it as the app, to be safe.
+    @Test func countsTheAppWhenWhereItRunsFromIsNotKnown() {
+        #expect(belonging([process("com.google.Chrome", at: nil)]) == ["com.google.Chrome"])
+    }
+}

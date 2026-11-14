@@ -1,0 +1,94 @@
+import Foundation
+import Synchronization
+
+/// Exits the helper after `idleTimeout` seconds with no open connection and no running request.
+/// launchd starts it again on the next request.
+public final class HelperLifetime: Sendable {
+    private let idleTimeout: TimeInterval
+    /// Where the helper's program was when it started, and the file that was there. An update puts another file
+    /// there, which launchd starts at the next request, so a helper whose file was replaced leaves once it is idle.
+    private let program: (path: String, identity: ItemIdentity)?
+    private let schedule: @Sendable (TimeInterval, @escaping @Sendable () -> Void) -> Void
+    private let exit: @Sendable () -> Void
+    private let state = Mutex((activeConnections: 0, requestsInFlight: 0, generation: 0))
+
+    /// How long the installed helper waits with nothing to do before it exits.
+    static let standardIdleTimeout: TimeInterval = 30
+
+    public convenience init() {
+        self.init(
+            idleTimeout: Self.standardIdleTimeout,
+            program: RunningProgram.path(of: getpid()),
+            schedule: { delay, work in DispatchQueue.global().asyncAfter(deadline: .now() + delay, execute: work) },
+            // `_exit`, not `exit`: `exit` would first run `atexit` handlers, while the helper's other threads keep
+            // running.
+            exit: { _exit(EXIT_SUCCESS) }
+        )
+    }
+
+    init(
+        idleTimeout: TimeInterval,
+        program: String?,
+        schedule: @escaping @Sendable (TimeInterval, @escaping @Sendable () -> Void) -> Void,
+        exit: @escaping @Sendable () -> Void
+    ) {
+        self.idleTimeout = idleTimeout
+        self.program = program.flatMap { path in ItemIdentity(ofItemAt: path).map { (path, $0) } }
+        self.schedule = schedule
+        self.exit = exit
+    }
+
+    public func start() {
+        scheduleExitIfIdle(generation: 0)
+    }
+
+    /// Counts a connection until `connectionClosed()`.
+    public func connectionOpened() {
+        state.withLock { state in
+            state.activeConnections += 1
+            state.generation += 1
+        }
+    }
+
+    /// Counts a request as running until `requestFinished()`. The connection count alone is not enough: a
+    /// client that goes away in the middle of a batch drops it to zero while the work is still running, and
+    /// a single `launchctl bootout` can take half a minute.
+    public func requestStarted() {
+        state.withLock { state in
+            state.requestsInFlight += 1
+            state.generation += 1
+        }
+    }
+
+    public func requestFinished() {
+        let generation = state.withLock { state in
+            state.requestsInFlight -= 1
+            state.generation += 1
+            return state.generation
+        }
+        scheduleExitIfIdle(generation: generation)
+    }
+
+    public func connectionClosed() {
+        let generation = state.withLock { state in
+            state.activeConnections -= 1
+            state.generation += 1
+            return state.generation
+        }
+        scheduleExitIfIdle(generation: generation)
+    }
+
+    /// Schedules an exit in `idleTimeout` seconds, which happens only if the helper is still idle and nothing
+    /// has changed since `generation`. The check and the exit happen under one lock, so no connection can open
+    /// between them and have its work cut off.
+    private func scheduleExitIfIdle(generation: Int) {
+        let isReplaced = program.map { ItemIdentity(ofItemAt: $0.path) != $0.identity } ?? false
+        schedule(isReplaced ? 0 : idleTimeout) { [self] in
+            state.withLock { state in
+                if state.activeConnections == 0, state.requestsInFlight == 0, state.generation == generation {
+                    exit()
+                }
+            }
+        }
+    }
+}

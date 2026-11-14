@@ -1,0 +1,238 @@
+public import Foundation
+internal import PeelPrivileged
+
+public struct InstalledApp: Sendable, Hashable, Identifiable {
+    public let url: URL
+    /// Nil for an app whose Info.plist names none, which macOS still opens.
+    public let bundleIdentifier: String?
+    public let name: String
+    public let bundleName: String?
+    public let version: String?
+    public let buildVersion: String?
+    public let teamIdentifier: String?
+    /// The maker, as the app's signature names it. Nil when the signature names nobody, as for an App Store
+    /// app, which Apple signs again.
+    public let developer: String?
+    public let applicationGroups: [String]
+    public let embeddedBundleIdentifiers: [String]
+    public let architectures: Set<Architecture>
+    /// Whether its Info.plist puts Intel first in `LSArchitecturePriority`, so macOS runs a universal app under
+    /// Rosetta on Apple silicon.
+    public let asksForIntelFirst: Bool
+    public let isFromAppStore: Bool
+    /// Whether the App Store signed the bundle under its own identifier, which belongs to one developer's team alone.
+    public let isSignedByTheAppStore: Bool
+    public let isSystemProtected: Bool
+    /// The package the app sits inside, such as the app it is a helper of. Moved alone, the app would be cut out
+    /// of that package, so it stays with it.
+    public let enclosingPackage: URL?
+    /// When the app was last opened, as Spotlight records it. Nil when it never was, or when nothing records it.
+    public private(set) var lastUsedDate: Date?
+    /// Whether Spotlight records when the app is opened, so that no `lastUsedDate` means it never was. Spotlight
+    /// keeps no record for an app in a folder it does not index.
+    public private(set) var isUseRecorded: Bool
+    public let dateAdded: Date?
+    public let updateFeed: UpdateFeed?
+    /// The folder electron-updater keeps this app's downloads in, as its `app-update.yml` names it.
+    public let updaterFolder: String?
+    /// The id Velopack keeps this app's updates under (`Velopack.id(in:)`).
+    public let velopackID: String?
+    /// The folders the app's own product file names for its data (`ProductFolders`).
+    public let productFolders: [ProductFolder]
+    /// Whether this is Peel, which is removed only from its own Settings, where the helper and the login item
+    /// are unregistered first. Also true for the bundle the running code sits inside, such as the Peel that
+    /// embeds the `peel` tool, whatever its name or identifier.
+    public let isPeelItself: Bool
+    /// Whether this is the very bundle the running code was started from: the copy of Peel that is running.
+    public let isTheRunningCopy: Bool
+    /// The browser's web app this is, or nil for any other app.
+    public let webApp: WebApp?
+    /// Whether the bundle carries a system extension, which macOS removes only when Finder moves the app.
+    public let carriesSystemExtensions: Bool
+    /// Whether the whole seal of the bundle holds, read only for an app whose maker keeps its uninstall script in it.
+    public let isSealIntact: Bool?
+
+    /// Whether `other`, a reading of the same path, is the same build. Not `==`: the date an app was last opened
+    /// changes every time it is opened, which is no reason to forget its size or check it for updates again.
+    public func isTheSameBuild(as other: InstalledApp) -> Bool {
+        version == other.version && buildVersion == other.buildVersion && architectures == other.architectures
+            && teamIdentifier == other.teamIdentifier
+    }
+
+    public init(
+        url: URL,
+        bundleIdentifier: String?,
+        name: String,
+        bundleName: String? = nil,
+        version: String? = nil,
+        buildVersion: String? = nil,
+        teamIdentifier: String? = nil,
+        developer: String? = nil,
+        applicationGroups: [String] = [],
+        embeddedBundleIdentifiers: [String] = [],
+        architectures: Set<Architecture> = [.arm64],
+        asksForIntelFirst: Bool = false,
+        isFromAppStore: Bool = false,
+        isSignedByTheAppStore: Bool = false,
+        isSystemProtected: Bool = false,
+        enclosingPackage: URL? = nil,
+        lastUsedDate: Date? = nil,
+        isUseRecorded: Bool = true,
+        dateAdded: Date? = nil,
+        updateFeed: UpdateFeed? = nil,
+        updaterFolder: String? = nil,
+        velopackID: String? = nil,
+        productFolders: [ProductFolder] = [],
+        webApp: WebApp? = nil,
+        carriesSystemExtensions: Bool = false,
+        isSealIntact: Bool? = nil
+    ) {
+        self.url = url
+        self.bundleIdentifier = bundleIdentifier.flatMap { $0.isEmpty ? nil : $0 }
+        self.name = name
+        self.bundleName = bundleName
+        self.version = version
+        self.buildVersion = buildVersion
+        self.teamIdentifier = teamIdentifier
+        self.developer = developer
+        self.applicationGroups = applicationGroups
+        self.embeddedBundleIdentifiers = embeddedBundleIdentifiers
+        self.architectures = architectures
+        self.asksForIntelFirst = asksForIntelFirst
+        self.isFromAppStore = isFromAppStore
+        self.isSignedByTheAppStore = isSignedByTheAppStore
+        self.isSystemProtected = isSystemProtected
+        self.enclosingPackage = enclosingPackage
+        self.lastUsedDate = lastUsedDate
+        self.isUseRecorded = isUseRecorded
+        self.dateAdded = dateAdded
+        self.webApp = webApp
+        self.updateFeed = updateFeed
+        self.updaterFolder = updaterFolder
+        self.velopackID = velopackID
+        self.productFolders = productFolders
+        self.carriesSystemExtensions = carriesSystemExtensions
+        self.isSealIntact = isSealIntact
+        let path = PathPattern.comparablePath(of: url)
+        isPeelItself = Self.isPeel(self.bundleIdentifier, at: path)
+        isTheRunningCopy = path == Self.runningBundle
+    }
+
+    public var id: URL { url }
+
+    /// The apps that have an identifier, grouped by it.
+    public static func byIdentifier(_ apps: [InstalledApp]) -> [String: [InstalledApp]] {
+        Dictionary(grouping: apps.compactMap { app in app.bundleIdentifier.map { ($0, app) } }, by: \.0)
+            .mapValues { $0.map(\.1) }
+    }
+
+    /// How Peel names the app where it records whose a file is (`LeftoverMatch.sharedWith`): its identifier, or else
+    /// where it is.
+    public var reference: String { bundleIdentifier ?? PathPattern.comparablePath(of: url) }
+
+    /// Whether Apple made the app, as its identifier says. An app with no identifier is somebody else's.
+    var isApples: Bool { bundleIdentifier.map(ProtectedData.isApplesName) ?? false }
+
+    /// Whether this is a web app Safari made (`SafariWebApp`), whose identifier names it and nothing of Apple's.
+    public var isASafariWebApp: Bool { webApp == .safari }
+
+    public var isIntelOnly: Bool { architectures == [.x86_64] }
+
+    /// A universal app that still runs as Intel on Apple silicon, because its Info.plist asks for Intel first.
+    public var prefersIntel: Bool { asksForIntelFirst && architectures.contains(.x86_64) && !isIntelOnly }
+
+    public var isFromSetapp: Bool { Self.isFromSetapp(at: url, identifier: bundleIdentifier) }
+
+    /// Whether the app at `url` came from Setapp. Setapp's documentation says a bundle identifier "must use the
+    /// -setapp suffix", and Setapp installs apps in an `Applications/Setapp` folder, the system's or the user's.
+    static func isFromSetapp(at url: URL, identifier: String?) -> Bool {
+        let folder = url.deletingLastPathComponent()
+        return identifier?.lowercased().hasSuffix("-setapp") == true
+            || (folder.lastPathComponent == "Setapp" && folder.deletingLastPathComponent().lastPathComponent == "Applications")
+    }
+
+    /// Returns a copy with what Spotlight records of the app's use, which can change while the bundle stays the same.
+    func withUse(lastUsedDate date: Date?, isUseRecorded isRecorded: Bool) -> InstalledApp {
+        var copy = self
+        copy.lastUsedDate = date
+        copy.isUseRecorded = isRecorded
+        return copy
+    }
+
+    static let runningBundle = PathPattern.comparablePath(of: Bundle.main.bundleURL)
+
+    private static func isPeel(_ bundleIdentifier: String?, at path: String) -> Bool {
+        bundleIdentifier.map(Identifier.isPeels) == true || PathComponents.isPath(runningBundle, inside: path)
+    }
+
+    /// The name Finder shows, which follows the user's language when the app translates it, and the bundle's file
+    /// name, which does not. Anything that decides by name checks both, so the app and `peel`, which always sees
+    /// English names, reach the same answer.
+    public var names: [String] {
+        let fileName = url.deletingPathExtension().lastPathComponent
+        return fileName == name ? [name] : [name, fileName]
+    }
+
+    var matchingNames: Set<String> {
+        var names: Set<String> = [name, url.deletingPathExtension().lastPathComponent]
+        if let bundleName { names.insert(bundleName) }
+        for name in names {
+            if let withoutVersion = Naming.withoutTrailingVersion(name) { names.insert(withoutVersion) }
+        }
+        // The identifier's last part when it is one of these names with a version right after it, as Folx's
+        // `com.eltima.Folx3` names its `Folx3` folders. A number after any other name stays part of that name.
+        if let last = bundleIdentifier?.split(separator: ".").last.map(String.init) {
+            let word = last.lowercased()
+            let isANameAndAVersion = names.contains { name in
+                let name = name.lowercased()
+                return word.count > name.count && word.hasPrefix(name)
+                    && word.dropFirst(name.count).allSatisfy { $0.isASCII && $0.isNumber }
+            }
+            if isANameAndAVersion { names.insert(last) }
+        }
+        return names
+    }
+
+    /// How this app is removed when Peel never removes it from its page: Peel itself, or an agent its maker's own
+    /// uninstaller removes.
+    public var removedElsewhere: RemovedElsewhere? {
+        isPeelItself ? .byRemovePeel : MakersUninstaller.of(self).map(RemovedElsewhere.byItsMaker)
+    }
+
+    /// What a folder of the app's or its maker's is called, as `Naming.folderName` writes it: the app's names, its
+    /// identifier, the maker's part of the identifier and that part's last name, and the leading words of the
+    /// developer its signature names (`BraveSoftware` for "Brave Software, Inc.").
+    var ownFolderNames: Set<String> {
+        var folders = Set(matchingNames.filter(Naming.isSignificant).map(Naming.normalized))
+        if let bundleIdentifier {
+            folders.insert(Naming.normalized(bundleIdentifier))
+            if let vendor = Identifier.vendor(of: bundleIdentifier.lowercased()) {
+                folders.insert(Naming.normalized(vendor))
+                folders.insert(Naming.normalized(String(vendor.split(separator: ".").last ?? "")))
+            }
+        }
+        let words = (developer ?? "").split { !$0.isLetter && !$0.isNumber }.map { $0.lowercased() }
+        for end in words.indices { folders.insert(words[...end].joined()) }
+        return folders.filter { !$0.isEmpty }
+    }
+
+    /// The names of its maker's own folder, normalized: the maker its identifier names (`jetbrains`), the same written
+    /// as a domain (`bunkus.org`), and the leading words of the developer its signature names. Never its own names.
+    var makersFolderNames: Set<String> {
+        var folders: Set<String> = []
+        if let vendor = bundleIdentifier.flatMap({ Identifier.vendor(of: $0.lowercased()) }) {
+            let parts = vendor.split(separator: ".")
+            folders.insert(Naming.normalized(String(parts.last ?? "")))
+            folders.insert(Naming.normalized(parts.reversed().joined(separator: ".")))
+        }
+        let words = (developer ?? "").split { !$0.isLetter && !$0.isNumber }.map { $0.lowercased() }
+        for end in words.indices { folders.insert(words[...end].joined()) }
+        let own = Set(matchingNames.map(Naming.normalized))
+        return folders.filter { Naming.isLongEnough($0) && !own.contains($0) }
+    }
+}
+
+public enum Architecture: String, Sendable, Hashable, CaseIterable {
+    case arm64
+    case x86_64
+}

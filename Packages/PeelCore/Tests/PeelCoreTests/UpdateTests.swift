@@ -1,0 +1,1113 @@
+import Foundation
+@testable import PeelCore
+import Testing
+
+struct VersionComparisonTests {
+    @Test(arguments: [
+        ("2.11", "2.11.0", ComparisonResult.orderedSame),
+        ("1.34.0", "1.33.9", .orderedDescending),
+        ("1.9", "1.10", .orderedAscending),
+        ("2259", "2258", .orderedDescending),
+        ("2.0", "2.0b3", .orderedDescending),
+        ("v3.1.0", "3.1", .orderedSame),
+        ("2.19.0.2258 release", "2.19.0.2258", .orderedAscending),
+        // A component too large for an `Int` counts as the largest there is, so the rest keep their places.
+        ("1.99999999999999999999.5", "1.2.9", .orderedDescending),
+        // Build metadata and a build number in parentheses say nothing about which is newer.
+        ("1.2.3+45", "1.2.3", .orderedSame),
+        ("1.2.3 (456)", "1.2.3", .orderedSame),
+    ])
+    func compares(lhs: String, rhs: String, expected: ComparisonResult) {
+        #expect(VersionComparison.compare(lhs, rhs) == expected)
+    }
+}
+
+struct UpdateStatusTests {
+    @Test func aKeptPageIsGivenOnlyWhenABrowserOpensIt() throws {
+        let page = try #require(URL(string: "https://example.org/notes"))
+        #expect(UpdateStatus.updateAvailable(version: "2", releaseNotes: page).releaseNotes == page)
+        for address in ["file:///Applications/Calculator.app", "ssh://example.org", "x-apple.systempreferences:"] {
+            let kept = UpdateStatus.updateAvailable(version: "2", source: .homebrew, releaseNotes: URL(string: address))
+            #expect(kept.releaseNotes == nil, "\(address)")
+        }
+    }
+}
+
+struct AppcastTests {
+    private func latestItem(in feed: String, systemVersion: String = "26.7.0") -> AppcastItem? {
+        if case .latest(let item) = Appcast.read(Data(feed.utf8), systemVersion: systemVersion, isAppleSilicon: true) {
+            item
+        } else {
+            nil
+        }
+    }
+
+    /// A feed shared with WinSparkle lists a Windows build beside the Mac one, and the last release for an
+    /// older macOS can set a maximum system version below this one. Sparkle skips both, so Peel does too, or
+    /// it would announce an update the app itself says does not exist.
+    @Test func skipsItemsForAnotherSystemOrAnOlderMacOS() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><enclosure url="https://example.com/win.exe" sparkle:version="510" sparkle:os="windows" /></item>
+        <item><sparkle:version>505</sparkle:version><sparkle:maximumSystemVersion>15.9</sparkle:maximumSystemVersion></item>
+        <item><enclosure url="https://example.com/mac.zip" sparkle:version="500" sparkle:os="macos" /></item>
+        </channel></rss>
+        """
+        #expect(try #require(latestItem(in: feed)).version == "500")
+    }
+
+    /// Sparkle does not offer an Intel Mac a release that lists `arm64` among its hardware requirements, so neither
+    /// does Peel. The list is split at spaces and commas and read without case, as Sparkle reads it.
+    @Test func skipsAReleaseForAppleSiliconOnAnIntelMac() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><sparkle:version>600</sparkle:version><sparkle:hardwareRequirements>ARM64</sparkle:hardwareRequirements></item>
+        <item><sparkle:version>550</sparkle:version><sparkle:hardwareRequirements>metal,arm64</sparkle:hardwareRequirements></item>
+        <item><sparkle:version>500</sparkle:version><sparkle:hardwareRequirements>metal</sparkle:hardwareRequirements></item>
+        </channel></rss>
+        """
+        let read = { (isAppleSilicon: Bool) in
+            Appcast.read(Data(feed.utf8), systemVersion: "26.7.0", isAppleSilicon: isAppleSilicon)
+        }
+        guard case .latest(let onIntel) = read(false), case .latest(let onAppleSilicon) = read(true) else {
+            Issue.record("the feed was not read")
+            return
+        }
+        #expect(onIntel.version == "500")
+        #expect(onAppleSilicon.version == "600")
+        #expect(onAppleSilicon.hardwareRequirements == ["arm64"])
+
+        let onlyForAppleSilicon = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><sparkle:version>600</sparkle:version><sparkle:hardwareRequirements>arm64 metal</sparkle:hardwareRequirements></item>
+        </channel></rss>
+        """
+        #expect(
+            Appcast.read(Data(onlyForAppleSilicon.utf8), systemVersion: "26.7.0", isAppleSilicon: false)
+                == .nothingForThisMac
+        )
+    }
+
+    /// The parser under `XMLParser` refuses a feed whose internal entities would grow it ten billion times.
+    @Test func aFeedOfNestedEntitiesIsRefusedAtOnce() {
+        func feed(using entity: String) -> Data {
+            var entities = #"<!ENTITY a0 "1">"#
+            for level in 1...10 {
+                entities += "<!ENTITY a\(level) \"" + String(repeating: "&a\(level - 1);", count: 10) + "\">"
+            }
+            return Data("""
+            <?xml version="1.0"?><!DOCTYPE rss [\(entities)]>
+            <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+            <item><sparkle:version>\(entity)</sparkle:version></item>
+            </channel></rss>
+            """.utf8)
+        }
+        var reading: Appcast.Reading?
+
+        let took = processorTime { reading = Appcast.read(feed(using: "&a10;"), systemVersion: "26.7.0", isAppleSilicon: true) }
+
+        #expect(reading == .unreadable)
+        #expect(took < .seconds(1))
+        #expect(Appcast.read(feed(using: "&a1;"), systemVersion: "26.7.0", isAppleSilicon: true) != .unreadable)
+    }
+
+    /// Read where an update round reads a feed, on a thread of Swift's pool: its stack is small, and the system's
+    /// pick among languages takes room there for each language it is offered.
+    @Test func anItemNamingThousandsOfLanguagesIsRead() async {
+        let notes = (0..<6_000).map { #"<description xml:lang="x\#($0)">notes \#($0)</description>"# }.joined()
+        let feed = Data("""
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
+        <sparkle:version>200</sparkle:version>\(notes)
+        </item></channel></rss>
+        """.utf8)
+
+        let reading = await Task.detached {
+            Appcast.read(feed, systemVersion: "26.7.0", isAppleSilicon: true)
+        }.value
+
+        guard case .latest(let item) = reading else {
+            Issue.record("the feed wasn't read")
+            return
+        }
+        #expect(item.description == "notes 0")
+    }
+
+    @Test func anItemsLinksAreReadInTimeThatFollowsTheirNumber() {
+        let links = (0..<12_000).map { #"<link xml:lang="x\#($0)">https://example.com/\#($0)</link>"# }.joined()
+        let feed = Data("""
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
+        <sparkle:version>200</sparkle:version>\(links)
+        </item></channel></rss>
+        """.utf8)
+        var reading: Appcast.Reading?
+
+        let took = processorTime { reading = Appcast.read(feed, systemVersion: "26.7.0", isAppleSilicon: true) }
+
+        guard case .latest(let item) = reading else {
+            Issue.record("the feed wasn't read")
+            return
+        }
+        #expect(item.releaseNotes == URL(string: "https://example.com/0"))
+        #expect(took < .seconds(1), "took \(took)")
+    }
+
+    @Test func tellsAHealthyFeedWithNothingForThisMacFromOneItCannotRead() {
+        let future = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><sparkle:version>4</sparkle:version><sparkle:minimumSystemVersion>99.0</sparkle:minimumSystemVersion></item>
+        </channel></rss>
+        """
+        #expect(Appcast.read(Data(future.utf8), systemVersion: "26.7.0", isAppleSilicon: true) == .nothingForThisMac)
+        #expect(Appcast.read(Data("<rss><channel>".utf8), systemVersion: "26.7.0", isAppleSilicon: true) == .unreadable)
+    }
+
+    @Test func readsOnlyTheItemsSparkleReads() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><sparkle:version>300</sparkle:version></item>
+        <extra><item><sparkle:version>900</sparkle:version></item></extra>
+        </channel><item><sparkle:version>800</sparkle:version></item></rss>
+        """
+        #expect(try #require(latestItem(in: feed)).version == "300")
+        #expect(Appcast.read(Data("<plist><array/></plist>".utf8), systemVersion: "26.7.0", isAppleSilicon: true) == .unreadable)
+    }
+
+    /// Sparkle reads the version from the enclosure's attribute first, and from the element only when there is
+    /// none. An item's `<link>` is usually the product page, not the release notes.
+    @Test func followsSparklesOrderForVersionsAndNotes() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
+        <link>https://example.com/product</link>
+        <sparkle:version>1</sparkle:version>
+        <sparkle:releaseNotesLink>https://example.com/notes.html</sparkle:releaseNotesLink>
+        <enclosure url="https://example.com/a.zip" sparkle:version="2" />
+        </item></channel></rss>
+        """
+        let item = try #require(latestItem(in: feed))
+        #expect(item.version == "2")
+        #expect(item.releaseNotes == URL(string: "https://example.com/notes.html"))
+    }
+
+    /// Sparkle lets a feed give release notes per language with `xml:lang`. The reader's language comes first,
+    /// then notes with no language. A language the reader did not ask for is the last resort.
+    @Test func picksTheReleaseNotesInTheReadersLanguage() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
+        <sparkle:version>2</sparkle:version>
+        <sparkle:releaseNotesLink xml:lang="de">https://example.com/de.html</sparkle:releaseNotesLink>
+        <sparkle:releaseNotesLink>https://example.com/en.html</sparkle:releaseNotesLink>
+        <sparkle:releaseNotesLink xml:lang="fr">https://example.com/fr.html</sparkle:releaseNotesLink>
+        </item></channel></rss>
+        """
+        let item = try #require(latestItem(in: feed))
+        #expect(item.releaseNotes != nil)
+        let links: [(language: String, value: URL)] = [
+            ("de", URL(string: "https://example.com/de.html")!), ("", URL(string: "https://example.com/en.html")!),
+            ("fr", URL(string: "https://example.com/fr.html")!),
+        ]
+        #expect(Appcast.preferred(links, languages: ["fr-FR", "en"]) == URL(string: "https://example.com/fr.html"))
+        #expect(Appcast.preferred(links, languages: ["ro-RO", "en"]) == URL(string: "https://example.com/en.html"))
+        #expect(Appcast.preferred(Array(links.filter { !$0.language.isEmpty }), languages: ["ro"]) == URL(string: "https://example.com/de.html"))
+    }
+
+    @Test func readsNewestItemFromElements() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><sparkle:version>2257</sparkle:version><sparkle:shortVersionString>2.18.9</sparkle:shortVersionString></item>
+        <item>
+          <sparkle:version>2258</sparkle:version>
+          <sparkle:shortVersionString>2.19.0.2258 release</sparkle:shortVersionString>
+          <sparkle:minimumSystemVersion>12.7.6</sparkle:minimumSystemVersion>
+          <enclosure url="https://example.com/app.dmg" length="1" />
+        </item>
+        </channel></rss>
+        """
+        let item = try #require(latestItem(in: feed))
+        #expect(item.version == "2258")
+        #expect(item.displayVersion == "2.19.0.2258 release")
+    }
+
+    @Test func readsVersionsFromEnclosureAttributes() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><enclosure url="https://example.com/a.zip" sparkle:version="310" sparkle:shortVersionString="3.1" /></item>
+        </channel></rss>
+        """
+        let item = try #require(latestItem(in: feed))
+        #expect(item.version == "310")
+        #expect(item.displayVersion == "3.1")
+    }
+
+    @Test func readsTheSystemBoundsOfAnyMacOSAndIgnoresOnesItCannotRead() throws {
+        func offered(minimum: String? = nil, maximum: String? = nil, on system: String) -> Bool {
+            let bounds = [minimum.map { "<sparkle:minimumSystemVersion>\($0)</sparkle:minimumSystemVersion>" },
+                          maximum.map { "<sparkle:maximumSystemVersion>\($0)</sparkle:maximumSystemVersion>" }]
+            let feed = """
+            <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+            <item><sparkle:version>2</sparkle:version>\(bounds.compactMap(\.self).joined())</item>
+            <item><sparkle:version>1</sparkle:version></item>
+            </channel></rss>
+            """
+            return latestItem(in: feed, systemVersion: system)?.version == "2"
+        }
+
+        #expect(!offered(minimum: "27", on: "26.7.1"))
+        #expect(offered(minimum: "27", on: "27.0"))
+        #expect(offered(minimum: "27.0", on: "28.0"))
+        #expect(offered(minimum: "28.2", on: "30.1"))
+        #expect(!offered(maximum: "27.9", on: "28.0"))
+        #expect(offered(maximum: "28", on: "28.0"))
+        #expect(offered(minimum: "Golden Gate", on: "26.7.1"))
+        #expect(offered(maximum: "Golden Gate", on: "28.0"))
+    }
+
+    @Test func skipsChannelsAndItemsForNewerSystems() throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <item><sparkle:version>5</sparkle:version><sparkle:channel>beta</sparkle:channel></item>
+        <item><sparkle:version>4</sparkle:version><sparkle:minimumSystemVersion>28.0</sparkle:minimumSystemVersion></item>
+        <item><sparkle:version>3</sparkle:version></item>
+        </channel></rss>
+        """
+        let item = try #require(latestItem(in: feed))
+        #expect(item.version == "3")
+    }
+
+
+    @Test func readsTheNotesAFeedWritesInsideAnItem() async throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+        <description>The channel's own words</description>
+        <item><sparkle:version>2</sparkle:version>
+        <description><![CDATA[<ul><li>New search</li></ul>]]></description>
+        </item></channel></rss>
+        """
+
+        #expect(try await #require(latestItem(in: feed)).notes() == ReleaseNotes("<ul><li>New search</li></ul>", format: .html))
+    }
+
+    @Test(arguments: [("plain-text", ReleaseNotes.Format.plainText), ("Markdown", .markdown), ("html", .html)])
+    func readsTheFormatAFeedGivesItsNotes(_ name: String, _ format: ReleaseNotes.Format) async throws {
+        let feed = """
+        <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
+        <sparkle:version>2</sparkle:version><description sparkle:format="\(name)">New search</description>
+        </item></channel></rss>
+        """
+
+        #expect(try await #require(latestItem(in: feed)).notes()?.format == format)
+    }
+
+    @Test func picksTheNotesInTheReadersLanguage() {
+        let notes: [(language: String, value: String)] = [("de", "Neue Suche"), ("", "New search"), ("fr", "Nouvelle recherche")]
+
+        #expect(Appcast.preferred(notes, languages: ["fr-FR", "en"]) == "Nouvelle recherche")
+        #expect(Appcast.preferred(notes, languages: ["ro-RO", "en"]) == "New search")
+    }
+}
+
+struct VelopackTests {
+    @Test func readsTheIdVelopacksManifestDeclaresOnlyBesideItsUpdater() throws {
+        let directory = try TemporaryDirectory()
+        let manifest = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <package xmlns="http://schemas.microsoft.com/packaging/2010/07/nuspec.xsd"><metadata>
+          <id>TidewaterStudio</id><version>2.0.0</version><title>Tidewater Studio</title>
+        </metadata></package>
+        """
+        try directory.file("Studio.app/Contents/MacOS/UpdateMac", bytes: 16)
+        try directory.file("Studio.app/Contents/Resources/sq.version", contents: Data(manifest.utf8))
+        try directory.file("Plain.app/Contents/Resources/sq.version", contents: Data(manifest.utf8))
+        try directory.file("Odd.app/Contents/MacOS/UpdateMac", bytes: 16)
+        try directory.file("Odd.app/Contents/MacOS/sq.version", contents: Data("<package><id>../x</id></package>".utf8))
+
+        #expect(Velopack.id(in: directory.url.appending(path: "Studio.app/Contents")) == "TidewaterStudio")
+        #expect(Velopack.id(in: directory.url.appending(path: "Plain.app/Contents")) == nil)
+        #expect(Velopack.id(in: directory.url.appending(path: "Odd.app/Contents")) == nil)
+    }
+}
+
+struct ElectronUpdaterTests {
+    @Test func buildsFeedURLs() {
+        let generic = "provider: generic\nurl: https://cdn-desktop.tunein.com/release/\nupdaterCacheDirName: example-desktop-updater\n"
+        #expect(ElectronUpdater.feedURL(fromConfiguration: generic)?.absoluteString == "https://cdn-desktop.tunein.com/release/latest-mac.yml")
+
+        let github = "owner: example\nrepo: 'tool'\nprovider: github\nchannel: beta\n"
+        #expect(ElectronUpdater.feedURL(fromConfiguration: github)?.absoluteString == "https://github.com/example/tool/releases/latest/download/beta-mac.yml")
+
+        #expect(ElectronUpdater.feedURL(fromConfiguration: "provider: generic\nurl: http://insecure.example.com/\n") == nil)
+
+        // An app that updates from a company's own GitHub server names it with `host`. Asking github.com
+        // instead would send its owner and repository to a server they were never meant for.
+        #expect(ElectronUpdater.feedURL(fromConfiguration: "provider: github\nhost: git.example.com\nowner: example\nrepo: tool\n") == nil)
+        #expect(ElectronUpdater.feedURL(fromConfiguration: "provider: github\nhost: github.com\nowner: example\nrepo: tool\n") != nil)
+    }
+
+    /// The owner, repository, and channel come from the app's own file, so each has to be one name, as GitHub writes
+    /// an owner's or a repository's and electron-builder a channel's, or they could ask for any page on github.com.
+    @Test func asksGitHubOnlyWithNames() {
+        func feed(_ configuration: String) -> String? {
+            ElectronUpdater.feedURL(fromConfiguration: configuration)?.absoluteString
+        }
+        #expect(feed("provider: github\nowner: example\nrepo: tool.js\n")
+            == "https://github.com/example/tool.js/releases/latest/download/latest-mac.yml")
+        #expect(feed("provider: github\nowner: example-org\nrepo: my_tool\nchannel: beta\n")
+            == "https://github.com/example-org/my_tool/releases/latest/download/beta-mac.yml")
+
+        #expect(feed("provider: github\nowner: vendor?x=1\nrepo: app\n") == nil)
+        #expect(feed("provider: github\nowner: other/project/releases/download/v1/file.yml#\nrepo: app\n") == nil)
+        #expect(feed("provider: github\nowner: vendor\nrepo: app\nchannel: ../../../../orgs/example/repositories?q=\n") == nil)
+        #expect(feed("provider: github\nowner: -vendor\nrepo: app\n") == nil)
+        #expect(feed("provider: github\nowner: vendor\nrepo: .app\n") == nil)
+        #expect(feed("provider: generic\nurl: https://cdn.example.com/release/\nchannel: ../other\n") == nil)
+    }
+
+    @Test func asksAStorageServiceOnlyAtAnAddressTheAppWritesWhole() {
+        func feed(_ configuration: String) -> String? {
+            ElectronUpdater.feedURL(fromConfiguration: configuration)?.absoluteString
+        }
+        let endpoint = "provider: s3\nbucket: marxist-updates\nendpoint: https://s3.nl-ams.scw.cloud\nregion: nl-ams\n"
+        #expect(feed(endpoint) == "https://s3.nl-ams.scw.cloud/marxist-updates/latest-mac.yml")
+        let withPath = "provider: s3\nbucket: example\nendpoint: https://storage.example.com\npath: /releases\nchannel: beta\n"
+        #expect(feed(withPath) == "https://storage.example.com/example/releases/beta-mac.yml")
+        let r2 = "provider: r2\nbucket: example\naccountId: 0123abcd\npublicUrl: https://pub-0123abcd.r2.dev/\npath: updates\n"
+        #expect(feed(r2) == "https://pub-0123abcd.r2.dev/updates/latest-mac.yml")
+
+        #expect(feed("provider: s3\nbucket: example\n") == nil)
+        #expect(feed("provider: s3\nbucket: example\nendpoint: https://storage.example.com\naccelerate: true\n") == nil)
+        #expect(feed("provider: spaces\nname: example\nregion: nyc3\n") == nil)
+        #expect(feed("provider: r2\nbucket: example\naccountId: 0123abcd\n") == nil)
+        #expect(feed("provider: r2\naccountId: 0123abcd\npublicUrl: https://pub-0123abcd.r2.dev\n") == nil)
+        #expect(feed("provider: s3\nbucket: chatbox\nendpoint: https://0123abcd.r2.cloudflarestorage.com\npath: /releases\n") == nil)
+        #expect(feed("provider: s3\nbucket: example\nendpoint: https://0123abcd.eu.r2.cloudflarestorage.com\n") == nil)
+        #expect(feed("provider: s3\nbucket: example\nendpoint: http://storage.example.com\n") == nil)
+        #expect(feed("provider: r2\nbucket: example\naccountId: 0123abcd\npublicUrl: http://pub.example.com\n") == nil)
+    }
+
+    @Test func offersOnlyWhatElectronUpdaterWouldOfferThisMac() throws {
+        let darwin = "25.6.0"
+        func offered(_ fields: String, id: String? = nil) -> Bool {
+            ElectronUpdater.isOffered(
+                fromFeed: "version: 2.0.0\n\(fields)files:\n  - url: a.zip\n", darwinRelease: darwin,
+                updaterID: id.flatMap(UUID.init(uuidString:))
+            )
+        }
+        #expect(!offered("minimumSystemVersion: 99.0.0\n"))
+        #expect(!offered("minimumSystemVersion: '26.0.0'\n"), "compared with the Darwin release, as os.release() is")
+        #expect(offered("minimumSystemVersion: 20.0.0\n"))
+        #expect(offered("minimumSystemVersion: 13.0\n"), "semver can't read it, and the exception lets the update through")
+        #expect(offered("minimumSystemVersion: 25.6.0-beta.2\n"), "a release comes after its prereleases")
+        #expect(!offered("minimumSystemVersion: v25.6.1-beta.1\n"))
+        #expect(offered("stagingPercentage: 10\n", id: "00000000-0000-0000-0000-00000ccccccc"))
+        #expect(!offered("stagingPercentage: 10\n", id: "00000000-0000-0000-0000-000080000000"))
+        #expect(offered("stagingPercentage: 10\n"), "with no id yet, the app's first check decides")
+        #expect(offered("stagingPercentage: lots\n", id: "00000000-0000-0000-0000-000080000000"))
+    }
+
+    @Test func readsVersionFromFeed() {
+        let feed = "version: 1.33.0\nfiles:\n  - url: TuneIn-1.33.0-universal-mac.zip\n    version: 9.9.9\nreleaseDate: '2026-03-30T19:23:16.416Z'\n"
+        #expect(ElectronUpdater.version(fromFeed: feed) == "1.33.0")
+    }
+
+    @Test func readsTheNotesAnElectronFeedWrites() {
+        func notes(_ line: String) -> String? {
+            ElectronUpdater.releaseNotes(fromFeed: "version: 2.0\n\(line)files:\n  - url: a.zip\n")?.text
+        }
+
+        #expect(notes("releaseNotes: Fixed a crash\n") == "Fixed a crash")
+        #expect(notes("releaseNotes: 'It''s fixed'\n") == "It's fixed")
+        #expect(notes("releaseNotes: \"Line one\\nLine \\\"two\\\"\"\n") == "Line one\nLine \"two\"")
+        #expect(notes("releaseNotes: |-\n  ## 2.0\n  - One\n\n  - Two\n") == "## 2.0\n- One\n\n- Two")
+        #expect(notes("releaseNotes: >-\n  One line\n  goes on\n") == "One line goes on")
+        #expect(notes("") == nil)
+    }
+}
+
+struct AppStoreLookupTests {
+    /// Only a Mac record counts: an iPhone app can share the identifier, but its version is not the Mac's. An
+    /// answer with no Mac record is still an answer, unlike a reply that cannot be read.
+    @Test func usesOnlyMacApps() {
+        let mac = #"{"resultCount":1,"results":[{"kind":"mac-software","version":"2.11"}]}"#
+        #expect(AppStoreLookup.answer(in: Data(mac.utf8), for: .mac) == .listed(version: "2.11", page: nil, developer: nil))
+        // The developer is `artistName`, the name the App Store shows. For Apple's apps that is "Apple", the
+        // name Peel also gives the apps Apple signs outside the store; `sellerName` would say "Apple Inc."
+        let sold = #"{"resultCount":1,"results":[{"kind":"mac-software","version":"26.1","artistName":"Apple","sellerName":"Apple Inc."}]}"#
+        #expect(AppStoreLookup.answer(in: Data(sold.utf8), for: .mac) == .listed(version: "26.1", page: nil, developer: "Apple"))
+
+        let iPhone = #"{"resultCount":1,"results":[{"kind":"software","version":"26.36.74"}]}"#
+        #expect(AppStoreLookup.answer(in: Data(iPhone.utf8), for: .mac) == .notListed)
+        let sharedWithTheIPhone = #"{"resultCount":1,"results":[{"kind":"software","version":"16.13.2","supportedDevices":["MacDesktop-MacDesktop","iPhone5s-iPhone5s","iPadAir-iPadAir"]}]}"#
+        #expect(AppStoreLookup.answer(in: Data(sharedWithTheIPhone.utf8), for: .mac) == .notListed)
+        let theMacs = #"{"resultCount":1,"results":[{"kind":"software","version":"16.13.1","supportedDevices":["MacDesktop-MacDesktop","Watch4-Watch4"]}]}"#
+        #expect(
+            AppStoreLookup.answer(in: Data(theMacs.utf8), for: .mac) == .listed(version: "16.13.1", page: nil, developer: nil)
+        )
+
+        // No record at all: the store doesn't sell the app in this region, or anymore. That is an answer too.
+        #expect(AppStoreLookup.answer(in: Data(#"{"resultCount":0,"results":[]}"#.utf8), for: .mac) == .notListed)
+        #expect(AppStoreLookup.answer(in: Data("<html>".utf8), for: .mac) == .unreadable)
+    }
+
+    @Test func readsTheIPhoneAndIPadListingOfAnAppOfThoseDevices() {
+        let iPad = #"{"resultCount":1,"results":[{"kind":"software","version":"1.4.5","artistName":"Example AG"}]}"#
+        #expect(
+            AppStoreLookup.answer(in: Data(iPad.utf8), for: .iPhoneAndiPad(item: nil, store: nil))
+                == .listed(version: "1.4.5", page: nil, developer: "Example AG")
+        )
+        let mac = #"{"resultCount":1,"results":[{"kind":"mac-software","version":"2.0"}]}"#
+        #expect(AppStoreLookup.answer(in: Data(mac.utf8), for: .iPhoneAndiPad(item: nil, store: nil)) == .notListed)
+        #expect(AppStoreLookup.answer(in: Data(#"{"resultCount":0,"results":[]}"#.utf8), for: .iPhoneAndiPad(item: nil, store: nil)) == .notListed)
+    }
+
+    @Test func encodesLookupURL() {
+        let mac = AppStoreLookup.url(bundleIdentifier: "com.shazam.mac.Shazam", country: "ro", for: .mac)
+        #expect(
+            mac?.absoluteString
+                == "https://itunes.apple.com/lookup?bundleId=com.shazam.mac.Shazam&country=ro&entity=desktopSoftware"
+        )
+        let iPad = AppStoreLookup.url(bundleIdentifier: "org.example.weather", country: "de", for: .iPhoneAndiPad(item: nil, store: nil))
+        #expect(iPad?.absoluteString == "https://itunes.apple.com/lookup?bundleId=org.example.weather&country=de")
+        let numbered = AppStoreLookup.url(bundleIdentifier: "org.example.weather", country: "de", for: .iPhoneAndiPad(item: 1234, store: "de"))
+        #expect(numbered?.absoluteString == "https://itunes.apple.com/lookup?id=1234&country=de")
+    }
+}
+
+struct UpdateFeedDetectionTests {
+    private func bundle(
+        info: [String: String],
+        files: [String: String] = [:],
+        identifier: String = "com.example.app",
+        at path: String = "Example.app",
+        in directory: borrowing TemporaryDirectory
+    ) throws -> URL {
+        var plist = info
+        plist["CFBundleIdentifier"] = identifier
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try data.write(to: directory.file("\(path)/Contents/Info.plist"))
+        for (file, contents) in files {
+            try Data(contents.utf8).write(to: directory.file("\(path)/Contents/\(file)"))
+        }
+        return directory.url.appending(path: path)
+    }
+
+    @Test func detectsSparkleOverHTTPSOnly() throws {
+        let secure = try TemporaryDirectory()
+        let app = try #require(AppInspector.inspect(try bundle(info: ["SUFeedURL": "https://example.com/appcast.xml"], in: secure)))
+        #expect(app.updateFeed == .sparkle(URL(string: "https://example.com/appcast.xml")!))
+
+        let insecure = try TemporaryDirectory()
+        let other = try #require(AppInspector.inspect(try bundle(info: ["SUFeedURL": "http://example.com/appcast.xml"], in: insecure)))
+        #expect(other.updateFeed == nil)
+    }
+
+    /// Only an app that came from the App Store is looked up there. Sending every other app's identifier to
+    /// itunes.apple.com would send the list of installed apps, which Peel's Privacy settings say it never sends.
+    @Test func doesNotAskAppleAboutAppsThatDidNotComeFromTheAppStore() throws {
+        let directory = try TemporaryDirectory()
+        let app = try #require(AppInspector.inspect(try bundle(info: [:], in: directory)))
+        #expect(app.updateFeed == nil)
+
+        let store = try TemporaryDirectory()
+        let fromStore = try #require(AppInspector.inspect(try bundle(info: [:], files: ["_MASReceipt/receipt": ""], in: store)))
+        #expect(fromStore.updateFeed == .appStore(.mac))
+    }
+
+    @Test func prefersAppStoreReceiptAndDetectsElectron() throws {
+        let store = try TemporaryDirectory()
+        let storeApp = try #require(AppInspector.inspect(try bundle(info: ["SUFeedURL": "https://example.com/appcast.xml"], files: ["_MASReceipt/receipt": ""], in: store)))
+        #expect(storeApp.updateFeed == .appStore(.mac))
+
+        let electron = try TemporaryDirectory()
+        let electronApp = try #require(AppInspector.inspect(try bundle(info: [:], files: ["Resources/app-update.yml": "provider: generic\nurl: https://example.com/updates/"], in: electron)))
+        #expect(electronApp.updateFeed == .electron(URL(string: "https://example.com/updates/latest-mac.yml")!))
+    }
+
+    @Test func showsACasksVersionWithoutWhatHomebrewAdds() {
+        #expect(UpdateStatus.shownVersion(of: "26.10.22,802") == "26.10.22")
+        #expect(UpdateStatus.shownVersion(of: "1.2") == "1.2")
+    }
+
+    @Test func tellsAProductsPageFromNotes() throws {
+        func item(_ links: String) throws -> AppcastItem {
+            let feed = """
+                <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel><item>
+                <enclosure url="https://example.com/a.zip" sparkle:version="2"/>\(links)</item></channel></rss>
+                """
+            let items = Appcast.releases(in: Data(feed.utf8), systemVersion: "26.0", isAppleSilicon: true)
+            return try #require(items?.first)
+        }
+
+        let page = try item("<link>https://example.com/</link>")
+        #expect(page.releaseNotes == URL(string: "https://example.com/"))
+        #expect(page.notesAreTheProductsPage)
+        let notes = "<sparkle:releaseNotesLink>https://example.com/notes.html</sparkle:releaseNotesLink>"
+        #expect(try !item("<link>https://example.com/</link>\(notes)").notesAreTheProductsPage)
+        #expect(try !item("").notesAreTheProductsPage)
+    }
+
+    @Test func findsTheUpdateServiceVSCodeNames() throws {
+        let folder = try TemporaryDirectory()
+        let product = #"""
+            {"nameShort": "Code", "quality": "stable", "updateUrl": "https://update.code.visualstudio.com",
+             "commit": "e646868227c3e3a9e3f24277c8c7220be42c0be7", "darwinUniversalAssetId": "darwin-universal"}
+            """#
+        let app = try #require(AppInspector.inspect(try bundle(info: [:], files: ["Resources/app/product.json": product], in: folder)))
+        let address = "https://update.code.visualstudio.com/api/update/darwin-universal/stable/latest"
+        #expect(app.updateFeed == .vsCode(try #require(URL(string: address))))
+    }
+
+    @Test func asksVSCodesServiceOnlyAboutAStableBuildOfMicrosofts() {
+        let product: [String: Any] = [
+            "updateUrl": "https://update.code.visualstudio.com", "quality": "stable",
+            "commit": "e646868227c3e3a9e3f24277c8c7220be42c0be7",
+        ]
+
+        #expect(VSCodeUpdateService.feedURL(product: product) != nil)
+        for (key, value) in [("quality", "insider"), ("updateUrl", "https://updates.example.com")] {
+            var other = product
+            other[key] = value
+            #expect(VSCodeUpdateService.feedURL(product: other) == nil, "\(key)")
+        }
+    }
+
+    @Test func tellsVSCodesServiceNothingOfThisMacOrItsBuild() throws {
+        let universal = try #require(VSCodeUpdateService.feedURL(product: [
+            "updateUrl": "https://update.code.visualstudio.com", "quality": "stable",
+            "darwinUniversalAssetId": "darwin-universal",
+            "commit": "e646868227c3e3a9e3f24277c8c7220be42c0be7", "version": "1.144.0",
+        ]))
+        let appleSilicon = VSCodeUpdateService.feedURL(product: [
+            "updateUrl": "https://update.code.visualstudio.com", "quality": "stable",
+        ])
+
+        #expect(appleSilicon == universal)
+        #expect(universal.absoluteString == "https://update.code.visualstudio.com/api/update/darwin-universal/stable/latest")
+    }
+
+    @Test func readsTheFolderElectronUpdaterKeepsItsDownloadsIn() throws {
+        let cases: [(settings: String, folder: String?)] = [
+            ("provider: generic\nurl: https://example.com/updates\nupdaterCacheDirName: notes-updater\n", "notes-updater"),
+            ("provider: generic\r\nupdaterCacheDirName: 'notes-updater'\r\n", "notes-updater"),
+            ("updaterCacheDirName: \"@example_notes-updater\"\n", "@example_notes-updater"),
+            ("provider: generic\nurl: https://example.com/updates\n", nil),
+            ("updaterCacheDirName: ../notes-updater\n", nil),
+            ("publish:\n  updaterCacheDirName: notes-updater\n", nil),
+        ]
+        for (settings, folder) in cases {
+            let directory = try TemporaryDirectory()
+            let app = try #require(
+                AppInspector.inspect(try bundle(info: [:], files: ["Resources/app-update.yml": settings], in: directory))
+            )
+            #expect(app.updaterFolder == folder, "\(settings)")
+        }
+    }
+
+    /// Apps that come with macOS are kept current by Software Update, whatever feed their bundle names. The test
+    /// uses a bundle with a feed, since Calculator names none and would pass with or without the rule.
+    @Test func skipsSystemApps() throws {
+        let info = ["SUFeedURL": "https://example.com/appcast.xml"]
+
+        #expect(
+            UpdateFeed.detect(
+                info: info, electronConfiguration: nil, vsCodeFeed: nil, appStoreListing: nil,
+                isSystemProtected: true, isFromSetapp: false
+            )
+                == nil
+        )
+        #expect(
+            UpdateFeed.detect(
+                info: info, electronConfiguration: nil, vsCodeFeed: nil, appStoreListing: nil,
+                isSystemProtected: false, isFromSetapp: false
+            )
+                == .sparkle(try #require(URL(string: "https://example.com/appcast.xml")))
+        )
+    }
+
+    @Test func leavesAnAppFromSetappToSetapp() throws {
+        let feed = ["SUFeedURL": "https://example.com/appcast.xml"]
+        let electron = ["Resources/app-update.yml": "provider: generic\nurl: https://example.com/updates/"]
+        let suffixed = try TemporaryDirectory()
+        let named = try bundle(info: feed, identifier: "org.example.Sample-setapp", in: suffixed)
+        #expect(try #require(AppInspector.inspect(named)).updateFeed == nil)
+
+        let electronBuild = try TemporaryDirectory()
+        let electronApp = try bundle(info: [:], files: electron, identifier: "org.example.Sample-setapp", in: electronBuild)
+        #expect(try #require(AppInspector.inspect(electronApp)).updateFeed == nil)
+
+        let setappFolder = try TemporaryDirectory()
+        let placed = try bundle(
+            info: feed, identifier: "org.example.Sample", at: "Applications/Setapp/Sample.app", in: setappFolder
+        )
+        #expect(try #require(AppInspector.inspect(placed)).updateFeed == nil)
+
+        let elsewhere = try TemporaryDirectory()
+        let direct = try bundle(info: feed, identifier: "org.example.Sample", at: "Sample.app", in: elsewhere)
+        #expect(try #require(AppInspector.inspect(direct)).updateFeed == .sparkle(URL(string: feed["SUFeedURL"]!)!))
+    }
+
+    @Test func peelReadsItsOwnFeedAsAnySparkleAppDoes() throws {
+        let feed = "https://github.com/TuguiDragos/Peel/releases/latest/download/appcast.xml"
+        let peel = ["CFBundleIdentifier": "com.tuguidragos.Peel", "SUFeedURL": feed]
+        #expect(
+            UpdateFeed.detect(
+                info: peel, electronConfiguration: nil, vsCodeFeed: nil, appStoreListing: nil,
+                isSystemProtected: false, isFromSetapp: false
+            )
+                == .sparkle(URL(string: feed)!)
+        )
+        #expect(
+            UpdateFeed.detect(
+                info: ["CFBundleIdentifier": "com.tuguidragos.Peel"],
+                electronConfiguration: nil,
+                vsCodeFeed: nil,
+                appStoreListing: nil,
+                isSystemProtected: false,
+                isFromSetapp: false
+            ) == nil
+        )
+    }
+}
+
+struct TeamRegistryTests {
+    private func app(_ identifier: String, team: String?) -> InstalledApp {
+        InstalledApp(url: URL(filePath: "/Applications/\(identifier).app"), bundleIdentifier: identifier, name: identifier, teamIdentifier: team)
+    }
+
+    /// A registry that leads nowhere cannot be read, so it reports nothing, says so, and is left as it is.
+    @Test func leavesARegistryItCannotReachAsItIs() async throws {
+        let directory = try TemporaryDirectory()
+        let url = directory.url.appending(path: "teams.json")
+        let path = url.path(percentEncoded: false)
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: "/nowhere/teams.json")
+
+        let nothingThere = FileProblem.failed(SystemError(domain: NSPOSIXErrorDomain, code: Int(ENOENT)))
+        let outcome = await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111")])
+        #expect(outcome == .init(changes: [], problem: .unreadable(nothingThere)))
+
+        let kind = try FileManager.default.attributesOfItem(atPath: path)[.type] as? FileAttributeType
+        #expect(kind == .typeSymbolicLink, "the registry was written over")
+    }
+
+    /// A change of signer is the one security warning the Applications tool gives. It is kept on disk and
+    /// reported at every launch until the user acknowledges it.
+    @Test func keepsSayingAnAppChangedHandsUntilItIsAcknowledged() async throws {
+        let directory = try TemporaryDirectory()
+        let url = directory.url.appending(path: "teams.json")
+
+        #expect(await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111"), app("com.example.other", team: nil)]).changes.isEmpty)
+        #expect(await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111")]).changes.isEmpty)
+
+        let changed = await TeamRegistry(url: url).check([app("com.example.app", team: "BBBB222222")]).changes
+        #expect(changed.map(\.previous) == ["AAAA111111"])
+        #expect(changed.map(\.current) == ["BBBB222222"])
+
+        let nextLaunch = await TeamRegistry(url: url).check([app("com.example.app", team: "BBBB222222")]).changes
+        #expect(nextLaunch.map(\.previous) == ["AAAA111111"], "the change was said once and then forgotten")
+        #expect(nextLaunch.map(\.current) == ["BBBB222222"])
+
+        #expect(await TeamRegistry(url: url).acknowledge("com.example.app") == nil)
+        #expect(await TeamRegistry(url: url).check([app("com.example.app", team: "BBBB222222")]).changes.isEmpty)
+    }
+
+    /// An app signed again by the team it had has no change left to report.
+    @Test func forgetsAChangeThatWasUndone() async throws {
+        let directory = try TemporaryDirectory()
+        let registry = TeamRegistry(url: directory.url.appending(path: "teams.json"))
+        _ = await registry.check([app("com.example.app", team: "AAAA111111")])
+        #expect(await registry.check([app("com.example.app", team: "BBBB222222")]).changes.count == 1)
+
+        #expect(await registry.check([app("com.example.app", team: "AAAA111111")]).changes.isEmpty)
+    }
+
+    /// Someone who tampers with an app has no Developer ID for it, so a known team followed by none is the
+    /// strongest sign of tampering. A bundle caught halfway through an update looks the same for a moment, so
+    /// the change is reported only once it has lasted longer than `TeamRegistry.settlingTime`.
+    @Test func saysWhenAnAppIsNoLongerSignedByADeveloper() async throws {
+        let directory = try TemporaryDirectory()
+        let registry = TeamRegistry(url: directory.url.appending(path: "teams.json"))
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        _ = await registry.check([app("com.example.app", team: "AAAA111111")], now: start)
+
+        #expect(await registry.check([app("com.example.app", team: nil)], now: start.addingTimeInterval(60)).changes.isEmpty, "said at once, which an update in progress would trigger")
+        let later = await registry.check(
+            [app("com.example.app", team: nil)],
+            now: start.addingTimeInterval(60 + TeamRegistry.settlingTime + 1)
+        ).changes
+        #expect(later.map(\.previous) == ["AAAA111111"])
+        #expect(later.map(\.current) == [""])
+
+        #expect(await registry.check([app("com.example.app", team: "AAAA111111")], now: start.addingTimeInterval(7_200)).changes.isEmpty, "signed again by the team it had")
+    }
+
+    /// Two copies of one app signed by different teams are acknowledged once. Otherwise each copy would count as
+    /// a change from the other at every launch.
+    @Test func acknowledgesASecondTeamForTheSameAppOnce() async throws {
+        let directory = try TemporaryDirectory()
+        let registry = TeamRegistry(url: directory.url.appending(path: "teams.json"))
+        let copies = [app("com.example.app", team: "AAAA111111"), app("com.example.app", team: "BBBB222222")]
+        _ = await registry.check([copies[0]])
+
+        #expect(await registry.check(copies).changes.map(\.current) == ["BBBB222222"])
+        #expect(await registry.acknowledge("com.example.app") == nil)
+        #expect(await registry.check(copies).changes.isEmpty)
+        #expect(await registry.check(copies.reversed()).changes.isEmpty)
+    }
+
+    @Test func writesNothingWhenNothingChanged() async throws {
+        let directory = try TemporaryDirectory()
+        let url = directory.url.appending(path: "teams.json")
+        _ = await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111")])
+        let written =
+            try FileManager.default.attributesOfItem(atPath: url.path(percentEncoded: false))[.modificationDate]
+            as? Date
+        try await Task.sleep(for: .milliseconds(50))
+
+        _ = await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111")])
+
+        #expect(
+            try FileManager.default.attributesOfItem(atPath: url.path(percentEncoded: false))[.modificationDate]
+                as? Date == written
+        )
+    }
+
+    /// A registry that cannot be read is never written over. Rebuilt from today's apps, it would hide for good a
+    /// change of signer made since it was last read.
+    @Test(.permissionsHold) func leavesARegistryItCannotReadAlone() async throws {
+        let directory = try TemporaryDirectory()
+        let url = directory.url.appending(path: "teams.json")
+        _ = await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111")])
+        let before = try Data(contentsOf: url)
+        try directory.setPermissions(0o000, of: "teams.json")
+        defer { try? directory.setPermissions(0o644, of: "teams.json") }
+
+        let closed = FileProblem.failed(SystemError(domain: NSPOSIXErrorDomain, code: Int(EACCES)))
+        #expect(await TeamRegistry(url: url).check([app("com.example.app", team: "BBBB222222")]) == .init(changes: [], problem: .unreadable(closed)))
+
+        try directory.setPermissions(0o644, of: "teams.json")
+        #expect(try Data(contentsOf: url) == before)
+        #expect(await TeamRegistry(url: url).check([app("com.example.app", team: "BBBB222222")]).changes.count == 1)
+    }
+
+    /// A registry that cannot be read says so on every check, never silently, and starting it over keeps the old
+    /// file beside a new one, which records who signs each app from then on.
+    @Test func startsARegistryItCannotReadOverWhenAsked() async throws {
+        let directory = try TemporaryDirectory()
+        let url = try directory.file("teams.json", contents: Data("{".utf8))
+        let registry = TeamRegistry(url: url)
+
+        #expect(await registry.check([app("com.example.app", team: "AAAA111111")]) == .init(changes: [], problem: .unreadable(.damaged)))
+        #expect(await registry.acknowledge("com.example.app") == .unreadable(.damaged))
+        #expect(try Data(contentsOf: url) == Data("{".utf8))
+
+        #expect(await registry.startOver() == .started)
+        let kept = try FileManager.default.contentsOfDirectory(atPath: directory.url.path(percentEncoded: false))
+        #expect(kept.contains { $0.hasPrefix("teams-damaged-") && $0.hasSuffix(".json") })
+        #expect(await registry.check([app("com.example.app", team: "AAAA111111")]) == .init(changes: [], problem: nil))
+        #expect(await registry.check([app("com.example.app", team: "BBBB222222")]).changes.map(\.current) == ["BBBB222222"])
+    }
+
+    /// Starting over sets aside only a registry that cannot be read. One that reads is what tells a change of
+    /// signer apart, so it stays.
+    @Test func startsOverOnlyARegistryItCannotRead() async throws {
+        let directory = try TemporaryDirectory()
+        let url = directory.url.appending(path: "teams.json")
+        let registry = TeamRegistry(url: url)
+        _ = await registry.check([app("com.example.app", team: "AAAA111111")])
+
+        #expect(await registry.startOver() == .notNeeded)
+        let files = try FileManager.default.contentsOfDirectory(atPath: directory.url.path(percentEncoded: false))
+        #expect(!files.contains { $0.hasPrefix("teams-damaged-") })
+        #expect(await registry.check([app("com.example.app", team: "BBBB222222")]).changes.map(\.previous) == ["AAAA111111"])
+    }
+
+    /// A registry that cannot be saved has not recorded what the check learned, so it says so rather than let the
+    /// next launch start again from the apps as they are then.
+    @Test(.permissionsHold) func saysWhenTheRegistryCannotBeSaved() async throws {
+        let directory = try TemporaryDirectory()
+        _ = try directory.directory("Peel")
+        let url = directory.url.appending(path: "Peel/teams.json")
+        try directory.setPermissions(0o555, of: "Peel")
+        defer { try? directory.setPermissions(0o755, of: "Peel") }
+
+        let refusedWrite = SystemError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        let outcome = await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111")])
+        #expect(outcome == .init(changes: [], problem: .unsaved(.failed(refusedWrite))))
+        #expect(url.isMissing)
+
+        try directory.setPermissions(0o755, of: "Peel")
+        #expect(await TeamRegistry(url: url).check([app("com.example.app", team: "AAAA111111")]) == .init(changes: [], problem: nil))
+        #expect(!url.isMissing)
+    }
+
+    /// A registry written by an earlier version of Peel has no pending changes in it, and still reads.
+    @Test func readsARegistryWrittenBeforeChangesWereKept() async throws {
+        let directory = try TemporaryDirectory()
+        let url = try directory.file("teams.json", contents: Data(#"{"com.example.app":{"firstSeen":"2026-01-01T00:00:00Z","team":"AAAA111111"}}"#.utf8))
+
+        #expect(await TeamRegistry(url: url).check([app("com.example.app", team: "BBBB222222")]).changes.map(\.previous) == ["AAAA111111"])
+    }
+}
+
+struct UpdateSourceTests {
+    @Test func prefersHomebrewWhenTheCaskIsOutdated() {
+        let app = InstalledApp(url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "com.example.app", name: "Example")
+        let cask = HomebrewPackage(
+            name: "example",
+            kind: .cask,
+            homepage: URL(string: "https://example.com"),
+            installedVersion: "1.0",
+            latestVersion: "2.0",
+            isOutdated: true,
+            appNames: ["Example.app"]
+        )
+
+        let status = UpdateChecker().homebrewStatus(for: app, casks: [cask])
+        #expect(status == .updateAvailable(version: "2.0", source: .homebrew, releaseNotes: URL(string: "https://example.com")))
+        #expect(UpdateChecker().homebrewStatus(for: app, casks: []) == nil)
+    }
+
+    @Test func anAppThatUpdatedItselfPastHomebrewsRecordHasNoUpdateFromHomebrew() {
+        let checked = Date(timeIntervalSince1970: 1_792_315_250)
+        let cask = HomebrewPackage(
+            name: "example", kind: .cask, installedVersion: "1.0", latestVersion: "2.0,201", isOutdated: true,
+            appNames: ["Example.app"]
+        ).noting(lastUpdateCheck: checked)
+        let status = { (version: String) in
+            UpdateChecker(clock: { checked + 60 }).homebrewStatus(
+                for: InstalledApp(
+                    url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "com.example.app",
+                    name: "Example", version: version
+                ),
+                casks: [cask]
+            )
+        }
+        let update = UpdateStatus.updateAvailable(version: "2.0,201", source: .homebrew, releaseNotes: nil)
+
+        #expect(status("2.0") == .upToDate)
+        #expect(status("2.1") == .upToDate)
+        #expect(status("1.5") == update)
+        #expect(status("2.0.0") == update, "versions of other lengths compare as Homebrew's don't")
+    }
+
+    @Test func anAppWhoseCaskHomebrewCanNotUpgradeGetsNoAnswerFromHomebrew() throws {
+        let directory = try TemporaryDirectory()
+        let checked = Date(timeIntervalSince1970: 1_792_315_250)
+        // Installed from a package whose receipts are gone, so Homebrew counts what the cask installed as gone.
+        let cask = HomebrewPackage(
+            name: "example", kind: .cask, installedVersion: "1.0", latestVersion: "2.0", isOutdated: true,
+            quitIdentifiers: ["com.example.app"], packageIdentifiers: ["org.example.pkg"]
+        ).kept(inCaskroom: try directory.directory("Caskroom"))
+            .checkingWhatItInstalled(receipts: try directory.directory("receipts"))
+            .noting(lastUpdateCheck: checked)
+        let app = InstalledApp(
+            url: try directory.directory("Applications/Example.app"), bundleIdentifier: "com.example.app",
+            name: "Example", version: "1.0"
+        )
+
+        let status = UpdateChecker(clock: { checked + 60 }).homebrewStatus(for: app, casks: [cask])
+
+        #expect(cask.isMissingWhatItInstalled && !cask.waitsForAnUpgrade)
+        #expect(status == nil, "Homebrew can't upgrade it, and the app isn't up to date")
+    }
+
+    /// `firefox`, `firefox@beta`, and `firefox@esr` all install `Firefox.app`. With `firefox@esr` installed, the
+    /// base cask, which Homebrew only knows of, matches the app too and sorts first, but has no installed
+    /// version. The installed cask is the one to ask, or the waiting update is missed.
+    @Test func asksTheCaskThatIsInstalledNotItsBetterKnownSibling() {
+        let firefox = InstalledApp(url: URL(filePath: "/Applications/Firefox.app"), bundleIdentifier: "org.mozilla.firefox", name: "Firefox")
+        let known = HomebrewPackage(name: "firefox", kind: .cask, latestVersion: "140.0", appNames: ["Firefox.app"])
+        let installed = HomebrewPackage(
+            name: "firefox@esr",
+            kind: .cask,
+            installedVersion: "128.1",
+            latestVersion: "128.2",
+            isOutdated: true,
+            appNames: ["Firefox.app"]
+        )
+        let casks = CaskEvidence.combined(installed: [installed], known: [known])
+
+        #expect(casks.map(\.name) == ["firefox", "firefox@esr"], "the base cask sorts first, which is what hid the other")
+        #expect(
+            UpdateChecker().homebrewStatus(for: firefox, casks: casks)
+                == .updateAvailable(version: "128.2", source: .homebrew, releaseNotes: nil)
+        )
+        #expect(CaskEvidence.cask(for: firefox, in: casks)?.name == "firefox@esr")
+    }
+
+    @Test func homebrewSaysAnAppIsUpToDateOnlyWithinADayOfItsLastCheck() {
+        let checked = Date(timeIntervalSince1970: 1_792_315_250)
+        let day = Homebrew.autoUpdateInterval
+        let unknown = HomebrewPackage(name: "example", kind: .cask, installedVersion: "1.0", latestVersion: "1.0")
+        let current = unknown.noting(lastUpdateCheck: checked)
+        let behind = HomebrewPackage(
+            name: "example", kind: .cask, installedVersion: "1.0", latestVersion: "2.0", isOutdated: true
+        )
+        let update = UpdateStatus.updateAvailable(version: "2.0", source: .homebrew, releaseNotes: nil)
+        let status = { (cask: HomebrewPackage, now: Date) in
+            UpdateChecker.homebrewStatus(of: cask, appVersion: nil, at: now)
+        }
+
+        #expect(day == 86_400)
+        #expect(status(current, checked + 60) == .upToDate)
+        #expect(status(current, checked + day - 1) == .upToDate)
+        #expect(status(current, checked + day) == nil, "Homebrew's own `find -newermt` wants it newer than a day")
+        #expect(status(current, checked + 4 * day) == nil)
+        #expect(status(unknown.noting(lastUpdateCheck: checked + day), checked) == .upToDate, "as for Homebrew")
+        #expect(status(unknown, checked) == nil, "no check known")
+        #expect(status(behind.noting(lastUpdateCheck: checked), checked + 4 * day) == update)
+        #expect(status(behind, checked) == update)
+    }
+
+    @Test func comparesACopyHomebrewDidNotInstallWithTheVersionItsCatalogLists() {
+        let checked = Date(timeIntervalSince1970: 1_792_315_250)
+        let day = Homebrew.autoUpdateInterval
+        let page = URL(string: "https://example.com")
+        let status = { (listed: String, version: String, now: Date) in
+            UpdateChecker(clock: { now }).homebrewStatus(
+                for: InstalledApp(
+                    url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "com.example.app",
+                    name: "Example", version: version
+                ),
+                casks: [
+                    HomebrewPackage(
+                        name: "example", kind: .cask, homepage: page, latestVersion: listed, appNames: ["Example.app"]
+                    ).noting(lastUpdateCheck: checked),
+                ]
+            )
+        }
+        let update = { (version: String) in
+            UpdateStatus.updateAvailable(version: version, source: .homebrew, releaseNotes: page)
+        }
+
+        #expect(status("2.0", "1.0", checked + 4 * day) == update("2.0"), "a catalog never lists an older version")
+        #expect(status("1.0", "1.0", checked + 60) == .upToDate)
+        #expect(status("1.0", "1.1", checked + 60) == .upToDate)
+        #expect(status("1.0", "1.0", checked + day) == nil)
+        #expect(status("27.1.0-58756", "26.3.2", checked) == update("27.1.0-58756"))
+        #expect(status("27.1.0-58756", "27.1.0", checked) == .upToDate)
+        #expect(status("2.1.0", "2.0.5", checked) == update("2.1.0"))
+        #expect(status("1.2.3,456", "1.2.3", checked) == .upToDate)
+        #expect(status("1.0b3", "1.0", checked) == .upToDate)
+        #expect(status("17.0,2026-09", "17.0.24", checked) == nil)
+        #expect(status("5", "5.0.1", checked) == nil)
+        #expect(status("10.3.1", "10.3", checked) == nil, "versions written with another number of parts")
+        #expect(status("26.10.2.103-stable", "26.10.2", checked) == nil, "a build added as a fourth number")
+        #expect(status("2026-07-23", "2.5", checked) == nil)
+        #expect(status("3.2.1", "3.2.1-1234", checked) == nil, "what follows the numbers is no newer version")
+        #expect(status("latest", "1.0", checked) == nil)
+        #expect(status("2.0", "Release 7", checked) == nil)
+    }
+
+    @Test func asksTheCatalogOnlyAboutACopyNothingElseKeepsCurrent() {
+        let checked = Date(timeIntervalSince1970: 1_792_315_250)
+        let checker = UpdateChecker(clock: { checked + 60 })
+        let copy = { (path: String, fromTheAppStore: Bool, ofMacOS: Bool) in
+            InstalledApp(
+                url: URL(filePath: path), bundleIdentifier: "com.example.app", name: "Example", version: "1.0",
+                isFromAppStore: fromTheAppStore, isSystemProtected: ofMacOS
+            )
+        }
+        let listed = HomebrewPackage(name: "example", kind: .cask, latestVersion: "2.0", appNames: ["Example.app"])
+        let installed = HomebrewPackage(
+            name: "example", kind: .cask, installedVersion: "2.0", latestVersion: "2.0", appNames: ["Example.app"],
+            appTargets: ["/Applications/Example.app"]
+        ).noting(lastUpdateCheck: checked)
+        let disabled = HomebrewPackage(
+            name: "example", kind: .cask, latestVersion: "2.0", appNames: ["Example.app"],
+            retirement: HomebrewRetirement(stage: .disabled, reason: nil, disableDate: nil, replacement: nil)
+        )
+        let update = UpdateStatus.updateAvailable(version: "2.0", source: .homebrew, releaseNotes: nil)
+
+        #expect(checker.homebrewStatus(for: copy("/Applications/Example.app", false, false), casks: [listed]) == update)
+        #expect(checker.homebrewStatus(for: copy("/Applications/Example.app", true, false), casks: [listed]) == nil)
+        let setapp = copy("/Applications/Setapp/Example.app", false, false)
+        #expect(checker.homebrewStatus(for: setapp, casks: [listed]) == nil)
+        #expect(checker.homebrewStatus(for: copy("/Applications/Example.app", false, true), casks: [listed]) == nil)
+        #expect(checker.homebrewStatus(for: copy("/Applications/Example.app", false, false), casks: [disabled]) == nil)
+        #expect(
+            checker.homebrewStatus(for: copy("/Users/me/Applications/Example.app", false, false), casks: [installed])
+                == update,
+            "a copy Homebrew didn't put there"
+        )
+        #expect(UpdateChecker.catalogCask(for: copy("/Applications/Example.app", false, false), in: [installed]) == nil)
+        #expect(UpdateChecker.catalogCask(for: copy("/Applications/Example.app", false, false), in: [listed]) == listed)
+    }
+
+    @Test func anUpdateHomebrewReportedHoldsOnlyWhileHomebrewReportsOne() {
+        let homebrew = UpdateStatus.updateAvailable(version: "2.0", source: .homebrew)
+        #expect(homebrew.holds(whileHomebrewSays: homebrew))
+        #expect(homebrew.holds(whileHomebrewSays: .updateAvailable(version: "2.1", source: .homebrew)))
+        #expect(!homebrew.holds(whileHomebrewSays: .upToDate))
+        #expect(!homebrew.holds(whileHomebrewSays: nil))
+
+        #expect(UpdateStatus.updateAvailable(version: "2.0", source: .developer).holds(whileHomebrewSays: nil))
+        #expect(UpdateStatus.updateAvailable(version: "2.0", source: .appStore).holds(whileHomebrewSays: .upToDate))
+        #expect(UpdateStatus.upToDate.holds(whileHomebrewSays: nil))
+        #expect(UpdateStatus.failed.holds(whileHomebrewSays: nil))
+    }
+
+    @Test func showsAHomebrewVersionWithoutWhatTheDownloadNeeds() {
+        let cask = UpdateStatus.updateAvailable(version: "26.10.22,802", source: .homebrew)
+        #expect(cask.displayVersion == "26.10.22")
+        #expect(cask.version == "26.10.22,802", "the whole string is what Skip This Version stores")
+        #expect(UpdateStatus.updateAvailable(version: "1,5", source: .developer).displayVersion == "1,5")
+        #expect(UpdateStatus.upToDate.displayVersion == nil)
+    }
+
+    @Test func readsReleaseNotesFromAnAppcast() {
+        let feed = """
+        <rss><channel><item>
+        <sparkle:shortVersionString>3.2</sparkle:shortVersionString>
+        <sparkle:releaseNotesLink>https://example.com/notes.html</sparkle:releaseNotesLink>
+        </item></channel></rss>
+        """
+        guard case .latest(let item) = Appcast.read(Data(feed.utf8), systemVersion: "26.0.0", isAppleSilicon: true) else {
+            Issue.record("the feed was not read")
+            return
+        }
+        #expect(item.displayVersion == "3.2")
+        #expect(item.releaseNotes == URL(string: "https://example.com/notes.html"))
+    }
+}
+
+struct UpdatePreferencesTests {
+    /// An app's page shows the last answer about it, but not an update the user muted: a skipped version, or an
+    /// app Peel was told never to check, is not announced there again.
+    @Test func aMutedUpdateIsNotShownAsAvailable() {
+        let editor = InstalledApp(
+            url: URL(filePath: "/Applications/Editor.app", directoryHint: .isDirectory),
+            bundleIdentifier: "com.example.editor",
+            name: "Editor",
+            version: "1.0"
+        )
+        let notes = InstalledApp(
+            url: URL(filePath: "/Applications/Notes.app", directoryHint: .isDirectory),
+            bundleIdentifier: "com.example.notes",
+            name: "Notes",
+            version: "2.0"
+        )
+        let waiting = UpdateStatus.updateAvailable(version: "3.0")
+        let newer = UpdateStatus.updateAvailable(version: "4.0")
+        let preferences = UpdatePreferences(source: .automatic, ignoredApps: ["com.example.notes"], skippedVersions: ["com.example.editor": "3.0"])
+
+        #expect(preferences.shownStatus(waiting, for: editor) == nil, "a skipped version was shown as available")
+        #expect(preferences.shownStatus(waiting, for: notes) == nil, "an update of an ignored app was shown as available")
+        #expect(preferences.shownStatus(newer, for: editor) == newer)
+        #expect(preferences.shownStatus(.upToDate, for: editor) == .upToDate)
+        #expect(preferences.shownStatus(.failed, for: notes) == .failed)
+    }
+
+    @Test func anAppWithNoIdentifierIsMutedByWhereItIs() {
+        let plain = InstalledApp(url: URL(filePath: "/Applications/Plain Editor.app"), bundleIdentifier: nil, name: "Plain Editor")
+        let copy = InstalledApp(
+            url: URL(filePath: "/Users/me/Applications/Plain Editor.app"), bundleIdentifier: nil, name: "Plain Editor"
+        )
+        let update = UpdateStatus.updateAvailable(version: "2.0")
+        let ignored = UpdatePreferences(ignoredApps: [plain.reference])
+        let skipped = UpdatePreferences(skippedVersions: [plain.reference: "2.0"])
+
+        #expect(ignored.isIgnored(plain))
+        #expect(!ignored.isIgnored(copy))
+        #expect(!skipped.isWaiting(update, for: plain))
+        #expect(skipped.isWaiting(update, for: copy))
+    }
+}

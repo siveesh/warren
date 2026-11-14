@@ -1,0 +1,637 @@
+public import Foundation
+internal import PeelPrivileged
+
+/// An app, the files it leaves behind, and which of them need administrator rights to move.
+public struct Uninstallation: Sendable {
+    public let app: InstalledApp
+    public let appSize: Int64
+    public let appRequiresPrivileges: Bool
+    public let scan: LeftoverScan
+    /// The user asked Peel to leave this app alone, so nothing of it is offered or moved.
+    public var isExcluded = false
+    /// False when the bundle did not answer in time, so `appSize` is not known rather than zero.
+    public var isAppMeasured = true
+    /// True when moving the bundle would free less than half the space it takes, because most of its files share
+    /// their blocks with another copy, such as one in the Trash: `appSize` is then far below the app's size.
+    public var appSharesStorage = false
+    /// True when the app needs administrator rights and the helper can't move it, so it is never selected. An app
+    /// inside another package stays as part of it instead, the one reason its page gives.
+    public var isAppBeyondTheHelper = false
+    /// True when the app is already in the Trash, where Watch the Trash finds it: its bundle can't move again, so
+    /// it is never selected or counted, and what it left behind still is.
+    public var isAppInTheTrash = false
+    public var uninstallsItself: UninstallsItself?
+    public var installedSystemExtensions = CarriedSystemExtensions.none
+    /// What the app leaves in macOS's own settings folders or in `/opt`, which Peel names and never moves.
+    public var leftInTheSystem: LeftInTheSystem?
+    /// The command its maker gives to undo what the app changed in the Mac's own settings, said before it goes.
+    public var commandToRunFirst: CommandToRunFirst?
+    /// The app's other copies that stay installed, which share its privacy permissions: macOS keeps one set of them
+    /// for every copy of an identifier.
+    public var otherCopies: [URL] = []
+    /// How the app is removed when Peel never removes it from here: Peel itself from Settings, where its helper and
+    /// login item go first (`unreviewedSelection` is that way), an agent by its maker's uninstaller, and an app with
+    /// system extensions macOS installed by Finder. Its files are listed, and nothing of it is selected or moved.
+    public var removedElsewhere: RemovedElsewhere? {
+        RemovedElsewhere.of(app, installedSystemExtensions: installedSystemExtensions)
+    }
+
+    @concurrent
+    public static func prepare(
+        _ app: InstalledApp,
+        installedApps: [InstalledApp],
+        exclusions: Exclusions = .none,
+        casks: [HomebrewPackage] = [],
+        receipts: Set<String> = [],
+        systemExtensions: AppExtensions.SystemExtensionsAnswer = AppExtensions.askingMacOS,
+        environment: SearchEnvironment = .current,
+        answers: PackageReceipts.Answers = PackageReceipts.Answers()
+    ) async -> Uninstallation {
+        await prepare(
+            app, installedApps: installedApps, exclusions: exclusions, casks: casks, receipts: receipts,
+            systemExtensions: systemExtensions, environment: environment,
+            scanner: LeftoverScanner(environment: environment, exclusions: exclusions), rivals: nil, answers: answers
+        )
+    }
+
+    /// Prepares with `scanner`, which apps chosen together share with what it read, `rivals`, worked out here when
+    /// nil, and what `pkgutil` answered. The scanner searches `environment` with `exclusions`.
+    static func prepare(
+        _ app: InstalledApp,
+        installedApps: [InstalledApp],
+        exclusions: Exclusions,
+        casks: [HomebrewPackage],
+        receipts: Set<String>,
+        systemExtensions: AppExtensions.SystemExtensionsAnswer,
+        environment: SearchEnvironment,
+        scanner: LeftoverScanner,
+        rivals: LeftoverScanner.Rivals?,
+        answers: PackageReceipts.Answers
+    ) async -> Uninstallation {
+        async let bundle = FileSize.contents(of: app.url)
+        guard !exclusions.excludes(app) else {
+            return Uninstallation(
+                app: app,
+                appSize: await bundle?.size ?? 0,
+                appRequiresPrivileges: FileAccess.requiresPrivilegesToRemove(app.url),
+                scan: LeftoverScan(leftovers: [], unreadableLocations: []),
+                isExcluded: true,
+                isAppMeasured: await bundle.map { !$0.couldNotBeRead } ?? false,
+                appSharesStorage: await bundle?.sharesMostOfItsStorage ?? false
+            )
+        }
+        let given = rivals
+        let rivals = if let given { given } else { await scanner.rivals(installedApps: installedApps) }
+        let matcher = await scanner.matcher(for: app, rivals: rivals)
+        var scan = await scanner.scan(app, matcher: matcher)
+        if let evidence = CaskEvidence.evidence(for: app, casks: casks, home: environment.homeDirectory) {
+            scan = scan.adding(
+                await caskLeftovers(
+                    evidence,
+                    app: app,
+                    exclusions: exclusions,
+                    matcher: matcher,
+                    environment: environment
+                )
+            )
+        }
+        scan = scan.adding(
+            await receiptLeftovers(
+                for: app, receipts: receipts, installedApps: installedApps, exclusions: exclusions,
+                environment: environment, pkgutil: answers.answer
+            )
+        )
+        scan = scan.adding(
+            await leftoversOfManagedAreas(
+                of: app, matcher: matcher, exclusions: exclusions, environment: environment,
+                listed: scan.leftovers.map(\.url)
+            )
+        )
+        scan = scan.adding(
+            await leftoversItsMakerDocuments(
+                of: app, matcher: matcher, exclusions: exclusions, environment: environment,
+                listed: scan.leftovers.map(\.url)
+            )
+        )
+        scan = scan.adding(
+            await homebrewReceipt(
+                of: app,
+                casks: casks,
+                installedApps: installedApps,
+                exclusions: exclusions,
+                environment: environment
+            )
+        )
+        scan = await scan.splittingFoldersOfMachines(
+            home: environment.homeDirectory.path(percentEncoded: false),
+            root: environment.rootDirectory.path(percentEncoded: false),
+            exclusions: exclusions
+        )
+        scan = scan.holdingBack(placesOthersKeep: matcher.placesOthersKeep(home: environment.homeDirectory))
+        let uninstallsItself = await UninstallsItself.of(app, environment: environment)
+        if let uninstallsItself {
+            scan = scan.leavingToItsUninstaller(uninstallsItself)
+        }
+        scan = scan.holdingBack(signInPlugInsUnder: environment.rootDirectory)
+            .holdingBack(plugInsOtherAppsLoadIn: environment)
+        let reach = HelperReach(environment: environment)
+        scan = await scan.holdingBack(beyond: reach, leaving: app.url).markingTheJobsLaunchdHasLoaded()
+        let appRequiresPrivileges = FileAccess.requiresPrivilegesToRemove(app.url)
+        return Uninstallation(
+            app: app,
+            appSize: await bundle?.size ?? 0,
+            appRequiresPrivileges: appRequiresPrivileges,
+            scan: scan,
+            isAppMeasured: await bundle.map { !$0.couldNotBeRead } ?? false,
+            appSharesStorage: await bundle?.sharesMostOfItsStorage ?? false,
+            isAppBeyondTheHelper: appRequiresPrivileges && !app.isSystemProtected && app.enclosingPackage == nil
+                && reach.isBeyond(app.url),
+            isAppInTheTrash: TrashService.isInsideATrash(app.url, home: environment.homeDirectory),
+            uninstallsItself: uninstallsItself,
+            installedSystemExtensions: await AppExtensions.installed(carriedBy: app, asking: systemExtensions),
+            leftInTheSystem: LeftInTheSystem.of(app, environment: environment),
+            commandToRunFirst: CommandToRunFirst.of(app, environment: environment),
+            otherCopies: matcher.otherCopies.filter(AppInspector.staysInstalled)
+        )
+    }
+
+    /// What the areas `app` manages keep in the home folder, such as Xcode's simulators, which stay when the app goes.
+    /// A place inside a folder in `listed` is that folder's row already, and listed again it would be a row inside it.
+    static func leftoversOfManagedAreas(
+        of app: InstalledApp,
+        matcher: LeftoverMatcher,
+        exclusions: Exclusions,
+        environment: SearchEnvironment,
+        listed: [URL] = [],
+        areas: [SpaceInventory.Definition] = SpaceInventory.definitions
+    ) async -> [Leftover] {
+        let home = environment.homeDirectory
+        let rows = Set(listed.map(ItemKey.init))
+        var leftovers: [Leftover] = []
+        for area in areas {
+            guard let managedBy = area.managedBy, managedBy.includes(app.bundleIdentifier) else { continue }
+            let others = matcher.others(managing: managedBy)
+            for url in area.placesInTheHome(home)
+            where url.isRealFolder && !exclusions.excludes(url) && !isInsideARow(url, rows: rows, home: home) {
+                let leftover = await LeftoverScanner.leftover(
+                    at: url,
+                    kind: place(of: url, in: environment).kind,
+                    match: LeftoverMatch(
+                        reason: .managedByTheApp,
+                        confidence: .certain,
+                        sharedWith: others.apps,
+                        otherCopies: others.copies
+                    ),
+                    parent: ParentAccess(url.deletingLastPathComponent()),
+                    home: home.path(percentEncoded: false),
+                    root: environment.rootDirectory.path(percentEncoded: false)
+                )
+                .heldBack(managedBy.leftBehind)
+                leftovers.append(exclusions.holdBack(for: url).map(leftover.heldBack) ?? leftover)
+            }
+        }
+        return leftovers
+    }
+
+    /// What the app's maker documents keeping in the home folder where the search finds nothing (`DocumentedPlaces`),
+    /// as far as it is there and not a row already.
+    static func leftoversItsMakerDocuments(
+        of app: InstalledApp,
+        matcher: LeftoverMatcher,
+        exclusions: Exclusions,
+        environment: SearchEnvironment,
+        listed: [URL] = []
+    ) async -> [Leftover] {
+        let home = environment.homeDirectory
+        let rows = Set(listed.map(ItemKey.init))
+        var leftovers: [Leftover] = []
+        for documented in DocumentedPlaces.of(app) {
+            let url = home.appending(path: documented.place)
+            guard
+                url.isThere, documented.proof.map({ url.appending(path: $0).isThere }) ?? true,
+                !exclusions.excludes(url), !rows.contains(ItemKey(url)), !isInsideARow(url, rows: rows, home: home)
+            else { continue }
+            let leftover = await LeftoverScanner.leftover(
+                at: url,
+                kind: place(of: url, in: environment).kind,
+                match: LeftoverMatch(
+                    reason: .documentedByItsMaker, confidence: .certain, sharedWith: [],
+                    otherCopies: matcher.otherCopies
+                ),
+                parent: ParentAccess(url.deletingLastPathComponent()),
+                home: home.path(percentEncoded: false),
+                root: environment.rootDirectory.path(percentEncoded: false)
+            )
+            leftovers.append(exclusions.holdBack(for: url).map(leftover.heldBack) ?? leftover)
+        }
+        return leftovers
+    }
+
+    private static func isInsideARow(_ url: URL, rows: Set<ItemKey>, home: URL) -> Bool {
+        guard !rows.isEmpty else { return false }
+        let top = PathPattern.comparablePath(of: home)
+        var folder = url.deletingLastPathComponent()
+        while PathComponents.isPath(PathPattern.comparablePath(of: folder), inside: top) {
+            if rows.contains(ItemKey(folder)) { return true }
+            folder = folder.deletingLastPathComponent()
+        }
+        return false
+    }
+
+    /// The installer receipt files that belong to `app`. The receipt is the only reason macOS still counts the
+    /// package as installed once the app is gone, and it is two small files the Trash can give back. What the
+    /// package installed elsewhere is left to the Package Receipts page, which weighs each item on its own and lists
+    /// it only while the receipt is there, so a receipt whose package left more outside the app is held back.
+    static func receiptLeftovers(
+        for app: InstalledApp,
+        receipts: Set<String>,
+        installedApps: [InstalledApp],
+        exclusions: Exclusions,
+        environment: SearchEnvironment,
+        pkgutil: @escaping PackageReceipts.Pkgutil = PackageReceipts.pkgutil
+    ) async -> [Leftover] {
+        var leftovers = await receiptLeftovers(
+            for: app, receipts: receipts, installedApps: installedApps, exclusions: exclusions,
+            environment: environment, accountHome: nil, pkgutil: pkgutil
+        )
+        // A package installed for one account alone writes only in that account's home folder, and an account with
+        // no package of its own has nothing to find.
+        let home = environment.homeDirectory
+        let homeFolder = PathPattern.comparablePath(of: home)
+        if PathComponents.isPath(PathPattern.comparablePath(of: app.url), inside: homeFolder) {
+            let account = PackageReceipts.forAccount(home: home, pkgutil)
+            let packages = await PackageReceipts.identifiers(pkgutil: account)
+            if !packages.isEmpty {
+                leftovers += await receiptLeftovers(
+                    for: app, receipts: packages, installedApps: installedApps, exclusions: exclusions,
+                    environment: environment, accountHome: home, pkgutil: account
+                )
+            }
+        }
+        return leftovers
+    }
+
+    private static func receiptLeftovers(
+        for app: InstalledApp,
+        receipts: Set<String>,
+        installedApps: [InstalledApp],
+        exclusions: Exclusions,
+        environment: SearchEnvironment,
+        accountHome: URL?,
+        pkgutil: PackageReceipts.Pkgutil
+    ) async -> [Leftover] {
+        let identifier = app.bundleIdentifier?.lowercased()
+        let identifiers = Set((installedApps.map(\.bundleIdentifier) + [identifier]).compactMap { $0?.lowercased() })
+        let named = identifier.map { own in
+            receipts.filter { PackageReceipts.owner(of: $0, among: identifiers) == own }
+        } ?? []
+        let wroteOnlyTheApp = await PackageReceipts.receipts(writingOnly: app.url, pkgutil: pkgutil)
+            .filter { !named.contains($0.lowercased()) }
+        var leftovers: [Leftover] = []
+        for receipt in (Array(named) + wroteOnlyTheApp).sorted() {
+            let leftMore = named.contains(receipt)
+                ? await PackageReceipts.leftSomethingOutside(
+                    receipt, app: app.url, accountHome: accountHome, pkgutil: pkgutil
+                ) : false
+            let volume = accountHome ?? environment.rootDirectory
+            for url in PackageActions.receiptFiles(of: receipt, onVolume: volume, home: environment.homeDirectory)
+            where !exclusions.excludes(url) {
+                let leftover = await LeftoverScanner.leftover(
+                    at: url,
+                    kind: .receipts,
+                    match: LeftoverMatch(reason: .installerReceipt, confidence: .certain, sharedWith: []),
+                    parent: ParentAccess(url.deletingLastPathComponent()),
+                    home: environment.homeDirectory.path(percentEncoded: false),
+                    root: environment.rootDirectory.path(percentEncoded: false)
+                )
+                let heldForThePackage = leftMore && leftover.match.heldBack == nil
+                leftovers.append(heldForThePackage ? leftover.heldBack(.packageLeftMore) : leftover)
+            }
+        }
+        return leftovers
+    }
+
+    /// The folder of the cask Homebrew installed the app from, which keeps Homebrew counting the app as installed once
+    /// it is gone, and which `brew uninstall` would delete for good, with the links Homebrew made into it. Another app
+    /// of the cask still in place shares them.
+    static func homebrewReceipt(
+        of app: InstalledApp,
+        casks: [HomebrewPackage],
+        installedApps: [InstalledApp],
+        exclusions: Exclusions,
+        environment: SearchEnvironment
+    ) async -> [Leftover] {
+        guard
+            let cask = CaskEvidence.installedCask(for: app, in: casks),
+            let folder = cask.caskroomFolder,
+            FileAccess.isARealFolder(folder),
+            !exclusions.excludes(folder)
+        else { return [] }
+        let bundle = PathPattern.comparablePath(of: app.url)
+        let isTheApp = { (path: String) in path.caseInsensitiveCompare(bundle) == .orderedSame }
+        let others = cask.appTargets.filter { target in
+            !isTheApp(target) && FileManager.default.fileExists(atPath: target)
+        }
+        let otherApps = installedApps.filter { other in
+            !isTheApp(PathPattern.comparablePath(of: other.url))
+                && CaskEvidence.installedCask(for: other, in: casks)?.id == cask.id
+        }
+        let sharedWith = Set(otherApps.map(\.reference) + others.map { target in
+            let installed = installedApps.first {
+                PathPattern.comparablePath(of: $0.url).caseInsensitiveCompare(target) == .orderedSame
+            }
+            return installed?.reference ?? Bundle(url: URL(filePath: target))?.bundleIdentifier ?? target
+        })
+        let home = environment.homeDirectory.path(percentEncoded: false)
+        let root = environment.rootDirectory.path(percentEncoded: false)
+        let leftover = await LeftoverScanner.leftover(
+            at: folder,
+            kind: .homebrewReceipt,
+            match: LeftoverMatch(reason: .homebrewReceipt, confidence: .certain, sharedWith: sharedWith.sorted()),
+            parent: ParentAccess(folder.deletingLastPathComponent()),
+            home: home,
+            root: root
+        )
+        var leftovers = [exclusions.holdBack(for: folder).map(leftover.heldBack) ?? leftover]
+        let receipt = PathPattern.comparablePath(of: folder)
+        for location in environment.locations where location.kind.isForLinks {
+            let links = HomebrewReceipt.links(in: location.url, leadingInto: receipt)
+            for link in links where !exclusions.excludes(link) {
+                leftovers.append(await LeftoverScanner.leftover(
+                    at: link,
+                    kind: location.kind,
+                    match: LeftoverMatch(
+                        reason: .leadsIntoItsHomebrewReceipt, confidence: .certain, sharedWith: sharedWith.sorted()
+                    ),
+                    parent: ParentAccess(location.url),
+                    home: home,
+                    root: root
+                ))
+            }
+        }
+        return leftovers
+    }
+
+    /// Leftovers for the paths a cask names (`LeftoverScan.adding` drops those the scanner already found).
+    /// Homebrew warns that `zap` may remove what other apps share, and a vendor's shared folder is exactly what
+    /// only a cask would name. So a path in a Library is `likely` only when the app's own matcher also matches it.
+    /// Every other path is `possible`: shown, never preselected.
+    static func caskLeftovers(
+        _ evidence: CaskEvidence,
+        app: InstalledApp,
+        exclusions: Exclusions,
+        matcher: LeftoverMatcher,
+        environment: SearchEnvironment,
+        installedByApple: @escaping @Sendable (URL) async -> Bool = { await PackageReceipts.isInstalledByApple($0) }
+    ) async -> [Leftover] {
+        var leftovers: [Leftover] = []
+        // Compared by path: the app's URL ends in a slash and a cask's path does not, and many casks list the app
+        // among what they delete. What sits inside the bundle is skipped too: it goes with the app, and moved on
+        // its own it would be cut out of an app that stays.
+        let bundle = PathPattern.comparablePath(of: app.url)
+        let home = PathPattern.comparablePath(of: environment.homeDirectory)
+        for item in evidence.items where !exclusions.excludes(item.url) && !isAtOrInside(bundle, item.url) {
+            let place = place(of: item.url, in: environment)
+            // Whatever a cask says, what macOS keeps for itself or one of Apple's packages installed is Apple's.
+            if place.components.count == 1, SystemFolders.keeps(item.url.lastPathComponent, in: place.kind) { continue }
+            if !isAtOrInside(home, item.url), await installedByApple(item.url) { continue }
+            let own = matcher.match(
+                fileName: item.url.lastPathComponent, kind: place.kind, at: item.url, nested: place.components.count > 1
+            )
+            // Every folder on the way counts: a path inside a folder another app claims is not this app's alone.
+            let claims = place.components.map { matcher.othersClaiming(fileName: $0, kind: place.kind) }
+            let leftover = await LeftoverScanner.leftover(
+                at: item.url,
+                kind: place.kind,
+                match: LeftoverMatch(
+                    reason: .homebrewCask,
+                    confidence: item.isInLibrary && own != nil ? .likely : .possible,
+                    sharedWith: Set(claims.flatMap(\.apps)).union(own?.sharedWith ?? []).sorted(),
+                    otherCopies: claims.flatMap(\.copies) + (own?.otherCopies ?? [])
+                ),
+                parent: ParentAccess(item.url.deletingLastPathComponent()),
+                home: environment.homeDirectory.path(percentEncoded: false),
+                root: environment.rootDirectory.path(percentEncoded: false)
+            )
+            leftovers.append(exclusions.holdBack(for: item.url).map(leftover.heldBack) ?? leftover)
+        }
+        return leftovers
+    }
+
+    private static func isAtOrInside(_ folder: String, _ url: URL) -> Bool {
+        let path = PathPattern.comparablePath(of: url)
+        return PathComponents.isPath(path, atOrInside: folder)
+    }
+
+    /// The kind of scanned location `url` sits in, which says how its name is read (a `.plist` in Preferences
+    /// names a domain), and the path components from that location down to the item. Outside every scanned
+    /// location, the kind is `.elsewhere`.
+    static func place(
+        of url: URL,
+        in environment: SearchEnvironment
+    ) -> (kind: SearchLocation.Kind, components: [String]) {
+        let path = PathPattern.comparablePath(of: url)
+        let names = PathComponents.of(path)
+        let inside = environment.locations
+            .filter { names.count > $0.rootNames.count && names.starts(with: $0.rootNames) }
+            .map { (location: $0, root: $0.root, below: Array(names.dropFirst($0.rootNames.count))) }
+            // Two locations can share a root, like the hidden and plain halves of the home folder. The one that
+            // considers this name is the one that would have found it.
+            .filter { found in
+                guard let first = found.below.first else { return false }
+                return found.location.considers(fileName: first) && (!found.location.kind.countsOnlyLinks
+                    || found.below.count == 1 && found.location.url.appending(path: first).leadsTo != nil)
+            }
+            .max { $0.root.count < $1.root.count }
+        guard let inside else { return (.elsewhere, [url.lastPathComponent]) }
+        let components = inside.below
+        // The home folder is a location only for what sits directly in it; below that is the user's own.
+        guard inside.root != PathPattern.comparablePath(of: environment.homeDirectory) || components.count == 1 else {
+            return (.elsewhere, [url.lastPathComponent])
+        }
+        return (inside.location.kind, components)
+    }
+
+    /// True when the app itself would stay: excluded, removed elsewhere, kept by macOS, part of another package,
+    /// beyond the helper, or needing the helper while it is not there. Nothing of it is then selected for the user:
+    /// while it stays, its files are not leftovers. For an app macOS keeps, what it holds is data in use.
+    public func appStays(canUseHelper: Bool) -> Bool {
+        isExcluded || removedElsewhere != nil || app.isSystemProtected || app.enclosingPackage != nil
+            || isAppBeyondTheHelper
+            || (appRequiresPrivileges && !canUseHelper)
+    }
+
+    /// What is selected for the user at first: the app and the recommended leftovers that can move. Empty for
+    /// an app that would stay (`appStays(canUseHelper:)`).
+    public func suggestedSelection(canUseHelper: Bool) -> Set<URL> {
+        guard !appStays(canUseHelper: canUseHelper) else { return [] }
+        var selection = Set(
+            scan.leftovers.filter { $0.match.isRecommended && (canUseHelper || !$0.requiresPrivileges) }.map(\.url)
+        )
+        if !isAppInTheTrash {
+            selection.insert(app.url)
+        }
+        return selection
+    }
+
+    /// What a checkbox on the app's page can select: nothing Peel leaves alone or with something excluded inside,
+    /// nothing that needs the helper while it cannot act, and nothing of an excluded app or one removed elsewhere.
+    public func selectable(canUseHelper: Bool) -> Set<URL> {
+        guard !isExcluded, removedElsewhere == nil else { return [] }
+        var urls = Set(scan.leftovers.filter { leftover in
+            leftover.match.heldBack?.cannotBeMoved != true && (canUseHelper || !leftover.requiresPrivileges)
+        }.map(\.url))
+        if !app.isSystemProtected, app.enclosingPackage == nil, !isAppBeyondTheHelper, !isAppInTheTrash,
+           canUseHelper || !appRequiresPrivileges {
+            urls.insert(app.url)
+        }
+        return urls
+    }
+
+    /// What moves when nobody reviews the list, as when Peel removes itself: the app, plus the leftovers that no
+    /// other app shares, nothing holds back, need no helper, and are certainly its own or named inside its bundle
+    /// identifier (a namespace only its maker uses). Another copy of the app keeps nothing here, since removing
+    /// Peel clears its settings. Empty when the app is excluded, kept by macOS, part of another package, or needs
+    /// the helper: then nothing should start.
+    public var unreviewedSelection: [URL] {
+        guard movesUnreviewed else { return [] }
+        let own = scan.leftovers.filter { isUnreviewedOwn($0) && !$0.requiresPrivileges }
+        return order(of: Set(own.map(\.url)).union([app.url]))
+    }
+
+    /// The app's own links in the folders only an administrator can change, chosen as `unreviewedSelection` chooses,
+    /// which Remove Peel hands to the helper before the helper goes.
+    public var unreviewedLinks: [URL] {
+        guard movesUnreviewed else { return [] }
+        return scan.leftovers.filter { isUnreviewedOwn($0) && $0.requiresPrivileges && $0.kind.isForLinks }.map(\.url)
+    }
+
+    private var movesUnreviewed: Bool {
+        !isExcluded && !app.isSystemProtected && app.enclosingPackage == nil && !appRequiresPrivileges
+    }
+
+    private func isUnreviewedOwn(_ leftover: Leftover) -> Bool {
+        let match = leftover.match
+        let isInItsNamespace = app.bundleIdentifier.map {
+            leftover.url.lastPathComponent.lowercased().hasPrefix($0.lowercased() + ".")
+        } ?? false
+        return match.sharedWith.isEmpty && match.heldBack == nil && match.confidence >= .likely
+            && (match.confidence == .certain || isInItsNamespace)
+    }
+
+    /// How many items a checkbox can select now, and their total size: what a section header shows and the page's
+    /// total adds up. Rows Peel leaves alone, and those waiting for the helper, are not counted.
+    public func movable(
+        among leftovers: [Leftover],
+        withApp: Bool,
+        canUseHelper: Bool
+    ) -> (count: Int, size: SizeTotal) {
+        let selectable = selectable(canUseHelper: canUseHelper)
+        let movable = leftovers.filter { selectable.contains($0.url) }
+        var sizes = Dictionary(movable.map { ($0.url, $0.isMeasured ? $0.size : nil) }) { first, _ in first }
+        var count = movable.count
+        if withApp, selectable.contains(app.url) {
+            sizes.updateValue(isAppMeasured ? appSize : nil, forKey: app.url)
+            count += 1
+        }
+        return (count, SizeTotal(movingItemsAt: sizes))
+    }
+
+    /// A list of `rows` on the app's page, for its Select menu: what a checkbox can select now, and what Peel
+    /// selects for the person, which is nothing while the app stays.
+    public func selectableRows(_ rows: [URL], canUseHelper: Bool) -> SelectableRows<URL> {
+        let selectable = selectable(canUseHelper: canUseHelper)
+        let suggested = suggestedSelection(canUseHelper: canUseHelper)
+        return SelectableRows(
+            rows: rows,
+            selectable: rows.filter(selectable.contains),
+            recommended: rows.filter(suggested.contains)
+        )
+    }
+
+    public var privilegedURLs: Set<URL> {
+        guard !isExcluded, removedElsewhere == nil else { return [] }
+        var urls = Set(
+            scan.leftovers.filter { $0.requiresPrivileges && $0.match.heldBack != .beyondTheHelper }.map(\.url)
+        )
+        if appRequiresPrivileges, !app.isSystemProtected, app.enclosingPackage == nil, !isAppBeyondTheHelper,
+           !isAppInTheTrash {
+            urls.insert(app.url)
+        }
+        return urls
+    }
+
+    /// What the app's page needs the helper for.
+    public enum HelperUse: Sendable, Hashable {
+        /// Moving this many rows, each of which a person could select once the helper can act.
+        case moving(Int)
+        case forgettingAReceipt
+    }
+
+    /// Nil on a page from which nothing moves. A receipt's files are rows of their own when they are listed, so
+    /// `receipts`, what the page's menu can forget, counts only with no row waiting.
+    public func helperUse(receipts: Int) -> HelperUse? {
+        guard !isExcluded, removedElsewhere == nil else { return nil }
+        let rows = privilegedURLs.intersection(selectable(canUseHelper: true)).count
+        return rows > 0 ? .moving(rows) : receipts > 0 ? .forgettingAReceipt : nil
+    }
+
+    /// The app itself, then the selected leftovers.
+    public func removalOrder(of selection: Set<URL>) -> [URL] {
+        guard !isExcluded, removedElsewhere == nil else { return [] }
+        return order(of: selection)
+    }
+
+    /// Moves `selection`, the app first: its files follow only once it has moved, so an app that stays keeps
+    /// everything of its own. Without the app selected, the files move on their own.
+    public func move(
+        _ selection: Set<URL>,
+        using service: TrashService,
+        throughTheHelper: Bool = true
+    ) async -> TrashResult {
+        let order = removalOrder(of: selection)
+        let files = order.filter { $0 != app.url }
+        return await service.trash(
+            apps: order.filter { $0 == app.url },
+            thenFiles: { stayed in stayed.isEmpty ? files : [] },
+            usingHelperFor: throughTheHelper ? privilegedURLs : [],
+            lettingTheirProgramsRun: uninstallsItself?.letsItsProgramsRun == true ? [app.url] : [],
+            emptiedFoldersNamed: makersFolderNames
+        )
+    }
+
+    /// The names of the app's and its maker's folders, one of which goes too once the uninstall leaves it empty.
+    public var makersFolderNames: Set<String> {
+        MakersFolders.names(of: [app])
+    }
+
+    /// The leftovers that stay for an administrator once the app is gone: nothing else holds them back or uses them,
+    /// and each sits where an uninstall searches, the only places Orphaned Files believes a record of.
+    public var leftForAnAdministrator: [Leftover] {
+        scan.leftovers.filter { $0.isLeftForAnAdministrator && !$0.match.isShared && $0.kind != .elsewhere }
+    }
+
+    /// What to remember of `leftForAnAdministrator` once the app is gone, moved by `result` or already in the Trash.
+    public func leftForAnAdministrator(after result: TrashResult) -> [LeftForAnAdministrator.Record] {
+        guard isAppInTheTrash || result.trashed.contains(where: { $0.originalURL == app.url }) else { return [] }
+        return leftForAnAdministrator.map { leftover in
+            LeftForAnAdministrator.Record(
+                path: PathPattern.comparablePath(of: leftover.url),
+                kind: leftover.kind,
+                apps: [.init(reference: app.reference, name: app.name)],
+                reason: leftover.match.reason,
+                confidence: leftover.match.confidence
+            )
+        }
+    }
+
+    /// Whether the app stayed while files of its own were selected, which then stayed with it.
+    public func keptItsFiles(after result: TrashResult, selection: Set<URL>) -> Bool {
+        selection.contains(app.url) && result.failures.contains { $0.url == app.url }
+            && !Set(scan.leftovers.map(\.url)).isDisjoint(with: selection)
+    }
+
+    private func order(of selection: Set<URL>) -> [URL] {
+        (selection.contains(app.url) ? [app.url] : []) + scan.leftovers.map(\.url).filter(selection.contains)
+    }
+}

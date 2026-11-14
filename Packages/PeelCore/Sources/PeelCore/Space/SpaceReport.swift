@@ -1,0 +1,829 @@
+public import Foundation
+internal import PeelPrivileged
+
+/// An area of the disk that can take up a lot of room, such as simulators or virtual machines. Most areas are
+/// read-only here: their own app or tool is the right place to remove them. Peel never adds them up into a
+/// "junk" total.
+public struct SpaceItem: Sendable, Hashable, Identifiable {
+    public enum Handling: Sendable, Hashable {
+        /// Only the app or tool that owns it should remove it. The app's words for the area say how.
+        case readOnly
+        /// Peel can move the files and folders inside it to the Trash (see `SpaceRemoval`).
+        case trash
+    }
+
+    public enum Category: String, Sendable, Hashable, CaseIterable {
+        case development
+        case virtualMachines
+        case media
+        case cloud
+        case library
+    }
+
+    public let id: String
+    public let category: Category
+    public let urls: [URL]
+    /// What its folders take: the least it can be when one of them ran out of time or couldn't be read all through.
+    /// Unknown is not the same as empty.
+    public let size: SizeTotal
+    public let handling: Handling
+    /// Why nothing in this area is recommended, whatever each item holds.
+    public var heldBack: HoldBack?
+    /// True when what macOS keeps in its folders for its own services is neither measured nor offered: there they run
+    /// as other accounts, whose open files Peel cannot see, or keep caches not even Full Disk Access can read.
+    public var leavesMacOSsOwn = false
+    /// A child something wrote to in the last few minutes is held back (`HoldBack.stillInUse`).
+    public var holdsBackRecentWrites = false
+    /// The folders of `urls` where macOS files reports into folders of its own, so only their files are offered.
+    public var onlyFilesIn: [URL] = []
+    /// True when the area offers no folder, only files: those in its folders and in the folders directly inside them,
+    /// since a program expects to find the folder it writes in.
+    public var keepsItsFolders = false
+    /// The commands that free an area Peel leaves alone, as its tool's documentation gives them. Peel shows them to
+    /// copy and never runs them: they delete for good.
+    public var commands: [String] = []
+    /// True when the apps that make and clear this area are all gone from this Mac, so its words can't send the
+    /// person to them.
+    public var managingAppIsMissing = false
+    /// True when no app or tool looks after the area, or the ones that do are gone from this Mac, so the person
+    /// removes what it holds in Finder, as its page says how.
+    public var isRemovedByHand = false
+    /// What each place takes, for an area whose places are the items of one folder.
+    public var placeSizes: [URL: SizeTotal] = [:]
+    /// A fact about some of its places, which the app puts into words.
+    public var placeNotes: [URL: PlaceNote] = [:]
+
+    public enum PlaceNote: Sendable, Hashable {
+        /// A folder in Homebrew's `var` that no installed formula names in its own file.
+        case namedByNoInstalledFormula
+        /// A year of TeX Live other than the one in use.
+        case notTheTeXLiveInUse
+        /// A version of the .NET SDK with a newer one beside it.
+        case aNewerSDKIsInstalled
+    }
+
+    public var isReadOnly: Bool {
+        if case .readOnly = handling { true } else { false }
+    }
+
+    /// The folders an area has in each of many containers, which every Mac has hundreds of, so they are counted.
+    public struct ContainerFolders: Sendable, Hashable {
+        public let parent: URL
+        public let folders: [String]
+        public let containers: Int
+        public let areGroups: Bool
+    }
+
+    public var inContainers: [ContainerFolders] = []
+    /// What `inContainers` leaves of `urls`, worked out once, since the area's page asks each time it is drawn.
+    var placesNotCounted: [URL]?
+
+    /// The folders of `urls` that are named one by one.
+    public var listedPlaces: [URL] { placesNotCounted ?? urls }
+}
+
+public struct SpaceReport: Sendable {
+    public let items: [SpaceItem]
+    /// Local snapshots: copies of the disk kept on the disk itself. Peel explains them but never removes one,
+    /// because deleting a snapshot cannot be undone. Nil when `diskutil` did not say.
+    public let snapshots: [LocalSnapshot]?
+    /// True when an area went unmeasured because macOS refused access, which Full Disk Access would grant.
+    public let needsFullDiskAccess: Bool
+
+    public func items(in category: SpaceItem.Category) -> [SpaceItem] {
+        items.filter { $0.category == category }
+    }
+}
+
+public enum SpaceInventory {
+    struct Command: Sendable, ExpressibleByStringLiteral {
+        enum Need: Sendable {
+            case simctl
+            case simctlRuntimeOption(String)
+        }
+
+        let line: String
+        var need: Need?
+
+        init(stringLiteral line: String) {
+            self.line = line
+        }
+
+        init(_ line: String, needs need: Need) {
+            self.line = line
+            self.need = need
+        }
+
+        func isKnown(simctlRuntimeHelp help: String?) -> Bool {
+            switch need {
+            case nil: true
+            case .simctl: help != nil
+            case .simctlRuntimeOption(let option):
+                help?.split { !($0.isLetter || $0.isNumber || $0 == "-") }.contains { $0 == option } ?? false
+            }
+        }
+    }
+
+    /// The apps that make and clear an area, as the area's words in the app name them, and why what the area keeps
+    /// in the home folder is only offered for review when one of them is uninstalled.
+    struct ManagingApps: Sendable {
+        let identifiers: [String]
+        let leftBehind: HoldBack
+
+        func includes(_ identifier: String?) -> Bool {
+            guard let identifier = identifier?.lowercased() else { return false }
+            return identifiers.contains { $0.lowercased() == identifier }
+        }
+
+        /// Whether one of them is on this Mac, wherever it is, outside a Trash.
+        var oneIsOnThisMac: Bool {
+            identifiers.contains { !AppInspector.applicationURLs(forBundleIdentifier: $0).isEmpty }
+        }
+    }
+
+    struct Definition: Sendable {
+        let id: String
+        let category: SpaceItem.Category
+        let paths: [String]
+        let handling: SpaceItem.Handling
+        /// The folders inside every app's container (`Library/Containers/<identifier>`) that belong to this area too.
+        var containerFolders: [String] = []
+        /// The folder inside every group container not Apple's own (`Library/Group Containers/<group>`) that belongs
+        /// to this area too.
+        var groupContainerFolder: String?
+        /// True for the folder macOS gives the account for caches (`confstr`'s `_CS_DARWIN_USER_CACHE_DIR`), which
+        /// is never in `paths` since macOS chooses where it is.
+        var isTheUserCacheFolder = false
+        var heldBack: HoldBack?
+        var leavesMacOSsOwn = false
+        var holdsBackRecentWrites = false
+        var onlyFilesIn: [String] = []
+        var keepsItsFolders = false
+        var commands: [Command] = []
+        var managedBy: ManagingApps?
+        /// True for an area no app or tool looks after, which the person clears in Finder.
+        var isRemovedByHand = false
+        /// The places of an area that lists the items of folders it finds again at each scan.
+        var places: (@Sendable (_ home: URL, _ root: URL) -> [URL])?
+        /// The notes on such an area's places.
+        var placeNotes: (@Sendable (_ places: [URL]) -> [URL: SpaceItem.PlaceNote])?
+
+        /// Each of `paths` on this Mac: one that starts with `/` is under `root`, the rest are in `home`.
+        func urls(home: URL, root: URL, userCache: URL?) -> [URL] {
+            if let places { return places(home, root) }
+            return paths.map { path in
+                path.hasPrefix("/")
+                    ? root.appending(path: String(path.dropFirst()), directoryHint: .isDirectory)
+                    : home.appending(path: path, directoryHint: .isDirectory)
+            } + (isTheUserCacheFolder ? [userCache].compactMap(\.self) : [])
+        }
+
+        /// Each of `paths` in the home folder: those outside it belong to every account on the Mac.
+        func placesInTheHome(_ home: URL) -> [URL] {
+            paths.filter { !$0.hasPrefix("/") }.map { home.appending(path: $0, directoryHint: .isDirectory) }
+        }
+
+        /// True when the area's size is what it offers, child by child, rather than its places measured whole: one
+        /// place may sit inside another of its own, which would count twice.
+        var measuresWhatItOffers: Bool { leavesMacOSsOwn || !onlyFilesIn.isEmpty || keepsItsFolders }
+
+        func onlyFilesIn(home: URL, root: URL) -> [URL] {
+            onlyFilesIn.map { path in
+                path.hasPrefix("/")
+                    ? root.appending(path: String(path.dropFirst()), directoryHint: .isDirectory)
+                    : home.appending(path: path, directoryHint: .isDirectory)
+            }
+        }
+    }
+
+    /// The identifier of every area. Public so the app can check that it has words for each one: the words
+    /// live in the app, because this package has no string catalog.
+    public static var definitionIdentifiers: [String] { definitions.map(\.id) }
+
+    /// The identifier of every area its apps manage, which the app gives words for when those apps are gone.
+    public static var managedAreaIdentifiers: [String] { definitions.filter { $0.managedBy != nil }.map(\.id) }
+
+    static let definitions: [Definition] = [
+        // CoreSimulator's daemon, simdiskimaged, keeps runtime images in both stores its sandbox lets it write to, the
+        // second for runtimes mounted as cryptexes. Their mounted volumes are elsewhere and would count twice.
+        Definition(
+            id: "simulators",
+            category: .development,
+            paths: [
+                "Library/Developer/CoreSimulator/Devices", "/Library/Developer/CoreSimulator/Images",
+                "/Library/Developer/CoreSimulator/Cryptex/Images",
+            ],
+            handling: .readOnly,
+            commands: [
+                Command("xcrun simctl runtime delete --outdated", needs: .simctlRuntimeOption("--outdated")),
+                Command("xcrun simctl delete unavailable", needs: .simctl),
+            ],
+            // Apple's "Managing your simulated and physical devices in Device Hub": simulators are made and removed in
+            // Xcode, whose first launch installs CoreSimulator, which keeps them in the home folder.
+            managedBy: ManagingApps(identifiers: ["com.apple.dt.Xcode"], leftBehind: .holdsSimulators)
+        ),
+        Definition(
+            id: "android-sdk",
+            category: .development,
+            paths: ["Library/Android/sdk/system-images", ".android/avd"],
+            handling: .readOnly
+        ),
+        // rustup's RUSTUP_HOME is `~/.rustup` and keeps each toolchain in `toolchains` (rustup's `config.rs`).
+        Definition(
+            id: "rust-toolchains",
+            category: .development,
+            paths: [".rustup/toolchains"],
+            handling: .readOnly,
+            commands: ["rustup toolchain list", "rustup toolchain uninstall <name>"]
+        ),
+        // Android's "Install and configure the NDK": every version in the SDK's `ndk` folder; `sdkmanager` removes one.
+        Definition(
+            id: "android-ndk",
+            category: .development,
+            paths: ["Library/Android/sdk/ndk"],
+            handling: .readOnly,
+            commands: [#"~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager --uninstall "ndk;<version>""#]
+        ),
+        Definition(
+            id: "unity-assets",
+            category: .development,
+            paths: ["Library/Unity/Asset Store-5.x"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "docker",
+            category: .virtualMachines,
+            paths: ["Library/Containers/com.docker.docker/Data/vms"],
+            handling: .readOnly,
+            commands: ["docker system prune"]
+        ),
+        Definition(
+            id: "orbstack",
+            category: .virtualMachines,
+            paths: ["Library/Group Containers/HUAQ24HBR6.dev.orbstack/data"],
+            handling: .readOnly,
+            commands: ["orb delete <name>", "docker image prune -a"]
+        ),
+        Definition(
+            id: "colima",
+            category: .virtualMachines,
+            paths: [".colima"],
+            handling: .readOnly,
+            // Without --data, colima delete keeps the images and volumes on the disk.
+            commands: ["colima delete --data"]
+        ),
+        Definition(
+            id: "utm",
+            category: .virtualMachines,
+            paths: ["Library/Containers/com.utmapp.UTM/Data/Documents"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "parallels",
+            category: .virtualMachines,
+            paths: ["Parallels"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "vmware",
+            category: .virtualMachines,
+            paths: ["Virtual Machines.localized"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "podman",
+            category: .virtualMachines,
+            paths: [".local/share/containers/podman/machine"],
+            handling: .readOnly,
+            commands: ["podman machine rm <name>"]
+        ),
+        Definition(
+            id: "lima",
+            category: .virtualMachines,
+            paths: [".lima"],
+            handling: .readOnly,
+            commands: ["limactl delete <name>"]
+        ),
+        Definition(
+            id: "minikube",
+            category: .virtualMachines,
+            paths: [".minikube/machines", ".minikube/cache/images"],
+            handling: .readOnly,
+            commands: ["minikube delete --all --purge"]
+        ),
+        Definition(
+            id: "virtualbox",
+            category: .virtualMachines,
+            paths: ["VirtualBox VMs"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "vagrant",
+            category: .virtualMachines,
+            paths: [".vagrant.d/boxes"],
+            handling: .readOnly,
+            commands: ["vagrant box remove <name>", "vagrant box prune"]
+        ),
+        // VirtualBuddy's library (`VBSettings.defaultVirtualBuddyLibraryURL` at 682bc47f): the machines, and in
+        // `_Downloads` the system images they were installed from, which deleting a machine leaves.
+        Definition(
+            id: "virtualbuddy",
+            category: .virtualMachines,
+            paths: ["Library/Application Support/VirtualBuddy"],
+            handling: .readOnly,
+            managedBy: ManagingApps(identifiers: ["codes.rambo.VirtualBuddy"], leftBehind: .holdsVirtualMachines)
+        ),
+        // CodeWeavers' "Change Where CrossOver Stores Bottles" and "Advanced CrossOver Mac Configuration": an account's
+        // bottles, and the published bottles every account shares.
+        Definition(
+            id: "crossover",
+            category: .virtualMachines,
+            paths: ["Library/Application Support/CrossOver/Bottles", "/Library/Application Support/CrossOver/Bottles"],
+            handling: .readOnly,
+            managedBy: ManagingApps(identifiers: ["com.codeweavers.CrossOver"], leftBehind: .holdsVirtualMachines)
+        ),
+        // Whisky's `BottleData.defaultBottleDir` at fd5480a7, in a folder named like the app's container.
+        Definition(
+            id: "whisky",
+            category: .virtualMachines,
+            paths: ["Library/Containers/com.isaacmarovitz.Whisky/Bottles"],
+            handling: .readOnly,
+            managedBy: ManagingApps(identifiers: ["com.isaacmarovitz.Whisky"], leftBehind: .holdsVirtualMachines)
+        ),
+        // Wine's default prefix, which its FAQ says to delete like any other folder to remove its Windows apps.
+        Definition(
+            id: "wine",
+            category: .virtualMachines,
+            paths: [".wine"],
+            handling: .readOnly,
+            isRemovedByHand: true
+        ),
+        // Tart's machines (`VMStorageLocal` at bcc8084a). The images it caches are on the Developer page.
+        Definition(
+            id: "tart",
+            category: .virtualMachines,
+            paths: [".tart/vms"],
+            handling: .readOnly,
+            commands: ["tart delete <name>"]
+        ),
+        // Lume keeps each machine in a folder of its own here, beside the images it caches (`Home.swift` at 964e3f62).
+        Definition(
+            id: "lume",
+            category: .virtualMachines,
+            paths: [".lume"],
+            handling: .readOnly,
+            commands: ["lume delete <name>", "lume prune"]
+        ),
+        // Veertu's "Modifying the Global Configuration": templates, their state, and on Apple silicon the system images
+        // Anka downloaded, which `anka delete --cache` removes with other temporary files.
+        Definition(
+            id: "anka",
+            category: .virtualMachines,
+            paths: [
+                "Library/Application Support/Veertu/Anka/vm_lib", "Library/Application Support/Veertu/Anka/state_lib",
+                "Library/Application Support/Veertu/Anka/img_lib",
+            ],
+            handling: .readOnly,
+            commands: ["anka delete <name>", "anka delete --cache"]
+        ),
+        // Rancher Desktop's virtual machine (`paths_darwin.go` at 736b7194), with every image, container, and volume.
+        Definition(
+            id: "rancher-desktop",
+            category: .virtualMachines,
+            paths: ["Library/Application Support/rancher-desktop/lima"],
+            handling: .readOnly,
+            managedBy: ManagingApps(identifiers: ["io.rancherdesktop.app"], leftBehind: .holdsVirtualMachines)
+        ),
+        // Apple's container tool keeps its containers, images, volumes, and Linux kernel here
+        // (`ApplicationRoot.defaultPath` at af7c4391).
+        Definition(
+            id: "apple-container",
+            category: .virtualMachines,
+            paths: ["Library/Application Support/com.apple.container"],
+            handling: .readOnly,
+            commands: [
+                "container system df", "container prune", "container image prune --all", "container volume prune",
+            ]
+        ),
+        // Genymotion keeps each virtual device in a folder of its own here, by its page on where a device's logs are.
+        Definition(
+            id: "genymotion",
+            category: .virtualMachines,
+            paths: [".Genymobile/Genymotion/deployed"],
+            handling: .readOnly,
+            managedBy: ManagingApps(identifiers: ["com.genymobile.genymotion"], leftBehind: .holdsVirtualMachines)
+        ),
+        Definition(
+            id: "podcasts",
+            category: .media,
+            paths: ["Library/Group Containers/243LU875E5.groups.com.apple.podcasts"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "tv",
+            category: .media,
+            paths: ["Movies/TV"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "messages",
+            category: .media,
+            paths: ["Library/Messages/Attachments"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "wallpapers",
+            category: .media,
+            paths: [
+                "Library/Application Support/com.apple.wallpaper/aerials/videos",
+                "/Library/Application Support/com.apple.idleassetsd/Customer",
+            ],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "cloudstorage",
+            category: .cloud,
+            paths: ["Library/CloudStorage"],
+            handling: .readOnly
+        ),
+        Definition(
+            id: "icloud",
+            category: .cloud,
+            paths: ["Library/Mobile Documents/com~apple~CloudDocs"],
+            handling: .readOnly
+        ),
+        // macOS's analytics helper can't make the account's crash reports folder again once it is gone, so only the
+        // reports in it are offered.
+        Definition(
+            id: "logs",
+            category: .library,
+            paths: ["Library/Logs", "Library/Logs/DiagnosticReports"],
+            handling: .trash,
+            containerFolders: ["Data/Library/Logs"],
+            onlyFilesIn: ["Library/Logs/DiagnosticReports"]
+        ),
+        Definition(
+            id: "caches",
+            category: .library,
+            paths: ["Library/Caches"],
+            handling: .trash,
+            holdsBackRecentWrites: true
+        ),
+        // macOS empties this folder only in a safe boot (`man confstr`). Apps' helpers keep caches in it, and so do
+        // macOS's own services, some of them where not even Full Disk Access reaches.
+        Definition(
+            id: "user-caches",
+            category: .library,
+            paths: [],
+            handling: .trash,
+            isTheUserCacheFolder: true,
+            leavesMacOSsOwn: true,
+            holdsBackRecentWrites: true
+        ),
+        Definition(
+            id: "container-caches",
+            category: .library,
+            paths: [],
+            handling: .trash,
+            containerFolders: ["Data/Library/Caches", "Data/tmp"],
+            groupContainerFolder: "Library/Caches",
+            holdsBackRecentWrites: true
+        ),
+        // Sandboxed, Mail writes only the second folder. The first is what an older Mail left in the Library itself.
+        Definition(
+            id: "mail-downloads",
+            category: .library,
+            paths: ["Library/Mail Downloads", "Library/Containers/com.apple.mail/Data/Library/Mail Downloads"],
+            handling: .trash,
+            heldBack: .openedFromMail
+        ),
+        // Blizzard's support names this folder as the Battle.net cache, whose removal does not affect game data
+        // (us.support.blizzard.com/en/article/34721). It belongs to every account on the Mac.
+        Definition(
+            id: "battlenet-cache",
+            category: .library,
+            paths: ["/Users/Shared/Blizzard/Battle.net"],
+            handling: .trash,
+            heldBack: .sharedWithEveryone
+        ),
+        // Services that run as root write here, and Peel can't see what they hold open, so what one wrote in the last
+        // minutes stays, and a log's folder, which launchd never makes again, is never offered whole.
+        Definition(
+            id: "system-caches",
+            category: .library,
+            paths: ["/Library/Caches"],
+            handling: .trash,
+            leavesMacOSsOwn: true,
+            holdsBackRecentWrites: true
+        ),
+        Definition(
+            id: "system-logs",
+            category: .library,
+            paths: ["/Library/Logs", "/Library/Logs/DiagnosticReports"],
+            handling: .trash,
+            leavesMacOSsOwn: true,
+            holdsBackRecentWrites: true,
+            onlyFilesIn: ["/Library/Logs/DiagnosticReports"],
+            keepsItsFolders: true
+        ),
+        // Homebrew's services write their logs in its `var/log`, some in a folder of their own, such as nginx's.
+        // `brew services start` makes such a folder, and launchd makes a missing log file again but never a folder
+        // (`man launchd.plist`), so only the files go. A log a running service holds open frees nothing when moved.
+        Definition(
+            id: "homebrew-logs",
+            category: .development,
+            paths: ["/opt/homebrew/var/log"],
+            handling: .trash,
+            holdsBackRecentWrites: true,
+            keepsItsFolders: true
+        ),
+        Definition(
+            id: "homebrew-data",
+            category: .development,
+            paths: [],
+            handling: .readOnly,
+            isRemovedByHand: true,
+            places: { home, root in HomebrewData.prefixes(home: home, root: root).flatMap(HomebrewData.folders(in:)) },
+            placeNotes: HomebrewData.notes(on:)
+        ),
+        Definition(
+            id: "tex-live",
+            category: .development,
+            paths: [],
+            handling: .readOnly,
+            isRemovedByHand: true,
+            places: { _, root in TeXLive.years(root: root) },
+            placeNotes: TeXLive.notes(on:)
+        ),
+        Definition(
+            id: "dotnet-sdks",
+            category: .development,
+            paths: [],
+            handling: .readOnly,
+            isRemovedByHand: true,
+            places: DotNetSDKs.versions(home:root:),
+            placeNotes: DotNetSDKs.notes(on:)
+        ),
+    ]
+
+    /// What measuring an area found: its size, and whether a folder in it ran out of time, which says nothing of how
+    /// big it is, while one macOS refused says only that the area is at least what was seen.
+    struct Measured {
+        let size: SizeTotal
+        let ranOutOfTime: Bool
+        /// What each measured place took.
+        var parts: [URL: SizeTotal] = [:]
+
+        /// Listed whatever its size when a folder ran out of time, since it may be the biggest one, or when nothing
+        /// in it could be read, so the person learns Peel couldn't look; otherwise by what was seen.
+        func isShown(over minimumSize: Int64) -> Bool {
+            ranOutOfTime || !size.isComplete && size.known == 0 || size.known >= minimumSize
+        }
+
+        /// What ran out of time first, then the biggest of what was seen.
+        func comesBefore(_ other: Measured) -> Bool {
+            ranOutOfTime != other.ranOutOfTime ? ranOutOfTime : size.known > other.size.known
+        }
+    }
+
+    /// The total size of `urls` less what is excluded inside them, a few at a time, since one that doesn't answer would
+    /// delay the rest by its whole budget. A folder read only in part counts what was seen; one that ran out of time (a
+    /// file provider can stall a read for minutes), or holds an excluded place that did, is unknown, and so is one
+    /// holding an excluded place macOS refused, though no time ran out.
+    private static func size(
+        of urls: [URL],
+        leaving exclusions: Exclusions,
+        measure: @escaping LeftoverScanner.Measure
+    ) async -> Measured {
+        let unknown = SizeTotal(known: 0, isComplete: false)
+        let measured = await urls.concurrentMap(width: LeftoverScanner.concurrentMeasurements) { url -> Measured in
+            guard !Task.isCancelled, let contents = await measure(url) else {
+                return Measured(size: unknown, ranOutOfTime: true)
+            }
+            var known = contents.size
+            for place in exclusions.places(inside: url) where !place.isMissing {
+                guard let excluded = await measure(place) else { return Measured(size: unknown, ranOutOfTime: true) }
+                guard !excluded.couldNotBeRead else { return Measured(size: unknown, ranOutOfTime: false) }
+                known -= excluded.size
+            }
+            return Measured(
+                size: SizeTotal(known: max(0, known), isComplete: !contents.couldNotBeRead), ranOutOfTime: false
+            )
+        }
+        // A stopped scan starts nothing more, so it answers for fewer places than it was given.
+        let isWhole = measured.count == urls.count
+        return Measured(
+            size: SizeTotal(combining: measured.map(\.size) + (isWhole ? [] : [unknown])),
+            ranOutOfTime: !isWhole || measured.contains(where: \.ranOutOfTime),
+            parts: Dictionary(zip(urls, measured.map(\.size)), uniquingKeysWith: { first, _ in first })
+        )
+    }
+
+    /// The folders Space empties. Each stays itself, since Space moves what is inside, never the folder.
+    static func emptiedFolders(in environment: SearchEnvironment) -> [URL] {
+        definitions.filter { $0.handling == .trash }.flatMap {
+            $0.urls(
+                home: environment.homeDirectory, root: environment.rootDirectory,
+                userCache: environment.userCacheDirectory
+            )
+        }
+    }
+
+    /// Every app's container, listed rather than matched with `glob`, which stops at 128 paths.
+    static func appContainers(in home: URL) -> [URL] {
+        folders(in: home.appending(path: "Library/Containers", directoryHint: .isDirectory))
+    }
+
+    /// Every group container but Apple's own, which hold what macOS keeps for its apps and are never emptied.
+    static func groupContainers(in home: URL) -> [URL] {
+        folders(in: home.appending(path: "Library/Group Containers", directoryHint: .isDirectory))
+            .filter { !ProtectedData.isApplesName($0.lastPathComponent) }
+    }
+
+    /// What an area can offer in its `folders`: every child that is not one of the folders themselves, nothing named
+    /// for macOS in an area that leaves macOS's own out, and the files of each child folder in place of the folder
+    /// where macOS files its reports into folders and in an area that keeps its folders.
+    private static func offered(in folders: [URL], of definition: Definition, home: URL, root: URL) -> [URL] {
+        let paths = Set(folders.map(PathPattern.comparablePath))
+        let filesOnly = Set(definition.onlyFilesIn(home: home, root: root).map(PathPattern.comparablePath))
+        return folders.flatMap { folder -> [URL] in
+            // A folder that can't be listed is measured whole, so its size reads as unknown, never as nothing.
+            guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path(percentEncoded: false))
+            else { return [folder] }
+            let kept = names.filter {
+                !ProtectedData.isLeftByFinder($0) && !(definition.leavesMacOSsOwn && isMacOSsOwn($0))
+            }
+            let children = kept.map { folder.appending(path: $0) }.filter { child in
+                !paths.contains(PathPattern.comparablePath(of: child))
+            }
+            guard definition.keepsItsFolders || filesOnly.contains(PathPattern.comparablePath(of: folder)) else {
+                return children
+            }
+            return children.flatMap { child -> [URL] in
+                let path = child.path(percentEncoded: false)
+                guard child.isRealFolder, let inside = try? FileManager.default.contentsOfDirectory(atPath: path) else {
+                    return [child]
+                }
+                return inside.filter { !ProtectedData.isLeftByFinder($0) }
+                    .map { child.appending(path: $0) }.filter { !$0.isRealFolder }
+            }
+        }
+    }
+
+    /// Whether macOS keeps `name` for its own services in a folder every account shares.
+    static func isMacOSsOwn(_ name: String) -> Bool {
+        ProtectedData.isApplesName(name) || SystemFolders.keeps(name, in: .caches)
+            || SystemFolders.keeps(name, in: .logs)
+    }
+
+    private static func folders(in parent: URL) -> [URL] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: parent.path(percentEncoded: false))) ?? []
+        return names.sorted().map { parent.appending(path: $0, directoryHint: .isDirectory) }.filter(\.isRealFolder)
+    }
+
+    /// Anything smaller than this is noise in a report about space.
+    public static let minimumSize: Int64 = 50 * 1_000_000
+
+    /// What is excluded is left out: an area that is excluded is not listed, and what is excluded inside one is
+    /// not counted in its size.
+    @concurrent
+    public static func scan(
+        in environment: SearchEnvironment = .current,
+        minimumSize: Int64 = SpaceInventory.minimumSize,
+        keeping: Set<String> = [],
+        exclusions: Exclusions = .none
+    ) async -> SpaceReport {
+        await scan(
+            home: environment.homeDirectory,
+            root: environment.rootDirectory,
+            userCache: environment.userCacheDirectory,
+            minimumSize: minimumSize,
+            keeping: keeping,
+            exclusions: exclusions,
+            measure: LeftoverScanner.walk
+        )
+    }
+
+    /// `root` is where the paths outside the home folder start, so a test can point it at a folder of its own.
+    @concurrent
+    static func scan(
+        home: URL,
+        root: URL = URL(filePath: "/", directoryHint: .isDirectory),
+        userCache: URL? = nil,
+        minimumSize: Int64,
+        keeping: Set<String> = [],
+        exclusions: Exclusions = .none,
+        measure: @escaping LeftoverScanner.Measure,
+        simctlRuntimeHelp: @escaping @Sendable () async -> String? = { await Simctl.runtimeHelp() }
+    ) async -> SpaceReport {
+        let containers = appContainers(in: home)
+        let groups = groupContainers(in: home)
+        let wanted = definitions.compactMap { definition -> (Definition, [URL])? in
+            let urls = definition.urls(home: home, root: root, userCache: userCache)
+                .filter { FileManager.default.fileExists(atPath: PathPattern.comparablePath(of: $0)) }
+                + definition.containerFolders.flatMap { folder in
+                    containers.map { $0.appending(path: folder, directoryHint: .isDirectory) }.filter(\.isRealFolder)
+                }
+                + (definition.groupContainerFolder.map { folder in
+                    groups.map { $0.appending(path: folder, directoryHint: .isDirectory) }.filter(\.isRealFolder)
+                } ?? [])
+            let kept = urls.filter { !exclusions.excludes($0) }
+            return kept.isEmpty ? nil : (definition, kept)
+        }
+        let asksSimctl = wanted.contains { definition, _ in definition.commands.contains { $0.need != nil } }
+        async let simctlHelp = asksSimctl ? simctlRuntimeHelp() : nil
+
+        // Four areas are measured at a time. One after another, the wait would be the sum of them all, and a
+        // folder that never answers would delay every area after it by its whole budget. Four leaves room for
+        // the rest of the app.
+        var measured: [(definition: Definition, urls: [URL], measured: Measured)] = []
+        await withTaskGroup(of: (Definition, [URL], Measured).self) { group in
+            var pending = wanted.makeIterator()
+            func addNext() -> Bool {
+                guard !Task.isCancelled, let (definition, urls) = pending.next() else { return false }
+                let measured = definition.measuresWhatItOffers
+                    ? offered(in: urls, of: definition, home: home, root: root).filter { !exclusions.excludes($0) }
+                    : urls
+                group.addTask { (definition, urls, await size(of: measured, leaving: exclusions, measure: measure)) }
+                return true
+            }
+            for _ in 0..<4 where addNext() {}
+            while let area = await group.next() {
+                _ = addNext()
+                measured.append(area)
+            }
+        }
+        let help = await simctlHelp
+        // An area in `keeping`, open on its page, stays listed whatever its size, so a move doesn't close its page.
+        let shown = measured
+            .filter { keeping.contains($0.definition.id) || $0.measured.isShown(over: minimumSize) }
+            .sorted { $0.measured.comesBefore($1.measured) }
+        let items = shown.map { definition, urls, measured in
+            var item = item(
+                definition, urls: urls, size: measured.size, home: home, root: root, simctlRuntimeHelp: help
+            )
+            if definition.places != nil {
+                item.placeSizes = measured.parts
+                item.placeNotes = definition.placeNotes?(urls) ?? [:]
+            }
+            return item
+        }
+
+        return SpaceReport(
+            items: items,
+            snapshots: await LocalSnapshots.list(),
+            needsFullDiskAccess: items.contains {
+                !$0.size.isComplete && $0.urls.contains { FullDiskAccess.canList($0) == .missing }
+            }
+        )
+    }
+
+    static func item(
+        _ definition: Definition,
+        urls: [URL],
+        size: SizeTotal,
+        home: URL,
+        root: URL,
+        simctlRuntimeHelp help: String?
+    ) -> SpaceItem {
+        let counted: [SpaceItem.ContainerFolders] = [
+            ("Library/Containers", definition.containerFolders, false),
+            ("Library/Group Containers", definition.groupContainerFolder.map { [$0] } ?? [], true),
+        ].compactMap { path, folders, areGroups in
+            let parent = home.appending(path: path, directoryHint: .isDirectory)
+            let containers = Set(urls.compactMap { container(of: $0, in: parent) })
+            guard !folders.isEmpty, !containers.isEmpty else { return nil }
+            return SpaceItem.ContainerFolders(
+                parent: parent, folders: folders.map { URL(filePath: $0).lastPathComponent },
+                containers: containers.count, areGroups: areGroups
+            )
+        }
+        let managingAppIsMissing = definition.managedBy.map { !$0.oneIsOnThisMac } ?? false
+        return SpaceItem(
+            id: definition.id,
+            category: definition.category,
+            urls: urls,
+            size: size,
+            handling: definition.handling,
+            heldBack: definition.heldBack,
+            leavesMacOSsOwn: definition.leavesMacOSsOwn,
+            holdsBackRecentWrites: definition.holdsBackRecentWrites,
+            onlyFilesIn: definition.onlyFilesIn(home: home, root: root),
+            keepsItsFolders: definition.keepsItsFolders,
+            commands: definition.commands.filter { $0.isKnown(simctlRuntimeHelp: help) }.map(\.line),
+            managingAppIsMissing: managingAppIsMissing,
+            isRemovedByHand: definition.isRemovedByHand || managingAppIsMissing,
+            inContainers: counted,
+            placesNotCounted: counted.isEmpty ? nil : urls.filter { url in
+                !counted.contains { container(of: url, in: $0.parent) != nil }
+            }
+        )
+    }
+
+    /// The name of the folder directly in `parent` that holds `url`.
+    static func container(of url: URL, in parent: URL) -> String? {
+        let path = PathComponents.of(PathPattern.comparablePath(of: url))
+        let folder = PathComponents.of(PathPattern.comparablePath(of: parent))
+        return path.count > folder.count && path.starts(with: folder) ? path[folder.count] : nil
+    }
+}

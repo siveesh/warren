@@ -1,0 +1,699 @@
+public import Foundation
+internal import PeelPrivileged
+internal import Security
+
+/// The result of one scan for extensions.
+public struct ExtensionScan: Sendable {
+    public var extensions: [AppExtension] = []
+    /// The kinds macOS gave no answer about: `pluginkit` lists app extensions and `systemextensionsctl` system
+    /// extensions. No answer is not the same as finding none, so the list then holds only part of what is there.
+    public var unanswered: Set<AppExtension.Kind> = []
+}
+
+/// A part of an app that macOS runs on its own, such as a Finder menu, a share sheet entry, a widget, or a
+/// network filter. Peel only lists them: the user turns them on and off in System Settings, and removes one
+/// by removing the app it came with.
+public struct AppExtension: Sendable, Hashable, Identifiable {
+    public init(
+        id: String? = nil,
+        identifier: String,
+        name: String,
+        kind: Kind,
+        point: String?,
+        owner: String?,
+        url: URL?,
+        election: Election,
+        teamIdentifier: String?,
+        reportedState: String?,
+        installedFor: String? = nil,
+        goneApp: String? = nil,
+        category: String? = nil,
+        version: String? = nil,
+        developer: String? = nil
+    ) {
+        self.id = id ?? identifier
+        self.identifier = identifier
+        self.name = name
+        self.kind = kind
+        self.point = point
+        self.owner = owner
+        self.url = url
+        self.election = election
+        self.teamIdentifier = teamIdentifier
+        self.reportedState = reportedState
+        self.installedFor = installedFor
+        self.goneApp = goneApp
+        self.category = category
+        self.version = version
+        self.developer = developer
+    }
+
+    public enum Kind: String, Sendable, Hashable, CaseIterable {
+        /// A `.appex` inside an app bundle, as listed by `pluginkit`.
+        case appExtension
+        /// A `.systemextension` or `.dext`. macOS installs a copy of its own, apart from the app.
+        case systemExtension
+    }
+
+    /// The user's choice about an extension, or what macOS is doing with it. For an app extension, it comes
+    /// from the tag `pluginkit` prints at the start of each line (`man pluginkit`): `+` elected to use, `-`
+    /// elected to ignore, `!` elected for debugger use, `=` superseded by another plug-in, and `?` unknown. No
+    /// tag (`asItCame`) means the user has not chosen, so macOS decides. For a system extension, it comes from
+    /// the state `systemextensionsctl list` prints.
+    public enum Election: String, Sendable, Hashable {
+        case on
+        case off
+        case asItCame
+        /// macOS has the extension but won't run it until the user allows it in System Settings. It is kept
+        /// apart from `off` because the user never turned it off.
+        case waitingForApproval
+        /// macOS is removing the extension. Only one of the states that map here waits for a restart, so this
+        /// case doesn't mean a restart is needed.
+        case beingRemoved
+        /// macOS is partway through a change to the extension, such as enabling or upgrading it.
+        case changing
+        /// Another copy of the same extension is the one macOS runs.
+        case superseded
+        /// `pluginkit`'s `?`, which its manual calls an unknown user election state.
+        case unknown
+        /// A system extension state Peel doesn't recognize, which `reportedState` holds as macOS printed it.
+        case unrecognized
+    }
+
+    public let identifier: String
+    public let name: String
+    public let kind: Kind
+    /// The identifier of the extension point it plugs into, such as `com.apple.FinderSync` for Finder. Nil when
+    /// unknown, and always for a system extension.
+    public let point: String?
+    public let owner: String?
+    /// The location of the copy macOS runs, or nil when it can't be found. No path is better than a wrong one.
+    public let url: URL?
+    public let election: Election
+    public let teamIdentifier: String?
+    /// The state `systemextensionsctl` printed, like `activated waiting for user`. Nil for an app extension,
+    /// since `pluginkit` prints no such state.
+    public let reportedState: String?
+    /// For a system extension, the path of the app macOS's record says it was installed for: the app it is held
+    /// for, or once that app has moved, the app it was installed from.
+    public let installedFor: String?
+
+    /// Whether the app macOS installed this for is bundled inside another app. Finder asks macOS to remove only the
+    /// extensions in the moved app's own folder, so no move of either app removes this one.
+    public var isForAnAppInsideAnother: Bool {
+        guard let installedFor else { return false }
+        return PathComponents.of(installedFor).dropLast().contains(where: PathComponents.isNamedAsAnApp)
+    }
+    /// `installedFor`, when nothing is at that place anymore (`AppExtensions.goneApp(installedFor:)`).
+    public let goneApp: String?
+    /// The category `systemextensionsctl` lists a system extension under; nil for an app extension.
+    public let category: String?
+    /// The version `systemextensionsctl` lists, `<short>/<build>`; nil for an app extension.
+    public let version: String?
+    /// The maker its copy's checked signature names, for a system extension.
+    public let developer: String?
+    /// For a version macOS is removing while it keeps another version of it, that version, as shown.
+    public internal(set) var replacedBy: String?
+    /// Tells rows apart in a list. The identifier alone can't: while an app updates a system extension, macOS
+    /// lists the old and the new version under the same identifier.
+    public let id: String
+}
+
+extension AppExtension {
+    /// The app the extension came with: the app its bundle is inside, or, for a system extension, the app macOS's
+    /// record says it was installed for.
+    var app: URL? {
+        kind == .systemExtension
+            ? installedFor.map { URL(filePath: $0) }
+            : url.flatMap { AppExtensions.app(ofExtensionAt: $0.path(percentEncoded: false)) }
+    }
+
+    /// Where the person turns an extension on and off, which the point it plugs into decides.
+    public enum Switch: Sendable, Hashable {
+        /// System Settings > General > Login Items & Extensions.
+        case systemSettings
+        /// Safari > Settings > Extensions, where Safari keeps the choice itself (Apple's Safari User Guide).
+        case safari
+        /// The widget gallery, which adds and removes widgets; macOS turns none on or off (Apple's Mac User Guide).
+        case widgetGallery
+        /// Nowhere: Shortcuts and Siri use it whenever someone asks for the app's actions.
+        case nowhere
+    }
+
+    public var turnedOnAndOffIn: Switch {
+        switch point {
+        case "com.apple.Safari.extension", "com.apple.Safari.web-extension", "com.apple.Safari.content-blocker":
+            .safari
+        case "com.apple.widgetkit-extension": .widgetGallery
+        case "com.apple.intents-service", "com.apple.appintents-extension": .nowhere
+        default: .systemSettings
+        }
+    }
+
+    /// Whether `election` says if it is on. Safari keeps its own choice, which `pluginkit` doesn't show.
+    public var showsItsState: Bool {
+        turnedOnAndOffIn != .safari
+    }
+
+    /// On macOS 27, System Settings deletes a network extension, even once its app is gone.
+    public var systemSettingsDeletesIt: Bool {
+        guard #available(macOS 27, *) else { return false }
+        return kind == .systemExtension && category == "com.apple.system_extension.network_extension"
+    }
+
+    /// The app it came with while that app is there: the outermost app around an app extension, as for its name, or
+    /// the app macOS's record names for a system extension. Nil when Peel can't tell, or the app is gone.
+    public var appURL: URL? {
+        switch kind {
+        case .appExtension:
+            guard let path = url?.path(percentEncoded: false), let app = PathComponents.outermostApp(of: path) else {
+                return nil
+            }
+            return URL(filePath: app, directoryHint: .isDirectory)
+        case .systemExtension:
+            return goneApp == nil ? installedFor.map { URL(filePath: $0, directoryHint: .isDirectory) } : nil
+        }
+    }
+
+    /// The version as macOS shows one with its build, `2.0 (200)`.
+    public var shownVersion: String? {
+        version.map { listed in
+            let parts = listed.split(separator: "/", maxSplits: 1)
+            return parts.count == 2 ? "\(parts[0]) (\(parts[1]))" : listed
+        }
+    }
+
+    /// The name of the app it came with, also once that app is gone.
+    public var appName: String? {
+        owner ?? goneApp.map { URL(filePath: $0).deletingPathExtension().lastPathComponent }
+    }
+
+    /// Why Peel leaves a system extension where it is, as Orphaned Files says it: macOS removes it at the next
+    /// restart, System Settings deletes it, or only moving its app removes it. Nil for an app extension.
+    public var leftAlone: HoldBack? {
+        guard kind == .systemExtension else { return nil }
+        if election == .beingRemoved { return .systemExtensionGoingAtRestart }
+        return systemSettingsDeletesIt ? .deletableSystemExtension : .systemExtension
+    }
+}
+
+public struct CarriedSystemExtensions: Sendable, Hashable {
+    public let names: [String]
+    public let systemSettingsDeletesThem: Bool
+    /// The names of those macOS runs for an app inside this one. Finder's move asks macOS to remove only the ones in
+    /// the app's own folder, so these stay installed whoever moves the app.
+    public let inAnAppInside: [String]
+    /// True when one of `inAnAppInside` keeps the app from being moved while it runs, as its maker says.
+    public let keepsTheAppInPlace: Bool
+    /// False when Peel couldn't look into the app to name them.
+    public let isKnown: Bool
+
+    public init(
+        names: [String],
+        systemSettingsDeletesThem: Bool = false,
+        inAnAppInside: [String] = [],
+        keepsTheAppInPlace: Bool = false
+    ) {
+        self.init(
+            names: names, systemSettingsDeletesThem: systemSettingsDeletesThem, inAnAppInside: inAnAppInside,
+            keepsTheAppInPlace: keepsTheAppInPlace, isKnown: true
+        )
+    }
+
+    private init(
+        names: [String],
+        systemSettingsDeletesThem: Bool,
+        inAnAppInside: [String],
+        keepsTheAppInPlace: Bool,
+        isKnown: Bool
+    ) {
+        self.names = names
+        self.systemSettingsDeletesThem = systemSettingsDeletesThem
+        self.inAnAppInside = inAnAppInside
+        self.keepsTheAppInPlace = keepsTheAppInPlace
+        self.isKnown = isKnown
+    }
+
+    public static let none = CarriedSystemExtensions(names: [])
+    public static let notKnown = CarriedSystemExtensions(
+        names: [], systemSettingsDeletesThem: false, inAnAppInside: [], keepsTheAppInPlace: false, isKnown: false
+    )
+
+    public var isEmpty: Bool { names.isEmpty && isKnown }
+}
+
+public enum AppExtensions {
+    /// The System Settings page where the user turns extensions on and off.
+    public static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.ExtensionsPreferences")!
+
+    /// Whether the extension at `path` is part of macOS, judged by the folder it sits in. These are left out,
+    /// so the list shows only what apps added.
+    static func isTheSystemsOwn(_ path: String) -> Bool {
+        AppleCode.isInASystemFolder(path)
+    }
+
+    /// Runs a tool and returns its output, or nil when it gave no answer. A parameter so a test can say what
+    /// macOS answers instead of asking it.
+    typealias Runner = @Sendable (_ tool: String, _ arguments: [String]) async -> String?
+
+    public static func scan(exclusions: Exclusions = .none) async -> ExtensionScan {
+        await scan(exclusions: exclusions, run: run)
+    }
+
+    @concurrent
+    static func scan(exclusions: Exclusions, run: Runner) async -> ExtensionScan {
+        let apps = await appExtensions(run: run)
+        let system = await systemExtensions(run: run)
+        let found = (apps ?? []) + (system ?? [])
+        // An extension is its app's, so an app excluded by its identifier leaves its extensions out too.
+        var excludedApps: [URL: Bool] = [:]
+        return ExtensionScan(extensions: found
+            .filter { extensionItem in
+                guard !exclusions.excludes(bundleIdentifier: extensionItem.identifier) else { return false }
+                if let app = extensionItem.app {
+                    let isExcluded = excludedApps[app] ?? (exclusions.isAnExcludedApp(app) || exclusions.excludes(app))
+                    excludedApps[app] = isExcluded
+                    if isExcluded { return false }
+                }
+                return extensionItem.url.map { !exclusions.excludes($0) } ?? true
+            }
+            .sorted {
+                let (one, other) = ($0.owner ?? "", $1.owner ?? "")
+                guard one == other else { return one.localizedStandardCompare(other) == .orderedAscending }
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            },
+            unanswered: Set(
+                [apps == nil ? .appExtension : nil, system == nil ? .systemExtension : nil].compactMap(\.self)
+            )
+        )
+    }
+
+    /// Returns what apps added, or nil when `pluginkit` gave no answer Peel can read. It always lists macOS's own
+    /// extensions and ends by counting what it listed, so a listing read short of that is not understood. It goes on
+    /// listing an extension for a while after its app has left, so what is no longer there is left out.
+    static func appExtensions(run: Runner) async -> [AppExtension]? {
+        guard let output = await run("/usr/bin/pluginkit", ["-m", "-v"]) else { return nil }
+        let lines = output.split(whereSeparator: \.isNewline)
+        let rows = lines.compactMap { parse(String($0)) }
+        guard !rows.isEmpty, count(in: lines, /^ *\((\d+) plug-ins?\)$/) == rows.count else { return nil }
+        return rows.compactMap { parsed in
+            guard !isTheSystemsOwn(parsed.path) else { return nil }
+            let url = URL(filePath: parsed.path, directoryHint: .isDirectory)
+            guard !url.isMissing else { return nil }
+            let info = AppInspector.infoDictionary(in: url.appending(path: "Contents", directoryHint: .isDirectory))
+            return AppExtension(
+                identifier: parsed.identifier,
+                name: Self.name(of: url, info: info),
+                kind: .appExtension,
+                point: extensionPoint(in: info),
+                owner: owner(ofExtensionAt: parsed.path),
+                url: url,
+                election: parsed.election,
+                teamIdentifier: nil,
+                reportedState: nil
+            )
+        }
+    }
+
+    /// Whether the user turned `identifier` on but macOS runs a copy other than `own`, or a copy that is gone.
+    /// Without `-A` or `-D`, `pluginkit` lists one copy per identifier, the one PlugInKit's discovery picks
+    /// (`man pluginkit`). This matters because `FIFinderSyncController` reports on the calling app's own copy:
+    /// with two copies of Peel installed, one of them reads "off" while System Settings shows the extension on.
+    @concurrent
+    public static func runsAnotherCopy(of identifier: String, than own: URL) async -> Bool {
+        guard let listing = await run("/usr/bin/pluginkit", ["-m", "-v", "-i", identifier]) else { return false }
+        return runsAnotherCopy(of: identifier, than: own, in: listing)
+    }
+
+    static func runsAnotherCopy(of identifier: String, than own: URL, in listing: String) -> Bool {
+        let chosen = listing.split(whereSeparator: \.isNewline)
+            .compactMap { parse(String($0)) }
+            .first { $0.identifier == identifier && $0.election == .on }
+        guard let chosen else { return false }
+        let theirs = FileIdentity.Link.of(
+            URL(filePath: chosen.path, directoryHint: .isDirectory).resolvingSymlinksInPath()
+        )
+        return theirs != FileIdentity.Link.of(own.resolvingSymlinksInPath())
+    }
+
+    /// Parses one line of `pluginkit -m -v`, like `     com.example.thing(1.0)\t<uuid>\t<date>\t/path/to/Thing.appex`.
+    /// A tag in front, such as `+` or `-`, gives the election.
+    static func parse(_ line: String) -> (identifier: String, election: AppExtension.Election, path: String)? {
+        let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+        guard fields.count >= 4 else { return nil }
+        let path = String(fields[3]).trimmingCharacters(in: .whitespaces)
+        guard path.hasPrefix("/") else { return nil }
+
+        var head = String(fields[0])
+        let election: AppExtension.Election = switch head.first {
+        case "+", "!": .on
+        case "-": .off
+        case "=": .superseded
+        case "?": .unknown
+        default: .asItCame
+        }
+        if election != .asItCame { head.removeFirst() }
+        head = head.trimmingCharacters(in: .whitespaces)
+        guard let identifier = identifier(before: head) else { return nil }
+        return (identifier, election, path)
+    }
+
+    /// Returns the identifier in `head`, without the version in parentheses at its end. The version can hold
+    /// parentheses of its own: `pluginkit` writes `((null))` for a bundle without one, and a version can read
+    /// `(1.0 (23))`. So the identifier ends at the parenthesis that opens the version, not at the last `(`.
+    static func identifier(before head: String) -> String? {
+        guard !head.isEmpty else { return nil }
+        guard head.hasSuffix(")") else { return head }
+        var depth = 0
+        var index = head.endIndex
+        while index > head.startIndex {
+            head.formIndex(before: &index)
+            if head[index] == ")" {
+                depth += 1
+            } else if head[index] == "(" {
+                depth -= 1
+                guard depth == 0 else { continue }
+                let identifier = String(head[head.startIndex..<index])
+                return identifier.isEmpty ? nil : identifier
+            }
+        }
+        return nil
+    }
+
+    /// The extension's display name, or else its bundle name, in the user's language when the bundle has a
+    /// translation. Falls back to the file name.
+    static func name(of url: URL, info: [String: Any]?) -> String {
+        let localized = Bundle(url: url)?.localizedInfoDictionary
+        return localized?["CFBundleDisplayName"] as? String ?? info?["CFBundleDisplayName"] as? String
+            ?? localized?["CFBundleName"] as? String ?? info?["CFBundleName"] as? String
+            ?? url.deletingPathExtension().lastPathComponent
+    }
+
+    /// The identifier of the extension point, read from `Info.plist`. An ExtensionKit bundle has no
+    /// `NSExtension` and names its point under `EXAppExtensionAttributes` instead.
+    static func extensionPoint(in info: [String: Any]?) -> String? {
+        if let point = (info?["NSExtension"] as? [String: Any])?["NSExtensionPointIdentifier"] as? String { return point }
+        return (info?["EXAppExtensionAttributes"] as? [String: Any])?["EXExtensionPointIdentifier"] as? String
+    }
+
+    /// The name of the app the extension came with. This is the outermost app, so an extension inside
+    /// Instruments inside Xcode belongs to Xcode.
+    static func owner(ofExtensionAt path: String) -> String? {
+        app(ofExtensionAt: path).flatMap { AppInspector.displayName(of: $0) }
+    }
+
+    /// The app an extension at `path` is part of: the outermost app bundle it is inside, or the app itself.
+    static func app(ofExtensionAt path: String) -> URL? {
+        PathComponents.outermostApp(of: path).map { URL(filePath: $0) }
+    }
+
+    /// Nil when macOS gave no answer Peel can read, which is not the same as none installed.
+    public typealias SystemExtensionsAnswer = @Sendable () async -> [AppExtension]?
+
+    public static let askingMacOS: SystemExtensionsAnswer = { await systemExtensions(run: run) }
+
+    /// The system extensions whose maker says they keep their app from being moved, renamed, or deleted while they
+    /// run, each with its team.
+    private static let keepingTheirAppInPlace: [(team: String, identifier: String)] = [
+        // `PrivilegesCLI --help`: once enabled, it prevents Privileges from being renamed, copied, or deleted.
+        ("7R5ZEU67FQ", "corp.sap.privileges.extension"),
+    ]
+
+    /// When macOS gives no answer, every system extension `app` carries counts. macOS's record names the app each one
+    /// was installed for, so one running for an app inside `app` counts too: turned off, it holds nothing in place.
+    @concurrent
+    public static func installed(
+        carriedBy app: InstalledApp,
+        asking answer: SystemExtensionsAnswer = askingMacOS
+    ) async -> CarriedSystemExtensions {
+        guard let carried = systemExtensions(carriedBy: app.url) else { return .notKnown }
+        guard let installed = await answer() else {
+            return carried.isEmpty ? .none : CarriedSystemExtensions(names: carried.map(\.name))
+        }
+        let identifiers = Set(carried.map(\.identifier))
+        let place = PathPattern.comparablePath(of: app.url)
+        let listed = installed.filter { item in
+            let team = item.teamIdentifier
+            let sameTeam = app.teamIdentifier == nil || team == nil || team == app.teamIdentifier
+            let isForAnAppInside = item.installedFor.map { PathComponents.isPath($0, inside: place) } ?? false
+            let runs = ![.off, .waitingForApproval].contains(item.election)
+            return (identifiers.contains(item.identifier) || (isForAnAppInside && runs))
+                && item.election != .beingRemoved && sameTeam
+        }
+        // During an update macOS lists the old version beside the new one: each is named once, as the one that runs.
+        var named: Set<String> = []
+        let held = listed.compactMap { item in
+            guard named.insert(item.identifier).inserted else { return AppExtension?.none }
+            return listed.first { $0.identifier == item.identifier && $0.election == .on } ?? item
+        }
+        let inside = held.filter { !identifiers.contains($0.identifier) }
+        return CarriedSystemExtensions(
+            names: held.map(\.name),
+            systemSettingsDeletesThem: !held.isEmpty && held.allSatisfy(\.systemSettingsDeletesIt),
+            inAnAppInside: inside.map(\.name),
+            keepsTheAppInPlace: inside.contains { item in
+                keepingTheirAppInPlace.contains { $0.team == item.teamIdentifier && $0.identifier == item.identifier }
+            }
+        )
+    }
+
+    /// A `.systemextension` keeps its `Info.plist` in `Contents`, and a `.dext` at its top. Nil when the folder that
+    /// holds them, or one of them, can't be read.
+    static func systemExtensions(carriedBy app: URL) -> [(identifier: String, name: String)]? {
+        let folder = app.appending(path: "Contents/Library/SystemExtensions", directoryHint: .isDirectory)
+        guard let names = ProtectedData.names(in: folder.path(percentEncoded: false), followingLinks: true) else {
+            return nil
+        }
+        var carried: [(identifier: String, name: String)] = []
+        for name in names.sorted() {
+            let bundle = folder.appending(path: name, directoryHint: .isDirectory)
+            let info: [String: Any]?
+            switch bundle.pathExtension {
+            case "systemextension": info = AppInspector.infoDictionary(in: bundle.appending(path: "Contents"))
+            case "dext": info = AppInspector.infoDictionary(in: bundle)
+            default: continue
+            }
+            guard let identifier = info?["CFBundleIdentifier"] as? String else { return nil }
+            carried.append((identifier, Self.name(of: bundle, info: info)))
+        }
+        return carried
+    }
+
+    /// Returns the system extensions, or nil when `systemextensionsctl` gave no answer Peel can read: its first
+    /// line counts the rows that follow, and a listing read short of it is not understood.
+    static func systemExtensions(
+        run: Runner, records: @autoclosure () -> [SystemExtensionRecord] = systemExtensionRecords()
+    ) async -> [AppExtension]? {
+        guard let output = await run("/usr/bin/systemextensionsctl", ["list"]) else { return nil }
+        let lines = output.split(whereSeparator: \.isNewline)
+        // Each category is a line of its own, `--- <category> (...)`, above the rows macOS lists under it.
+        var category: String?
+        let rows = lines.compactMap { line -> (row: SystemExtensionRow, category: String?)? in
+            if line.hasPrefix("--- ") {
+                category = line.dropFirst(4).split(separator: " ").first.map(String.init)
+                return nil
+            }
+            return parseSystemExtension(String(line)).map { ($0, category) }
+        }
+        guard count(in: lines, /^(\d+) extension\(s\)$/) == rows.count else { return nil }
+        let records = records()
+        return notingReplacements(rows.map { row, category in
+            let record = record(for: row.identifier, version: row.version, state: row.state, among: records)
+            let installedFor = record.flatMap(installedFor)
+            return AppExtension(
+                // During an update, one identifier is listed twice, once for the old version and once for the new,
+                // and in developer mode twice for one version: macOS's record names each copy.
+                id: record?.uniqueID ?? [row.identifier, row.version, row.state].compactMap(\.self).joined(separator: " "),
+                identifier: row.identifier,
+                name: row.name,
+                kind: .systemExtension,
+                point: nil,
+                owner: record?.container.flatMap(owner(ofExtensionAt:)),
+                url: record?.staged,
+                election: election(forSystemExtensionState: row.state),
+                teamIdentifier: row.teamIdentifier,
+                reportedState: row.state,
+                installedFor: installedFor,
+                goneApp: goneApp(installedFor: installedFor),
+                category: category,
+                version: row.version,
+                developer: developer(ofCopyAt: record?.staged)
+            )
+        })
+    }
+
+    static func developer(ofCopyAt url: URL?) -> String? {
+        url.flatMap { AppInspector.signingInformation(for: $0).developer }
+    }
+
+    /// Each system extension macOS is removing while it keeps another version of it, with the version that stays.
+    static func notingReplacements(_ found: [AppExtension]) -> [AppExtension] {
+        found.map { item in
+            guard item.election == .beingRemoved else { return item }
+            var noted = item
+            noted.replacedBy = found.first {
+                $0.identifier == item.identifier && $0.election != .beingRemoved && $0.version != item.version
+            }?.shownVersion
+            return noted
+        }
+    }
+
+    /// The number a tool's line of summary gives, or nil when no line reads that way.
+    private static func count(in lines: [Substring], _ summary: Regex<(Substring, Substring)>) -> Int? {
+        lines.lazy.compactMap { try? summary.wholeMatch(in: $0) }.first.flatMap { Int($0.1) }
+    }
+
+    /// Parses one row of `systemextensionsctl list`, laid out as
+    /// `<enabled>\t<active>\t<team>\t<identifier> (<version>)\t<name>\t[<state>]`. The header row above each
+    /// category has the same columns and is skipped, since its identifier column (`bundleID`) has no dot.
+    typealias SystemExtensionRow = (
+        identifier: String, version: String?, name: String, teamIdentifier: String?, state: String
+    )
+
+    static func parseSystemExtension(_ line: String) -> SystemExtensionRow? {
+        let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map {
+            String($0).trimmingCharacters(in: .whitespaces)
+        }
+        guard fields.count >= 6, let bracketed = fields.last, bracketed.hasPrefix("["), bracketed.hasSuffix("]") else {
+            return nil
+        }
+        let identifier = String(fields[3].prefix { $0 != " " })
+        guard identifier.contains(".") else { return nil }
+        let version = fields[3].dropFirst(identifier.count).trimmingCharacters(in: .whitespaces)
+        return (
+            identifier,
+            version.hasPrefix("(") && version.hasSuffix(")") ? String(version.dropFirst().dropLast()) : nil,
+            fields[4],
+            fields[2].count == 10 ? fields[2] : nil,
+            String(bracketed.dropFirst().dropLast())
+        )
+    }
+
+    /// Maps a state printed by `systemextensionsctl` to an election. The names are `sysextd`'s own, printed
+    /// with spaces where `sysextd` has underscores.
+    static func election(forSystemExtensionState state: String) -> AppExtension.Election {
+        switch state.replacing(" ", with: "_") {
+        case "activated_enabled": .on
+        case "activated_disabled": .off
+        case "activated_waiting_for_user": .waitingForApproval
+        case "terminated_waiting_to_uninstall_on_reboot", "terminating_for_uninstall",
+             "terminating_for_uninstall_but_still_running", "terminating_for_uninstall_via_delegate",
+             "uninstalling", "uninstalled": .beingRemoved
+        case "activated_enabling", "activated_waiting_to_upgrade", "activated_waiting_to_upgrade_on_reboot",
+             "terminating_for_disable", "terminating_for_disable_but_still_running",
+             "terminating_for_upgrade_via_delegate", "validating", "validating_by_category": .changing
+        default: .unrecognized
+        }
+    }
+
+    /// What `/Library/SystemExtensions/db.plist` records about a system extension: where macOS staged the copy
+    /// it runs (not the one inside the app), and which app requested it. One identifier can have a record per
+    /// version, so the version is kept too.
+    struct SystemExtensionRecord {
+        let identifier: String
+        let version: String?
+        let staged: URL?
+        let container: String?
+        /// Where the extension was installed from, inside its app (`originPath`).
+        var origin: String? = nil
+        var state: String? = nil
+        var uniqueID: String? = nil
+    }
+
+    /// The path of the app a record says its extension was installed for: the app macOS holds it for, or, once
+    /// Finder has moved that app and the record holds none, the app its original copy sat in.
+    static func installedFor(_ record: SystemExtensionRecord) -> String? {
+        record.container ?? PathComponents.outermostApp(of: record.origin ?? "")
+    }
+
+    static func goneApp(installedFor: String?) -> String? {
+        installedFor.flatMap { URL(filePath: $0).isMissing ? $0 : nil }
+    }
+
+    /// The record of the extension `systemextensionsctl` listed: the one of its version, or the only one of its
+    /// identifier. During an update an identifier has a record per version, and the other version's copy is not
+    /// this one: no path is better than a wrong one. Two copies of one version, as developer mode allows, are told
+    /// apart by the state, which the record writes with underscores where the listing has spaces.
+    static func record(
+        for identifier: String,
+        version: String?,
+        state: String? = nil,
+        among records: [SystemExtensionRecord]
+    ) -> SystemExtensionRecord? {
+        let named = records.filter { $0.identifier == identifier }
+        let ofTheVersion = named.filter { $0.version == version }
+        guard ofTheVersion.count < 2 else {
+            return ofTheVersion.first { $0.state != nil && $0.state == state?.replacing(" ", with: "_") }
+        }
+        return ofTheVersion.first ?? (named.count == 1 ? named.first : nil)
+    }
+
+    static func systemExtensionRecords(
+        at url: URL = URL(filePath: "/Library/SystemExtensions/db.plist")
+    ) -> [SystemExtensionRecord] {
+        guard let entries = BoundedRead.propertyList(at: url)?["extensions"] as? [[String: Any]] else { return [] }
+        return entries.compactMap { entry in
+            guard let identifier = entry["identifier"] as? String else { return nil }
+            let version = entry["bundleVersion"] as? [String: Any]
+            let short = version?["CFBundleShortVersionString"] as? String
+            let build = version?["CFBundleVersion"] as? String
+            let staged = (entry["stagedBundleURL"] as? [String: Any])?["relative"] as? String
+            return SystemExtensionRecord(
+                identifier: identifier,
+                version: [short, build].compactMap(\.self).joined(separator: "/"),
+                staged: staged.flatMap(URL.init(string:)),
+                container: (entry["container"] as? [String: Any])?["bundlePath"] as? String,
+                origin: entry["originPath"] as? String,
+                state: entry["state"] as? String,
+                uniqueID: entry["uniqueID"] as? String
+            )
+        }
+    }
+
+    /// Runs `tool` and returns its output, or nil when it could not run or failed. Nil means no answer, which
+    /// is not the same as no extensions.
+    private static func run(_ tool: String, _ arguments: [String]) async -> String? {
+        guard case .success(let output) = await Subprocess.run(tool, arguments, timeout: 10) else { return nil }
+        return output.status == 0 ? output.text : nil
+    }
+}
+
+/// Tells whether code is Apple's own, from where it sits or from its signature, never from its name: any
+/// bundle can call itself `com.apple.something`. Extensions and plug-ins both use it.
+enum AppleCode {
+    /// Whether `path` is inside `/System` or `/usr`, where macOS installs its own code. Not `/usr/local`, which
+    /// System Integrity Protection leaves to administrators and Homebrew, nor the data volume, which macOS also
+    /// names under `/System/Volumes/Data` and which holds what anybody installed.
+    static func isInASystemFolder(_ path: String) -> Bool {
+        let names = PathComponents.of(path)
+        guard path.hasPrefix("/"), names.count > 1 else { return false }
+        switch names[0] {
+        case "usr": return names[1] != "local"
+        case "System": return !(names[1] == "Volumes" && names.count > 2 && names[2] == "Data")
+        default: return false
+        }
+    }
+
+    static func isApples(_ url: URL) -> Bool {
+        isInASystemFolder(url.path(percentEncoded: false)) || isSignedByApple(url)
+    }
+
+    /// Whether Apple itself signed the code at `url`. The requirement is `anchor apple`, because every
+    /// Developer ID app also passes `anchor apple generic`. `kSecCSBasicValidateOnly` (`SecStaticCode.h`)
+    /// skips hashing the executable, which is slow and not needed to know the signer, and checking the sealed
+    /// resources, which some Apple components fail because of custom omit rules while their signature is
+    /// sound. Skipping them can only turn a no into a yes, and a wrong yes only hides a row.
+    private static func isSignedByApple(_ url: URL) -> Bool {
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &staticCode) == errSecSuccess, let staticCode else {
+            return false
+        }
+        var requirement: SecRequirement?
+        guard
+            SecRequirementCreateWithString("anchor apple" as CFString, [], &requirement) == errSecSuccess,
+            let requirement
+        else { return false }
+        let flags = SecCSFlags(rawValue: UInt32(kSecCSBasicValidateOnly))
+        return SecStaticCodeCheckValidity(staticCode, flags, requirement) == errSecSuccess
+    }
+}

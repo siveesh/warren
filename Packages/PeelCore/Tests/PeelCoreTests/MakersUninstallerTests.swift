@@ -1,0 +1,376 @@
+import Foundation
+@testable import PeelCore
+import Testing
+
+struct MakersUninstallerTests {
+    private func agent(_ identifier: String, team: String?, at path: String = "/Applications/Agent.app") -> InstalledApp {
+        InstalledApp(
+            url: URL(filePath: path, directoryHint: .isDirectory), bundleIdentifier: identifier, name: "Agent",
+            teamIdentifier: team, isSealIntact: true
+        )
+    }
+
+    /// The step for `app`, as if every script and uninstaller its maker names were on the Mac, where a system wide
+    /// installer puts them.
+    private func step(_ app: InstalledApp) -> MakersUninstaller.Step? {
+        MakersUninstaller.of(
+            app, home: URL(filePath: "/Users/me", directoryHint: .isDirectory), isOnTheMac: { _ in true },
+            isOnlyRoots: { _ in true }
+        )?.step
+    }
+
+    @Test func knowsAnAgentByTheTeamAndTheIdentifierItsMakerDocuments() {
+        let globalProtect = agent(
+            "com.paloaltonetworks.GlobalProtect.client", team: "PXPZ95SK77", at: "/Applications/GlobalProtect.app"
+        )
+        #expect(step(globalProtect) == .command("sudo /Applications/GlobalProtect.app/Contents/Resources/uninstall_gp.sh"))
+        #expect(MakersUninstaller.of(agent("com.paloaltonetworks.cortex.agent", team: "PXPZ95SK77")) != nil)
+        #expect(MakersUninstaller.of(agent("com.cisco.secureclient.gui", team: "DE8Y96K9QP"))?.maker == "Cisco")
+        #expect(MakersUninstaller.of(agent("com.microsoft.wdav", team: "UBF8T346G9"))?.maker == "Microsoft")
+        #expect(MakersUninstaller.of(agent("com.netskope.client.Netskope-Client", team: "24W52P9M7W")) != nil)
+        #expect(MakersUninstaller.of(agent("com.fortinet.FortiClient", team: "AH4XFXJ7DK")) != nil)
+        #expect(
+            step(agent("com.bitdefender.EndpointSecurityforMac", team: "GUNFMW623Y"))
+                == .uninstaller(URL(filePath: "/Applications/Bitdefender/EndpointSecurityforMacUninstaller.app", directoryHint: .isDirectory))
+        )
+        #expect(
+            step(agent("com.sophos.endpoint.uiserver", team: "2H5GFH3774"))
+                == .uninstaller(URL(filePath: "/Applications/Sophos/Remove Sophos Endpoint.app", directoryHint: .isDirectory))
+        )
+        let eset = agent("com.eset.ees.g2", team: "P8DQRXPVLP", at: "/Applications/ESET Endpoint Security.app")
+        #expect(
+            step(eset) == .uninstaller(
+                URL(
+                    filePath: "/Applications/ESET Endpoint Security.app/Contents/Helpers/Uninstaller.app",
+                    directoryHint: .isDirectory
+                )
+            )
+        )
+    }
+
+    @Test func knowsAVPNWhoseMakerDocumentsItsOwnUninstall() {
+        let express = agent("com.express.vpn", team: "TC292Y5427", at: "/Applications/ExpressVPN.app")
+        let tunnelblick = agent("net.tunnelblick.tunnelblick", team: "Z2SG5H3HC8", at: "/Applications/Tunnelblick.app")
+
+        #expect(MakersUninstaller.of(express)?.step == .inTheApp(express.url))
+        #expect(MakersUninstaller.of(agent("com.privateinternetaccess.vpn", team: "5357M5NW9W"))?.step == .inTheApp(
+            URL(filePath: "/Applications/Agent.app", directoryHint: .isDirectory)
+        ))
+        #expect(MakersUninstaller.of(tunnelblick)?.maker == "Tunnelblick")
+        let warp = agent("com.cloudflare.1dot1dot1dot1.macos", team: "68WVV388M8", at: "/Applications/Cloudflare WARP.app")
+        #expect(step(warp) == .command("'/Applications/Cloudflare WARP.app/Contents/Resources/uninstall.sh'"))
+        #expect(
+            step(agent("com.zerotier.ZeroTier-UI", team: "8ZD9JUCZ4V"))
+                == .command("sudo '/Library/Application Support/ZeroTier/One/uninstall.sh'")
+        )
+        #expect(MakersUninstaller.of(agent("com.zerotier.ZeroTier-One", team: "8ZD9JUCZ4V"))?.maker == "ZeroTier")
+        #expect(MakersUninstaller.of(agent("com.electron.ivpn-ui", team: "WQXXM75BYN"))?.step == .onItsDiskImage)
+        #expect(MakersUninstaller.of(agent("net.ivpn.client.IVPN", team: "WQXXM75BYN"))?.maker == "IVPN")
+        #expect(MakersUninstaller.of(agent("com.electron.ivpn-ui", team: "ABCDE12345")) == nil)
+    }
+
+    @Test func knowsAnAgentAndABackupAppWhoseMakersDocumentTheirOwnUninstall() {
+        let arq = agent("com.haystacksoftware.Arq", team: "48ZCSDVL96", at: "/Applications/Arq.app")
+
+        #expect(
+            step(agent("com.zscaler.zscaler", team: "PCBCQZJ7S7"))
+                == .uninstaller(URL(filePath: "/Applications/Zscaler/UninstallApplication.app", directoryHint: .isDirectory))
+        )
+        #expect(MakersUninstaller.of(agent("com.zscaler.tray", team: "PCBCQZJ7S7"))?.maker == "Zscaler")
+        #expect(MakersUninstaller.of(arq)?.step == .inTheApp(arq.url))
+        #expect(MakersUninstaller.of(agent("com.zscaler.zscaler", team: "ABCDE12345")) == nil)
+    }
+
+    @Test func knowsALocalServerStackWhoseMakerSaysToUseItsOwnUninstall() {
+        let herd = agent("de.beyondco.herd", team: "8Z259RPWAC", at: "/Applications/Herd.app")
+        let herdInTheHome = agent("de.beyondco.herd", team: "8Z259RPWAC", at: "/Users/me/Applications/Herd.app")
+
+        #expect(step(herd) == .command("bash /Applications/Herd.app/Contents/Resources/uninstall"))
+        #expect(step(herdInTheHome) == .command("bash ~/Applications/Herd.app/Contents/Resources/uninstall"))
+        #expect(MakersUninstaller.of(herd)?.maker == "Beyond Code")
+        #expect(MakersUninstaller.of(agent("de.beyondco.herd", team: "ABCDE12345")) == nil)
+    }
+
+    @Test func knowsADataRecoveryAppAndAMalwareScannerWhoseMakersDocumentTheirOwnUninstall() {
+        let diskDrill = agent("com.cleverfiles.DiskDrill", team: "Z6C22PNU8R", at: "/Applications/Disk Drill.app")
+        let malwarebytes = agent(
+            "com.malwarebytes.mbam.frontend.application", team: "GVZRY6KDKR", at: "/Applications/Malwarebytes.app"
+        )
+
+        #expect(MakersUninstaller.of(diskDrill)?.step == .inTheApp(diskDrill.url))
+        #expect(MakersUninstaller.of(diskDrill)?.maker == "CleverFiles")
+        #expect(MakersUninstaller.of(malwarebytes)?.step == .inTheApp(malwarebytes.url))
+        #expect(MakersUninstaller.of(malwarebytes)?.maker == "Malwarebytes")
+        #expect(MakersUninstaller.of(agent("com.cleverfiles.DiskDrill", team: "ABCDE12345")) == nil)
+    }
+
+    @Test func knowsKasperskyByTheTeamAndIdentifierItsSignatureNames() {
+        let kaspersky = agent(
+            "com.kaspersky.kav", team: "2Y8XE5CQ94", at: "/Applications/Kaspersky Anti-Virus For Mac.app"
+        )
+
+        #expect(MakersUninstaller.of(kaspersky)?.step == .inTheApp(kaspersky.url))
+        #expect(MakersUninstaller.of(kaspersky)?.maker == "Kaspersky")
+        #expect(MakersUninstaller.of(agent("com.kaspersky.kav", team: "ABCDE12345")) == nil)
+    }
+
+    @Test func knowsTheAppsWhoseMakersPagesAndSignedInstallersWereReadOnTheMac() {
+        let karabiner = agent(
+            "org.pqrs.Karabiner-Elements.Settings", team: "G43BCU2T37", at: "/Applications/Karabiner-Elements.app"
+        )
+        let eset = agent("com.eset.ecs.g2", team: "P8DQRXPVLP", at: "/Applications/ESET Cyber Security.app")
+        let ccc = agent("com.bombich.ccc", team: "L4F2DED5Q7", at: "/Applications/Carbon Copy Cloner.app")
+        let utility = agent(
+            "com.wacom.RemoveWacomTablet", team: "EG27766DY7",
+            at: "/Applications/Wacom Tablet.localized/Wacom Tablet Utility.app"
+        )
+
+        #expect(MakersUninstaller.of(karabiner)?.step == .inTheApp(karabiner.url))
+        #expect(MakersUninstaller.of(agent("org.pqrs.Karabiner-EventViewer", team: "G43BCU2T37")) == nil)
+        #expect(
+            step(agent("com.canonical.multipassGui", team: "X4QN7LTP59"))
+                == .command("sudo sh '/Library/Application Support/com.canonical.multipass/uninstall.sh'")
+        )
+        #expect(step(eset) == .uninstaller(
+            URL(filePath: "/Applications/ESET Cyber Security.app/Contents/Helpers/Uninstaller.app", directoryHint: .isDirectory)
+        ))
+        #expect(
+            step(agent("com.crashplan.desktop", team: "UGHXR79U6M"))
+                == .uninstaller(URL(filePath: "/Library/Application Support/CrashPlan/Uninstall.app", directoryHint: .isDirectory))
+        )
+        #expect(MakersUninstaller.of(ccc)?.step == .inTheApp(ccc.url))
+        #expect(MakersUninstaller.of(ccc)?.maker == "Bombich Software")
+        #expect(step(utility) == .uninstaller(utility.url))
+        #expect(MakersUninstaller.of(utility)?.removes == "Wacom Tablet")
+        #expect(
+            step(agent("com.wacom.WacomCenter", team: "EG27766DY7"))
+                == .uninstaller(URL(filePath: "/Applications/Wacom Tablet.localized/Wacom Tablet Utility.app", directoryHint: .isDirectory))
+        )
+        #expect(MakersUninstaller.of(agent("com.wacom.Wacom-Display-Settings", team: "EG27766DY7"))?.maker == "Wacom")
+        #expect(MakersUninstaller.of(agent("com.canonical.multipassGui", team: "ABCDE12345")) == nil)
+        #expect(
+            step(agent("com.backblaze.Backblaze", team: "G4K4BQ7S8J"))
+                == .uninstaller(URL(filePath: "/Library/Backblaze.bzpkg/UninstallBackblaze.app", directoryHint: .isDirectory))
+        )
+        let iStat = agent("com.bjango.istatmenus", team: "Y93TK974AT", at: "/Applications/iStat Menus.app")
+        #expect(MakersUninstaller.of(iStat)?.step == .inTheApp(iStat.url))
+        #expect(MakersUninstaller.of(agent("com.bjango.istatmenus-mas", team: "Y93TK974AT")) == nil)
+        #expect(
+            MakersUninstaller.of(agent("com.splashtop.Splashtop-Streamer", team: "CPQQ3AW49Y"))?.step == .onItsDiskImage
+        )
+        #expect(
+            step(agent("org.opensc-project.mac.opensctoken.OpenSCTokenApp", team: "L7897KTAHV"))
+                == .command("sudo /usr/local/bin/opensc-uninstall")
+        )
+    }
+
+    @Test func knowsTheAppsWhoseUninstallerTheirMakersPageOffersToDownload() {
+        #expect(MakersUninstaller.of(agent("com.box.desktop", team: "M683GB7CPW"))?.step == .fromTheMakersPage)
+        #expect(MakersUninstaller.of(agent("com.box.desktop.helper", team: "M683GB7CPW"))?.maker == "Box")
+        let webex = MakersUninstaller.of(agent("Cisco-Systems.Spark", team: "DE8Y96K9QP"))
+        #expect(webex?.step == .fromTheMakersPage)
+        #expect(webex?.maker == "Cisco")
+        #expect(MakersUninstaller.of(agent("Cisco-Systems.Spark", team: "ABCDE12345")) == nil)
+        #expect(MakersUninstaller.of(agent("org.gpgtools.gpgkeychain", team: "PKV8ZPD836"))?.step == .fromTheMakersPage)
+        #expect(MakersUninstaller.of(agent("com.datadoghq.agent", team: "JKFCB4CN7C"))?.step == .fromTheMakersPage)
+    }
+
+    @Test func knowsTheAppsWhoseMakersUninstallersWereRunOnTheMac() {
+        let avast = agent("com.avast.AAFM", team: "6H4HRTU5E3", at: "/Applications/Avast.app")
+        let avastUninstaller = agent(
+            "com.avast.av.uninstaller", team: "6H4HRTU5E3", at: "/Applications/com.avast.av.uninstaller.app"
+        )
+        let avg = agent("com.avg.Antivirus", team: "XSJ59WMJBM", at: "/Applications/AVGAntivirus.app")
+        let avgUninstaller = agent(
+            "com.avg.av.uninstaller", team: "XSJ59WMJBM", at: "/Applications/com.avg.av.uninstaller.app"
+        )
+        let trendMicro = agent(
+            "com.trendmicro.AFMAgent", team: "E8P47U2H32", at: "/Applications/TrendMicro.localized/AFMAgent.app"
+        )
+        let trendMicroUninstaller = agent(
+            "com.trendmicro.iTIS.UninstallerLauncher", team: "E8P47U2H32",
+            at: "/Applications/TrendMicro.localized/UninstallerLauncher.app"
+        )
+
+        #expect(step(avast) == .uninstaller(avastUninstaller.url))
+        #expect(MakersUninstaller.of(avastUninstaller)?.step == .uninstaller(avastUninstaller.url))
+        #expect(MakersUninstaller.of(avastUninstaller)?.removes == "Avast Security")
+        #expect(step(avg) == .uninstaller(avgUninstaller.url))
+        #expect(MakersUninstaller.of(avgUninstaller)?.removes == "AVG AntiVirus")
+        #expect(step(trendMicro) == .uninstaller(trendMicroUninstaller.url))
+        #expect(MakersUninstaller.of(trendMicroUninstaller)?.removes == "Trend Micro Antivirus")
+        #expect(MakersUninstaller.of(agent("com.trendmicro.iTIS.SupportTool", team: "E8P47U2H32"))?.maker == "Trend Micro")
+        #expect(
+            step(agent("com.tuxera.TuxeraDiskManager", team: "PPNVCC9Z68"))
+                == .command("sudo /Library/Filesystems/tuxera_ntfs.fs/Contents/Resources/Support/uninstall-package.sh")
+        )
+        let music = agent("com.bearisdriving.BGM.App", team: "PR7PXC66S5", at: "/Applications/Background Music.app")
+        #expect(step(music) == .command("bash '/Applications/Background Music.app/Contents/Resources/uninstall.sh'"))
+        #expect(MakersUninstaller.of(agent("com.avast.AAFM", team: "XSJ59WMJBM")) == nil)
+        #expect(MakersUninstaller.of(agent("com.trendmicro.antivirusone", team: "E8P47U2H32")) == nil)
+    }
+
+    @Test func givesTheUninstallScriptOfTheCiscoClientThatIsOnTheMac() {
+        let anyConnect = agent("com.cisco.anyconnect.gui", team: "DE8Y96K9QP")
+        let secureClient = "/opt/cisco/secureclient/bin/cisco_secure_client_uninstall.sh"
+
+        let found = MakersUninstaller.of(anyConnect, isOnTheMac: { $0 == secureClient }, isOnlyRoots: { _ in true })
+        #expect(found?.step == .command("sudo \(secureClient)"))
+        #expect(found?.instructions.absoluteString.contains("224782") == true)
+        let older = MakersUninstaller.of(anyConnect, isOnTheMac: { $0 != secureClient }, isOnlyRoots: { _ in true })
+        #expect(older?.step == .command("sudo /opt/cisco/anyconnect/bin/vpn_uninstall.sh"))
+        #expect(older?.instructions.absoluteString.contains("anyconnect410") == true)
+        #expect(MakersUninstaller.of(anyConnect) { _ in false }?.step == .notOnTheMac)
+    }
+
+    /// A script inside the app runs where the app is, which need not be /Applications, and a step whose script or
+    /// uninstaller isn't on the Mac is never offered: its command could only fail.
+    @Test func offersOnlyAStepWhoseScriptOrUninstallerIsOnTheMac() throws {
+        let directory = try TemporaryDirectory()
+        let script = try directory.file("My Apps/Background Music.app/Contents/Resources/uninstall.sh", bytes: 0)
+        let music = InstalledApp(
+            url: try directory.directory("My Apps/Background Music.app"), bundleIdentifier: "com.bearisdriving.BGM.App",
+            name: "Background Music", teamIdentifier: "PR7PXC66S5", isSealIntact: true
+        )
+        let herd = InstalledApp(
+            url: try directory.directory("My Apps/Herd.app"), bundleIdentifier: "de.beyondco.herd", name: "Herd",
+            teamIdentifier: "8Z259RPWAC"
+        )
+
+        #expect(MakersUninstaller.of(music)?.step == .command("bash '\(script.path(percentEncoded: false))'"))
+        #expect(MakersUninstaller.of(herd)?.step == .notOnTheMac)
+        #expect(MakersUninstaller.of(herd)?.maker == "Beyond Code")
+        #expect(MakersUninstaller.of(agent("com.zerotier.ZeroTier-UI", team: "8ZD9JUCZ4V")) { _ in false }?.step == .notOnTheMac)
+        #expect(MakersUninstaller.of(agent("com.netskope.client", team: "24W52P9M7W")) { _ in false }?.step == .notOnTheMac)
+        #expect(MakersUninstaller.of(agent("com.box.desktop", team: "M683GB7CPW")) { _ in false }?.step == .fromTheMakersPage)
+    }
+
+    @Test func aScriptNothingVouchesForGetsNoCommand() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Downloads/GlobalProtect.app/Contents/Resources/uninstall_gp.sh")
+        let unsealed = InstalledApp(
+            url: try directory.directory("Downloads/GlobalProtect.app"),
+            bundleIdentifier: "com.paloaltonetworks.GlobalProtect.client", name: "GlobalProtect",
+            teamIdentifier: "PXPZ95SK77", isSealIntact: false
+        )
+        let accounts = try directory.file("bin/opensc-uninstall")
+        let openSC = agent("org.opensc-project.mac.opensctoken", team: "L7897KTAHV")
+
+        #expect(MakersUninstaller.of(unsealed)?.step == .notOnTheMac)
+        #expect(MakersUninstaller.onlyRootCanChange(accounts) == false)
+        #expect(MakersUninstaller.onlyRootCanChange(URL(filePath: "/bin/sh")))
+        let openSCsStep = MakersUninstaller.of(openSC, isOnTheMac: { _ in true }, isOnlyRoots: { _ in false })?.step
+        #expect(openSCsStep == .notOnTheMac)
+    }
+
+    @Test func aSealHoldsOnlyWhileNothingInTheBundleChanged() throws {
+        let directory = try TemporaryDirectory()
+        let bundle = try directory.directory("Maker.app")
+        let info: [String: Any] = ["CFBundleIdentifier": "org.example.maker", "CFBundleExecutable": "Maker"]
+        try directory.file(
+            "Maker.app/Contents/Info.plist",
+            contents: try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        )
+        try directory.directory("Maker.app/Contents/MacOS")
+        try FileManager.default.copyItem(
+            at: URL(filePath: "/bin/cat"), to: bundle.appending(path: "Contents/MacOS/Maker")
+        )
+        let script = try directory.file("Maker.app/Contents/Resources/uninstall.sh", contents: Data("exit 0\n".utf8))
+        let signing = try Process.run(
+            URL(filePath: "/usr/bin/codesign"),
+            arguments: ["--force", "--sign", "-", bundle.path(percentEncoded: false)]
+        )
+        signing.waitUntilExit()
+        try #require(signing.terminationStatus == 0)
+        #expect(CodeSignature.sealHolds(at: bundle))
+
+        try Data("exit 1\n".utf8).write(to: script)
+
+        #expect(!CodeSignature.sealHolds(at: bundle))
+    }
+
+    @Test func aSealBreaksWhenAProgramInsideOrAnotherSliceChanges() throws {
+        let directory = try TemporaryDirectory()
+        let bundle = try directory.directory("Maker.app")
+        let helper = try directory.directory("Maker.app/Contents/Helpers/Tool.app")
+        for (app, name) in [(helper, "Tool"), (bundle, "Maker")] {
+            let programs = app.appending(path: "Contents/MacOS", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: programs, withIntermediateDirectories: true)
+            try FileManager.default.copyItem(at: URL(filePath: "/bin/cat"), to: programs.appending(path: name))
+            let info: [String: Any] = ["CFBundleIdentifier": "org.example.\(name.lowercased())", "CFBundleExecutable": name]
+            try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+                .write(to: app.appending(path: "Contents/Info.plist"))
+            let signing = try Process.run(
+                URL(filePath: "/usr/bin/codesign"), arguments: ["--force", "--sign", "-", app.path(percentEncoded: false)]
+            )
+            signing.waitUntilExit()
+            try #require(signing.terminationStatus == 0)
+        }
+        try #require(CodeSignature.sealHolds(at: bundle))
+        let tool = helper.appending(path: "Contents/MacOS/Tool")
+
+        try #require(try changeTheHeader(of: tool) { _ in true } > 0)
+        #expect(!CodeSignature.sealHolds(at: bundle), "a program changed inside the app passes for the one its maker signed")
+        _ = try changeTheHeader(of: tool) { _ in true }
+        try #require(CodeSignature.sealHolds(at: bundle))
+
+        let others = try changeTheHeader(of: bundle.appending(path: "Contents/MacOS/Maker")) { $0 != Self.thisMacsCPU }
+        try #require(others > 0, "/bin/cat has no slice for another processor")
+        #expect(!CodeSignature.sealHolds(at: bundle), "a slice this Mac doesn't run passes changed")
+    }
+
+    #if arch(arm64)
+    private static let thisMacsCPU: UInt32 = 0x0100_000C
+    #else
+    private static let thisMacsCPU: UInt32 = 0x0100_0007
+    #endif
+
+    /// Flips a byte of the unused `reserved` field in the header of each slice of the program at `file` whose CPU type
+    /// `isChanged` takes, so the slice's first page no longer matches its hash, and returns how many it changed.
+    private func changeTheHeader(of file: URL, slices isChanged: (UInt32) -> Bool) throws -> Int {
+        var data = try Data(contentsOf: file)
+        func number(at offset: Int, bigEndian: Bool) -> UInt32 {
+            let bytes = Array(data[offset..<offset + 4])
+            return (bigEndian ? bytes : bytes.reversed()).reduce(0) { $0 << 8 | UInt32($1) }
+        }
+        let slices: [(cpu: UInt32, offset: Int)] = number(at: 0, bigEndian: true) == 0xCAFE_BABE
+            ? (0..<Int(number(at: 4, bigEndian: true))).map {
+                (number(at: 8 + 20 * $0, bigEndian: true), Int(number(at: 16 + 20 * $0, bigEndian: true)))
+            }
+            : [(number(at: 4, bigEndian: false), 0)]
+        let changed = slices.filter { isChanged($0.cpu) }
+        for slice in changed { data[slice.offset + 28] ^= 0xFF }
+        try data.write(to: file)
+        return changed.count
+    }
+
+    @Test func knowsSymantecEndpointProtectionByTheTeamItsSignatureNames() {
+        let symantec = agent("com.symantec.sep.mainapp", team: "9PTGMPNXZ2", at: "/Applications/Symantec Solutions/Symantec Endpoint Protection.app")
+
+        #expect(MakersUninstaller.of(symantec)?.step == .inTheApp(symantec.url))
+        #expect(MakersUninstaller.of(agent("com.symantec.sep.mainapp", team: "ABCDE12345")) == nil)
+    }
+
+    @Test func knowsAnUninstallerItsMakerDocumentsOpeningToRemoveAProduct() {
+        let path = "/Applications/Chrome Remote Desktop Host Uninstaller.app"
+        let uninstaller = agent("com.google.chromeremotedesktop.me2me-host-uninstaller", team: "EQHXZ8M8AV", at: path)
+
+        let found = MakersUninstaller.of(uninstaller)
+        #expect(found?.maker == "Google")
+        #expect(found?.removes == "Chrome Remote Desktop Host")
+        #expect(found?.step == .uninstaller(URL(filePath: path, directoryHint: .isDirectory)))
+        #expect(MakersUninstaller.of(agent("com.google.chromeremotedesktop.me2me-host-uninstaller", team: "ABCDE12345")) == nil)
+        #expect(MakersUninstaller.of(agent("com.google.chromeremotedesktop.me2me-host", team: "EQHXZ8M8AV")) == nil)
+        #expect(MakersUninstaller.of(agent("com.google.Chrome", team: "EQHXZ8M8AV")) == nil)
+    }
+
+    /// An identifier is what a bundle says of itself: alone, it would let any app keep Peel away. The team comes
+    /// from the checked signature, and a maker's other apps share it.
+    @Test func neitherTheIdentifierNorTheTeamIsEnoughAlone() {
+        #expect(MakersUninstaller.of(agent("com.paloaltonetworks.GlobalProtect.client", team: nil)) == nil)
+        #expect(MakersUninstaller.of(agent("com.paloaltonetworks.GlobalProtect.client", team: "ABCDE12345")) == nil)
+        #expect(MakersUninstaller.of(agent("com.microsoft.Word", team: "UBF8T346G9")) == nil)
+        #expect(MakersUninstaller.of(agent("com.microsoft.wdavx", team: "UBF8T346G9")) == nil)
+        #expect(MakersUninstaller.of(agent("com.cisco.webexmeetingsapp", team: "DE8Y96K9QP")) == nil)
+    }
+}

@@ -1,0 +1,252 @@
+public import Foundation
+import PeelPrivileged
+
+public struct BackgroundItem: Sendable, Hashable, Identifiable {
+    public enum Kind: String, Sendable, Hashable {
+        case agent
+        case daemon
+    }
+
+    public enum Source: Sendable, Hashable {
+        case userLibrary
+        case systemLibrary
+        /// Registered or submitted by an app, and known only while it is loaded.
+        case app
+        /// Loaded from a file outside the folders launchd reads by itself, and known only while it is loaded: launchd
+        /// forgets it at the next logout or restart.
+        case otherFile
+    }
+
+    public enum State: Sendable, Hashable {
+        case running(pid: Int32)
+        case loaded
+        case notLoaded
+        case unknown
+    }
+
+    /// Why the state is `unknown`.
+    public enum StateNotKnown: Sendable, Hashable {
+        /// `launchctl` gave no list of the jobs loaded in the job's domain that Peel could read.
+        case jobsNotListed
+        /// `launchctl` gave no list of the jobs turned off in the job's domain that Peel could read.
+        case disabledNotListed
+        /// Another file declares the same job, and launchd didn't say which of the two it loaded.
+        case whichFileNotSaid
+    }
+
+    public let label: String
+    public let kind: Kind
+    public internal(set) var stateNotKnown: StateNotKnown?
+    public internal(set) var source: Source
+    public let plistURL: URL?
+    public let program: String?
+    /// Whether launchd starts the job as it loads it, and again after it exits; nil when nothing Peel can read says.
+    public let runsAtLoad: Bool?
+    public let keepsAlive: Bool?
+    public let ownerBundleIdentifier: String?
+    public let ownerName: String?
+    /// Where the app that owns the job is, or nil when no app does or it is gone.
+    public let ownerURL: URL?
+    /// True when no installed app claims the job and its program is gone from disk, or it names none of its own.
+    /// The full rule is `BackgroundItemOwnership.isOrphan(label:program:owner:)`.
+    public let isOrphan: Bool
+    public internal(set) var state: State
+    public let isDisabled: Bool
+    /// False when only a name points to the owner (`BackgroundItemOwnership.Owner.isConfirmed`).
+    public var isOwnerConfirmed = true
+    /// True for a file launchd can't load: not a property list, or one without a `Label`.
+    public var isUnreadable = false
+    /// True for a file macOS lets only its owner read, as launchd does as root: what Peel knows of its job comes from
+    /// launchd, and until launchd says which job it loaded from the file, the row is named by the file.
+    public var isClosedToPeel = false
+    /// True for a row named by its file, since Peel couldn't read the label inside: nothing but moving it is offered.
+    public var isNamedByItsFile = false
+    /// What in the job's command is worth a second look, if anything.
+    public var unusualCommand: UnusualCommand?
+    /// True for an agent that loads in the Background session, which launchd keeps in the user domain rather than
+    /// the GUI one: started, stopped and asked about there.
+    public var loadsInTheBackgroundSession = false
+    /// True while an app's job runs from inside a Trash: its app was moved there, and macOS starts it from there at
+    /// each login until the Trash is emptied.
+    public var runsFromTheTrash = false
+    /// True for a job launchd runs for a system extension, whose program sits in `/Library/SystemExtensions`: macOS
+    /// runs it, and only System Settings changes it.
+    public var isSystemExtension = false
+    /// True for a job ServiceManagement manages: the person turns it on and off in System Settings > General > Login
+    /// Items & Extensions, so Peel never disables it.
+    public var isManagedByServiceManagement = false
+    /// False for an app's job that, once disabled, would leave the list at the next restart: launchd keeps only its
+    /// label, which neither starts with its app's identifier nor is declared in its app's bundle.
+    public var staysListedWhenDisabled = true
+    /// True for a job launchd runs from a file no longer on disk, removed while it was loaded: launchd forgets it at
+    /// the next logout or restart, and nothing loads it again.
+    public var isFileGone = false
+    /// True for a job of an app the person excluded in Settings, which Peel lists and never acts on.
+    public var isExcluded = false
+    /// True while the exclusions aren't known: any job may be an excluded app's, so none is acted on.
+    public var exclusionsAreNotKnown = false
+    /// True for a job its app gave launchd itself, as an update's installer is given, rather than registered with
+    /// ServiceManagement: System Settings doesn't list it, and launchd forgets it at the next logout or restart.
+    public var isSubmittedByItsApp = false
+    public var anotherFileIsLoaded = false
+    public internal(set) var loginItemsStatus: LoginItemsStatus?
+
+    public var isOwnerInstalled: Bool { ownerURL != nil }
+
+    public var isKeptOffBySystemSettings: Bool { loginItemsStatus.map { !$0.letsItRun } == true }
+
+    /// Whether Start runs the job now, whatever its schedule (`launchctl kickstart`), rather than loading it from its
+    /// file, after which macOS runs it as the file says.
+    public var startsAtOnce: Bool { state != .notLoaded || plistURL == nil }
+
+    /// Whether `exclusions` keep the job's app, by its identifier or its place, as they keep any app.
+    func isOfAnApp(excludedBy exclusions: Exclusions) -> Bool {
+        ownerBundleIdentifier.map(exclusions.excludes(bundleIdentifier:)) == true
+            || ownerURL.map(exclusions.excludes(_:)) == true
+    }
+
+    /// True for a job an app submitted that is still loaded after the app went, its program gone or not named by
+    /// launchctl: the app that would unregister it is gone, so only taking it out of launchd removes it.
+    public var isLeftByAGoneApp: Bool { source == .app && !isOwnerInstalled && (isOrphan || program == nil) }
+
+    /// Includes the file's path, because two files can declare one label (a per-user copy beside the
+    /// system-wide one), and each file needs a row of its own.
+    public var id: String { "\(kind.rawValue)/\(label)/\(plistURL?.path(percentEncoded: false) ?? "")" }
+
+    /// Starting, stopping, enabling, and disabling a daemon goes through the privileged helper.
+    public var requiresPrivileges: Bool { kind == .daemon }
+
+    /// True for Peel's own privileged helper. The helper refuses to act on its own label, so this job is
+    /// installed and uninstalled only from Peel's Settings.
+    public var isPeelsHelper: Bool { kind == .daemon && label == HelperIdentity.helperIdentifier }
+
+    /// True when the label starts with `com.apple.`.
+    public var declaresAnAppleLabel: Bool { label.hasPrefix("com.apple.") }
+
+    /// True when the label is Apple's, or one macOS gives a job of its own. macOS keeps its jobs under
+    /// `/System/Library` and `/Library/Apple/System/Library`, never where the scan reads, so a listed job with
+    /// such a label did not come with macOS. Peel shows it and never acts on it.
+    public var usesALabelOfMacOS: Bool {
+        declaresAnAppleLabel || SystemDaemons.belongs(label, to: SystemDaemons.shipped)
+            || SystemDaemons.belongs(label, to: SystemAgents.shipped)
+    }
+
+    /// True when Peel may start, stop, enable and disable the job: never under a label of macOS, for a system
+    /// extension or for an excluded app, an agent only under a label `launchctl` reads whole, and a daemon only under a
+    /// label the helper takes, which also leaves out the helper itself.
+    public var canBeControlled: Bool {
+        !usesALabelOfMacOS && !isSystemExtension && !isExcluded && !exclusionsAreNotKnown
+            && (requiresPrivileges ? PrivilegedPathPolicy.allowsDaemon(label) : isReadWholeByLaunchctl)
+    }
+
+    /// `launchctl` reads a service's name up to the next slash, so a label with one reaches another job.
+    private var isReadWholeByLaunchctl: Bool {
+        !label.utf8.contains { $0 == 0x2F || $0 < 0x20 || $0 == 0x7F }
+    }
+
+    public enum UnusableLabel: Sendable, Hashable {
+        case holdsASlash
+        case holdsAControlCharacter
+        /// The helper takes only ASCII letters, digits, `.`, `-`, `_`, `@`, and `+`
+        /// (`PrivilegedPathPolicy.isValidLabel`).
+        case notTakenByTheHelper
+    }
+
+    /// Why Peel never passes this name to `launchctl`: the helper refuses it for a daemon, or `launchctl` would misread
+    /// it for an agent. Apple's names have notes of their own.
+    public var unusableLabel: UnusableLabel? {
+        guard !label.hasPrefix("com.apple.") else { return nil }
+        if requiresPrivileges { return PrivilegedPathPolicy.isValidLabel(label) ? nil : .notTakenByTheHelper }
+        if label.utf8.contains(0x2F) { return .holdsASlash }
+        return isReadWholeByLaunchctl ? nil : .holdsAControlCharacter
+    }
+
+    /// True for a job Peel can only take out of launchd, which nothing loads again by itself: one loaded from a file
+    /// elsewhere, still there or gone. Disabled, it would leave the list with nothing to enable it from.
+    public var canOnlyBeStopped: Bool { canBeControlled && source == .otherFile }
+
+    /// True when Peel may disable the job: not one whose switch is System Settings', and one whose row Enable stays on.
+    public var mayBeDisabled: Bool {
+        canBeControlled && !isManagedByServiceManagement && !isKeptOffBySystemSettings && staysListedWhenDisabled
+    }
+
+    public var removalRequiresPrivileges: Bool { source == .systemLibrary }
+
+    /// True for a job Peel sees only while it is loaded, so once stopped it would leave the list and could not be
+    /// started again from here.
+    public var isSeenOnlyWhileLoaded: Bool { source == .app || source == .otherFile }
+
+    public var canMoveToTrash: Bool {
+        !isSeenOnlyWhileLoaded && plistURL != nil && !usesALabelOfMacOS && !isExcluded
+    }
+
+    /// True for an agent whose file Peel may edit: one in this account's own Library, which runs as the person, that
+    /// Peel may control and has read whole, and that neither ServiceManagement nor another file of its name speaks for.
+    public var canBeEdited: Bool {
+        kind == .agent && source == .userLibrary && plistURL != nil && canBeControlled && !isNamedByItsFile
+            && !isUnreadable && !isClosedToPeel && !isManagedByServiceManagement && !anotherFileIsLoaded && !isFileGone
+    }
+
+    public var isRunning: Bool {
+        if case .running = state { true } else { false }
+    }
+
+    /// Start, Stop, Enable, and Disable, which a job Peel may not control, a job whose state Peel could not read, a
+    /// file named by itself since its label couldn't be read, and a file whose label launchd runs from another file
+    /// don't have. A job loaded from a file elsewhere has only Stop. A job Peel may not disable has only Enable, while
+    /// launchd keeps it disabled.
+    public var offersControls: Bool {
+        guard canBeControlled, state != .unknown, !isNamedByItsFile, !anotherFileIsLoaded else { return false }
+        if canOnlyBeStopped || isRunning { return true }
+        if isLeftByAGoneApp { return true }
+        if isKeptOffBySystemSettings { return state == .loaded || isDisabled }
+        return !isSeenOnlyWhileLoaded || isDisabled || mayBeDisabled
+    }
+
+    /// A button that changes whether the job runs, named for what it does to the state the page shows.
+    public enum Control: Sendable, Hashable {
+        /// Stops the job and takes it out of launchd.
+        case stop
+        /// Stops the running job and starts it again at once.
+        case restart
+        /// Starts the job now, whatever its schedule says.
+        case runNow
+        /// Takes the job, loaded and waiting for its time, out of launchd.
+        case unload
+        /// Loads the job from its file, after which macOS runs it as the file says.
+        case load
+        /// Stop under the name the page gives it for a job its gone app left loaded.
+        case remove
+
+        var startsTheJob: Bool { self == .restart || self == .runNow || self == .load }
+    }
+
+    /// The buttons that change whether the job runs, in the order shown. A job Peel sees only while it is loaded has
+    /// Stop only while it runs, and a disabled job that isn't loaded has none, since launchd refuses to load it. A job
+    /// System Settings keeps from running is never started: that would go over the person's choice there.
+    public var controls: [Control] {
+        guard offersControls else { return [] }
+        if canOnlyBeStopped { return [.stop] }
+        if isLeftByAGoneApp { return [.remove] }
+        if isSeenOnlyWhileLoaded { return isRunning ? [.stop] : [] }
+        let controls: [Control] = switch state {
+        case .running: [.stop, .restart]
+        case .loaded: [.runNow, .unload]
+        case .notLoaded: isDisabled ? [] : [.load]
+        case .unknown: []
+        }
+        return isKeptOffBySystemSettings ? controls.filter { !$0.startsTheJob } : controls
+    }
+
+    /// Enable and Disable, which a job Peel can only stop, and one its gone app left, don't have.
+    public var offersEnableOrDisable: Bool {
+        offersControls && !canOnlyBeStopped && !isLeftByAGoneApp && (isDisabled || mayBeDisabled)
+    }
+
+    /// Whether the helper would let Peel do more with the job than it can without it: a control the page offers, or the
+    /// move of its file.
+    public var waitsForTheHelper: Bool {
+        guard !isPeelsHelper, !isSystemExtension else { return false }
+        return requiresPrivileges && offersControls || removalRequiresPrivileges && canMoveToTrash
+    }
+}

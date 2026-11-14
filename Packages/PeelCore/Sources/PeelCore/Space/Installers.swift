@@ -1,0 +1,856 @@
+import AppKit
+public import Foundation
+internal import PeelPrivileged
+
+/// A large installer or backup that is easy to forget: an app's disk image, package, or archive, a macOS
+/// installer, device firmware, a backup of an iPhone or iPad, a download a browser never finished, or an update an
+/// app downloaded.
+public struct InstallerItem: Sendable, Hashable, Identifiable {
+    public enum Kind: String, Sendable, Hashable, CaseIterable {
+        case appInstaller
+        case macOSInstaller
+        case firmware
+        case deviceBackup
+        /// A download a browser never finished, still under the name it writes to until the end.
+        case incompleteDownload
+        /// An update an app downloaded with Sparkle, Squirrel, or electron-updater, kept until it is installed.
+        case updateDownload
+    }
+
+    public let url: URL
+    public let kind: Kind
+    public let name: String
+    /// Nil when measuring ran out of time or was refused. Unknown is not the same as empty.
+    public let size: Int64?
+    public let date: Date?
+    /// The name of the installed app that this installer is for, when there is one.
+    public let installedApp: String?
+    /// True for a device backup: Peel shows it, but the app that made it is the one that should remove it.
+    public let isReadOnly: Bool
+    public let notes: [Note]
+    /// True when moving the item needs administrator access, so the move goes through the helper. A macOS
+    /// installer that Software Update downloaded is one: it belongs to root. One the helper would refuse is held
+    /// back as `beyondTheHelper`.
+    public var requiresPrivileges = false
+    /// Why the item is left for the person to choose, from what measuring it saw: it was not measured or not read,
+    /// or a wallet or a repository is inside.
+    public var heldBack: HoldBack?
+    /// What keeps it in step with the other devices, when it is held back as `inTheCloud`.
+    public var syncedBy: SyncKeeper? = nil
+    /// The programs that hold it open, when it is held back as `openInAProgram`.
+    public var openBy: [String] = []
+    /// The app a downloaded update is for, which has to quit before the update moves from under it.
+    public var updatesApp: UpdatedApp? = nil
+
+    public struct UpdatedApp: Sendable, Hashable {
+        public let identifier: String
+        public let name: String
+
+        public init(identifier: String, name: String) {
+            self.identifier = identifier
+            self.name = name
+        }
+    }
+
+    public var id: URL { url }
+
+    /// False for a device backup and for what Peel never moves, whatever the helper can do.
+    public var canBeMoved: Bool { !isReadOnly && heldBack?.cannotBeMoved != true }
+
+    public func isLocked(canUseHelper: Bool) -> Bool {
+        requiresPrivileges && heldBack?.cannotBeMoved != true && !canUseHelper
+    }
+
+    /// A fact shown beside the item's name. The app puts it into words.
+    public enum Note: Sendable, Hashable {
+        /// A macOS installer's version, as its bundle gives it.
+        case version(String)
+        /// A name a backup gives for its device or system, such as "iPhone" or "iOS 17.2", shown as is.
+        case name(String)
+        case encrypted
+        /// The installed app that downloaded an update, which it keeps until it installs it.
+        case downloadedBy(String)
+        /// A restore image in VirtualBuddy's library that none of its machines was installed from.
+        case unusedByAnyVirtualMachine
+    }
+}
+
+extension InstallerItem {
+    /// Whether `query` matches what the row shows: the name, the app it is for, and its notes, such as the app that
+    /// downloaded an update, whose own name is the updater's.
+    public func matches(_ query: String) -> Bool {
+        guard !query.isEmpty else { return true }
+        let shown = [name, installedApp].compactMap(\.self) + notes.compactMap { note -> String? in
+            switch note {
+            case .version(let text), .name(let text), .downloadedBy(let text): text
+            case .encrypted, .unusedByAnyVirtualMachine: nil
+            }
+        }
+        return shown.contains { SearchText.matches($0, query) }
+    }
+}
+
+extension Collection where Element == InstallerItem {
+    /// What moving the items could free now, as an orphan group counts it.
+    public func movable(canUseHelper: Bool) -> SizeTotal {
+        let selectable = Set(selectableRows(canUseHelper: canUseHelper).selectable)
+        return SizeTotal(filter { selectable.contains($0.url) }.map(\.size))
+    }
+
+    /// What a kind's row and page show: what moving could free, or what is there for a device backup, which Peel only
+    /// shows.
+    public func shownTotal(of kind: InstallerItem.Kind, canUseHelper: Bool) -> SizeTotal {
+        kind == .deviceBackup ? SizeTotal(map(\.size)) : movable(canUseHelper: canUseHelper)
+    }
+
+    public func selectableRows(canUseHelper: Bool) -> SelectableRows<URL> {
+        let selectable = filter { $0.canBeMoved && !$0.isLocked(canUseHelper: canUseHelper) }
+        return SelectableRows(
+            rows: map(\.url),
+            selectable: selectable.map(\.url),
+            recommended: selectable.filter { $0.heldBack == nil }.map(\.url)
+        )
+    }
+}
+
+public struct InstallerScan: Sendable {
+    public let items: [InstallerItem]
+    /// The folders Peel looks in that macOS would not let it read, the device backups' among them, so what is in
+    /// them is not known.
+    public let unreadableLocations: [URL]
+
+    public var needsFullDiskAccess: Bool { !unreadableLocations.isEmpty }
+
+    public func items(in kind: InstallerItem.Kind) -> [InstallerItem] {
+        items.filter { $0.kind == kind }
+    }
+
+    /// The scan without what is no longer on the disk.
+    public var withoutWhatLeft: InstallerScan {
+        InstallerScan(items: items.filter { !$0.url.isMissing }, unreadableLocations: unreadableLocations)
+    }
+}
+
+public enum Installers {
+    /// Anything smaller than this isn't worth a row in a list about big downloads.
+    public static let minimumSize: Int64 = 20 * 1_000_000
+    /// The Storage pane of System Settings (General > Storage), where iOS Files deletes a device backup without the
+    /// device.
+    public static let storageSettingsURL = URL(string: "x-apple.systempreferences:com.apple.settings.Storage")!
+
+    /// `xip` is Apple's own archive format, which Xcode ships in. `zip` is not listed, since a zip file can hold
+    /// anything: `installerInside(zip:)` decides about each one.
+    static let installerExtensions: Set<String> = ["dmg", "iso", "pkg", "mpkg", "xip"]
+    static let firmwareExtensions: Set<String> = ["ipsw"]
+    /// What a browser adds to a download's name until it ends: Chromium's `.crdownload`
+    /// (`chrome/browser/download/download_target_determiner.cc`), Firefox's `.part`
+    /// (`netwerk/base/nsIBackgroundFileSaver.idl`), and Safari's `.download`, a package its Info.plist declares as the
+    /// "Safari download" document type, with the file being written inside.
+    static let incompleteDownloadExtensions: Set<String> = ["crdownload", "part", "download"]
+    /// A download that changed within this time may still be going, whatever holds it open.
+    static let stillDownloading: TimeInterval = 24 * 60 * 60
+    /// An installer that arrived or changed within this time may be the one the person is installing from now.
+    static let justArrived: TimeInterval = 60 * 60
+
+    @concurrent
+    public static func scan(
+        installedApps: [InstalledApp],
+        home: URL = .homeDirectory,
+        root: URL = URL(filePath: "/", directoryHint: .isDirectory),
+        exclusions: Exclusions = .none,
+        minimumSize: Int64 = Installers.minimumSize
+    ) async -> InstallerScan {
+        let attached = await AttachedDiskImages.paths() ?? []
+        return await scan(
+            installedApps: installedApps,
+            home: home,
+            root: root,
+            exclusions: exclusions,
+            minimumSize: minimumSize,
+            measure: LeftoverScanner.walk,
+            openFiles: OpenFiles(attachedImages: attached)
+        )
+    }
+
+    @concurrent
+    static func scan(
+        installedApps: [InstalledApp],
+        home: URL,
+        root: URL,
+        exclusions: Exclusions,
+        minimumSize: Int64,
+        measure: LeftoverScanner.Measure,
+        canList: (URL) -> AccessState = FullDiskAccess.canList,
+        syncKeeper: (URL) -> SyncKeeper? = SyncedFolders().keeper(of:),
+        openFiles: OpenFiles = OpenFiles()
+    ) async -> InstallerScan {
+        var items: [InstallerItem] = []
+        var unreadable: [URL] = []
+        let places = ["Downloads", "Desktop", "Documents", "Public"].map {
+            Folder(url: home.appending(path: $0, directoryHint: .isDirectory), isSharedWithEveryone: false)
+        } + [Folder(url: root.appending(path: "Users/Shared", directoryHint: .isDirectory), isSharedWithEveryone: true)]
+        let origins = DownloadOrigins.inHome(home).reader()
+        var folders: [Folder] = []
+        var listed: Set<String> = []
+        // A scan its page left asks nothing more: reading a folder macOS guards puts up macOS's question again.
+        for place in places {
+            guard !Task.isCancelled else { break }
+            // Listing a link as a URL answers "Not a directory", so a folder moved elsewhere is read where it leads,
+            // and once if that is inside another place.
+            let url = place.url.isSymbolicLink ? PathPattern.canonical(place.url) : place.url
+            if canList(url) == .missing { unreadable.append(place.url) }
+            for folder in [url] + subfolders(of: url)
+            where listed.insert(PathPattern.comparablePath(of: PathPattern.canonical(folder))).inserted {
+                folders.append(Folder(url: folder, isSharedWithEveryone: place.isSharedWithEveryone))
+            }
+        }
+
+        for folder in folders where !Task.isCancelled {
+            for url in files(in: folder.url) {
+                // The extension is checked before measuring, since measuring a folder walks all of it.
+                let suffix = url.pathExtension.lowercased()
+                let isInstaller = installerExtensions.contains(suffix)
+                let isArchive = suffix == "zip"
+                let isIncomplete = incompleteDownloadExtensions.contains(suffix)
+                guard isInstaller || isArchive || isIncomplete || firmwareExtensions.contains(suffix),
+                      !exclusions.excludes(url), !exclusions.holds(url), !Task.isCancelled
+                else { continue }
+                let (size, seen, newestInside) = await measured(url, by: measure)
+                guard isWorthARow(size, minimumSize) else { continue }
+                let heldBack = heldBack(
+                    url, seen: seen, in: folder, syncKeeper: syncKeeper, openFiles: openFiles
+                )
+                if isIncomplete {
+                    items.append(
+                        incompleteDownload(at: url, size: size, heldBack: heldBack, newestInside: newestInside)
+                    )
+                } else if isArchive {
+                    guard let inside = installerInside(zip: url) else { continue }
+                    let installer = appInstaller(
+                        at: url, size: size, heldBack: heldBack, installedApps: installedApps, named: inside
+                    )
+                    items.append(unlessItMayStillBeNeeded(installer, origins: origins))
+                } else if isInstaller {
+                    let installer = appInstaller(at: url, size: size, heldBack: heldBack, installedApps: installedApps)
+                    items.append(unlessItMayStillBeNeeded(installer, origins: origins))
+                } else {
+                    items.append(firmware(
+                        at: url, size: size,
+                        heldBack: heldBack ?? (arrivedRecently(url, newestInside: nil) ? .arrivedRecently : nil)
+                    ))
+                }
+            }
+        }
+
+        guard !Task.isCancelled else { return InstallerScan(items: items, unreadableLocations: unreadable) }
+        // The folders Peel reads apps from come first, and each folder is looked in once.
+        let shared = root.appending(path: "Users/Shared", directoryHint: .isDirectory).path(percentEncoded: false)
+        let appFolders = AppCatalog.directories(in: SearchEnvironment(homeDirectory: home, rootDirectory: root)).map {
+            let path = $0.path(percentEncoded: false)
+            return Folder(url: $0, isSharedWithEveryone: PathComponents.isPath(path, atOrInside: shared))
+        }
+        var lookedIn: Set<String> = []
+        items += await macOSInstallers(
+            in: (appFolders + folders).filter { lookedIn.insert(PathPattern.comparablePath(of: $0.url)).inserted },
+            exclusions: exclusions,
+            minimumSize: minimumSize,
+            measure: measure,
+            syncKeeper: syncKeeper,
+            openFiles: openFiles
+        )
+        items += await firmwareFiles(
+            home: home,
+            exclusions: exclusions,
+            minimumSize: minimumSize,
+            measure: measure,
+            syncKeeper: syncKeeper,
+            openFiles: openFiles
+        )
+        items += await updateDownloads(
+            home: home,
+            installedApps: installedApps,
+            exclusions: exclusions,
+            minimumSize: minimumSize,
+            measure: measure,
+            syncKeeper: syncKeeper,
+            openFiles: openFiles
+        )
+        items += await installersKeptByApps(
+            home: home,
+            installedApps: installedApps,
+            exclusions: exclusions,
+            minimumSize: minimumSize,
+            measure: measure,
+            syncKeeper: syncKeeper,
+            openFiles: openFiles
+        )
+
+        let backupFolder = home.appending(path: "Library/Application Support/MobileSync/Backup", directoryHint: .isDirectory)
+        let readable = canList(backupFolder)
+        if readable == .granted {
+            items += await backups(in: backupFolder, measure: measure)
+        }
+
+        if readable == .missing { unreadable.append(backupFolder) }
+        let reach = HelperReach(environment: SearchEnvironment(homeDirectory: home, rootDirectory: root))
+        items = items.map { item in
+            var item = item
+            if item.heldBack == .inTheCloud { item.syncedBy = syncKeeper(item.url) }
+            if item.heldBack == .openInAProgram { item.openBy = openFiles.holders(of: item.url) }
+            guard item.requiresPrivileges, item.heldBack?.cannotBeMoved != true, reach.isBeyond(item.url) else {
+                return item
+            }
+            item.heldBack = .beyondTheHelper
+            return item
+        }
+        return InstallerScan(
+            // An unknown size sorts first: an item that ran out of time is most likely one of the biggest.
+            items: items.sorted { ($0.size ?? .max) > ($1.size ?? .max) },
+            unreadableLocations: unreadable
+        )
+    }
+
+    /// A folder the scan looks in, and whether it belongs to every account on this Mac rather than to this one.
+    struct Folder {
+        let url: URL
+        let isSharedWithEveryone: Bool
+    }
+
+    /// The folders directly inside `place` that the scan looks in too, where a browser or a chat app keeps its
+    /// downloads. Never a link, a package, a folder whose contents are only in the cloud (listing it downloads
+    /// them), a repository, or a project: what is in those is work, or belongs to them.
+    private static func subfolders(of place: URL) -> [URL] {
+        files(in: place).filter { url in
+            guard url.isRealFolder, !FileSize.isDataless(url),
+                  (try? url.resourceValues(forKeys: [.isPackageKey]).isPackage) != true
+            else { return false }
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: url.path(percentEncoded: false))) ?? []
+            return !names.contains { FileSize.repositoryMarkers.contains($0) || ProjectArtifacts.isMarker($0) }
+        }
+    }
+
+    /// Why an item is left for the person to choose: it syncs to other devices, measuring it saw a reason, a program
+    /// has it open, or it belongs to every account on this Mac.
+    private static func heldBack(
+        _ url: URL, seen: HoldBack?, in folder: Folder, syncKeeper: (URL) -> SyncKeeper?, openFiles: OpenFiles
+    ) -> HoldBack? {
+        if syncKeeper(url) != nil { return .inTheCloud }
+        if let seen { return seen }
+        if openFiles.isAttachedDiskImage(url) { return .attachedDiskImage }
+        if !openFiles.holders(of: url).isEmpty { return .openInAProgram }
+        return folder.isSharedWithEveryone ? .sharedWithEveryone : nil
+    }
+
+    /// Holds back an app installer the person may still need: an encrypted disk image holds what they put in it, one
+    /// that is no installed app's and says nowhere where it was downloaded from may be the only copy, and one that
+    /// arrived or changed within `justArrived` may be the one they are installing from.
+    private static func unlessItMayStillBeNeeded(
+        _ installer: InstallerItem, origins: DownloadOrigins.Reader
+    ) -> InstallerItem {
+        guard installer.heldBack == nil else { return installer }
+        var installer = installer
+        if isEncryptedImage(installer.url) {
+            installer.heldBack = .encryptedImage
+        } else if installer.installedApp == nil, origins.address(of: installer.url) == nil {
+            installer.heldBack = .mayBeTheOnlyCopy
+        } else if arrivedRecently(installer.url, newestInside: nil) {
+            installer.heldBack = .arrivedRecently
+        }
+        return installer
+    }
+
+    /// Whether `url` arrived in its folder or changed within `justArrived`, or when that can't be told. A package
+    /// changes when what is inside it does (`newestInside`).
+    private static func arrivedRecently(_ url: URL, newestInside: Date?) -> Bool {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .addedToDirectoryDateKey])
+        let latest = [values?.contentModificationDate, values?.addedToDirectoryDate, newestInside]
+            .compactMap(\.self).max()
+        return latest.map { Date.now.timeIntervalSince($0) < justArrived } ?? true
+    }
+
+    /// Whether `url` is an encrypted disk image: one that `hdiutil create -encryption` makes begins with `encrcdsa`.
+    static func isEncryptedImage(_ url: URL) -> Bool {
+        url.pathExtension.lowercased() == "dmg" && BoundedRead.prefix(of: url, count: 8) == Data("encrcdsa".utf8)
+    }
+
+    /// What measuring `url` gave: its size, why what it saw leaves the item for the person to choose, and the newest
+    /// write it saw.
+    private static func measured(
+        _ url: URL,
+        by measure: LeftoverScanner.Measure
+    ) async -> (size: Int64?, heldBack: HoldBack?, newestChange: Date?) {
+        let contents = await measure(url)
+        return (
+            contents.flatMap { $0.couldNotBeRead ? nil : $0.size }, HoldBack.seen(in: contents),
+            contents?.newestChange
+        )
+    }
+
+    /// True when `size` reaches `minimumSize`. An unknown size could be any size, so it is kept.
+    private static func isWorthARow(_ size: Int64?, _ minimumSize: Int64) -> Bool {
+        size.map { $0 >= minimumSize } ?? true
+    }
+
+    /// Makes the item for an app installer. For an archive, `name` is what is inside it, which is matched
+    /// instead of the file name: a download can be called anything, such as `download (3).zip`.
+    static func appInstaller(
+        at url: URL,
+        size: Int64?,
+        heldBack: HoldBack?,
+        installedApps: [InstalledApp],
+        named name: String? = nil
+    ) -> InstallerItem {
+        let match = installedApp(named: name ?? url.deletingPathExtension().lastPathComponent, in: installedApps)
+        return InstallerItem(
+            url: url,
+            kind: .appInstaller,
+            name: url.lastPathComponent,
+            size: size,
+            date: creationDate(of: url),
+            installedApp: match?.name,
+            isReadOnly: false,
+            notes: [],
+            requiresPrivileges: FileAccess.requiresPrivilegesToRemove(url),
+            heldBack: heldBack
+        )
+    }
+
+    /// Words that can follow the app's name in an installer's file name, as `words(in:)` gives them joined: an
+    /// architecture, a platform, or a word such as "setup" or "final".
+    private static let afterTheName: Set<String> = ["arm64", "x64", "x8664", "amd64", "intel", "universal", "mac", "macos", "osx", "darwin", "installer", "setup", "full", "final"]
+
+    /// Returns the installed app that the installer at `url` is for. The app's name must be the whole name in
+    /// the file name, because the user may delete their only copy of an installer marked "already installed":
+    /// `Xcodes-1.4.dmg` is not Xcode's, and `Archiver-4.dmg` is not Arc's.
+    static func installedApp(for url: URL, in installedApps: [InstalledApp]) -> InstalledApp? {
+        installedApp(named: url.deletingPathExtension().lastPathComponent, in: installedApps)
+    }
+
+    private static func installedApp(named stem: String, in installedApps: [InstalledApp]) -> InstalledApp? {
+        let normalized = Naming.normalized(stem)
+        guard Naming.isLongEnough(normalized) else { return nil }
+        let matches = installedApps.compactMap { app -> (app: InstalledApp, length: Int)? in
+            let lengths = app.names
+                .filter { Naming.isSignificant($0) && names(stem, and: $0) }
+                .map { Naming.normalized($0).count }
+            return lengths.max().map { (app, $0) }
+        }
+        return matches.max { $0.length < $1.length }?.app
+    }
+
+    /// Returns the name of the app or installer a zip archive holds, when that is all it holds: every entry is one
+    /// `<Name>.app` at the top, or one disk image or package, or sits inside it, apart from the metadata `ditto`
+    /// writes (`__MACOSX`, `._` files). An archive of documents, or an installer with anything beside it, is not an
+    /// installer.
+    static func installerInside(zip url: URL) -> String? {
+        guard let names = ZipDirectory.names(at: url) else { return nil }
+        var inside: String?
+        for name in names {
+            guard let first = PathComponents.of(name).first else { continue }
+            if first == "__MACOSX" || first.hasPrefix("._") { continue }
+            guard inside == nil || inside == first else { return nil }
+            inside = first
+        }
+        guard let inside, inside.count > 4 else { return nil }
+        let suffix = (inside as NSString).pathExtension.lowercased()
+        let isAnApp = PathComponents.isNamedAsAnApp(inside) && names.contains { name in
+            let parts = PathComponents.of(name)
+            return parts.count > 1 && parts[0] == inside
+        }
+        guard isAnApp || installerExtensions.contains(suffix) else { return nil }
+        return (inside as NSString).deletingPathExtension
+    }
+
+    /// True when the file name `stem` is the app's `name`, alone or followed by a version, an architecture, or a
+    /// word installers add. Any other word after the name makes it another product: `Notion Calendar` is not
+    /// Notion, and `Signal RGB` is not Signal.
+    static func names(_ stem: String, and name: String) -> Bool {
+        let app = Naming.normalized(name)
+        guard Naming.normalized(stem) != app else { return true }
+        let words = words(in: stem)
+        // The app's name covers the first words whole, however they are spelled.
+        guard !words.isEmpty, let count = (1...words.count).first(where: { words.prefix($0).joined() == app }) else {
+            return false
+        }
+        let rest = words.dropFirst(count)
+        guard let first = rest.first else { return true }
+        if first.first?.isNumber == true { return true }
+        if first == "v", rest.dropFirst().first?.first?.isNumber == true { return true }
+        return (1...rest.count).contains { afterTheName.contains(rest.prefix($0).joined()) }
+    }
+
+    /// The words of a file name, lowercased: split at each character that is neither a letter nor a digit, where a
+    /// lowercase letter meets an uppercase one, and where letters meet digits.
+    static func words(in name: String) -> [String] {
+        var words: [String] = []
+        var word = ""
+        var previous: Character?
+        for character in name {
+            guard character.isLetter || character.isNumber else {
+                if !word.isEmpty { words.append(word.lowercased()) }
+                word = ""
+                previous = nil
+                continue
+            }
+            if let previous, previous.isLowercase && character.isUppercase || previous.isNumber != character.isNumber {
+                words.append(word.lowercased())
+                word = ""
+            }
+            word.append(character)
+            previous = character
+        }
+        if !word.isEmpty { words.append(word.lowercased()) }
+        return words
+    }
+
+    static func macOSInstallers(
+        in folders: [Folder],
+        exclusions: Exclusions,
+        minimumSize: Int64,
+        measure: LeftoverScanner.Measure,
+        syncKeeper: (URL) -> SyncKeeper?,
+        openFiles: OpenFiles
+    ) async -> [InstallerItem] {
+        var items: [InstallerItem] = []
+        for folder in folders {
+            for url in files(in: folder.url) where url.isNamedAsAnApp && isMacOSInstaller(url) {
+                guard !Task.isCancelled else { return items }
+                guard !exclusions.excludes(url), !exclusions.holds(url) else { continue }
+                let (size, seen, newest) = await measured(url, by: measure)
+                guard isWorthARow(size, minimumSize) else { continue }
+                let info = AppInspector.infoDictionary(in: url.appending(path: "Contents", directoryHint: .isDirectory))
+                let version = AppInspector.stated(info?["CFBundleShortVersionString"])
+                items.append(InstallerItem(
+                    url: url,
+                    kind: .macOSInstaller,
+                    name: url.deletingPathExtension().lastPathComponent,
+                    size: size,
+                    date: creationDate(of: url),
+                    installedApp: nil,
+                    isReadOnly: false,
+                    notes: version.map { [.version($0)] } ?? [],
+                    requiresPrivileges: FileAccess.requiresPrivilegesToRemove(url),
+                    heldBack: heldBack(
+                        url, seen: seen, in: folder, syncKeeper: syncKeeper, openFiles: openFiles
+                    ) ?? (arrivedRecently(url, newestInside: newest) ? .arrivedRecently : nil)
+                ))
+            }
+        }
+        return items
+    }
+
+    /// Apple names each macOS installer `Install macOS <name>`, and those before macOS Sierra `Install OS X <name>`
+    /// (support.apple.com/101578).
+    private static func isMacOSInstaller(_ url: URL) -> Bool {
+        ["Install macOS", "Install OS X"].contains { url.lastPathComponent.hasPrefix($0) }
+    }
+
+    /// The folders macOS names for its iOS Files in storage (`iOSFilesStorageExtension`).
+    static func firmwareFiles(
+        home: URL,
+        exclusions: Exclusions,
+        minimumSize: Int64,
+        measure: LeftoverScanner.Measure,
+        syncKeeper: (URL) -> SyncKeeper?,
+        openFiles: OpenFiles
+    ) async -> [InstallerItem] {
+        let folders = ["iPhone", "iPad", "iPod", "Apple TV"].map {
+            home.appending(path: "Library/iTunes/\($0) Software Updates", directoryHint: .isDirectory)
+        }
+        var items: [InstallerItem] = []
+        for folder in folders {
+            for url in files(in: folder) where firmwareExtensions.contains(url.pathExtension.lowercased()) {
+                guard !Task.isCancelled else { return items }
+                guard !exclusions.excludes(url), !exclusions.holds(url) else { continue }
+                let (size, seen, _) = await measured(url, by: measure)
+                guard isWorthARow(size, minimumSize) else { continue }
+                let place = Folder(url: folder, isSharedWithEveryone: false)
+                let heldBack = heldBack(url, seen: seen, in: place, syncKeeper: syncKeeper, openFiles: openFiles)
+                items.append(firmware(
+                    at: url, size: size,
+                    heldBack: heldBack ?? (arrivedRecently(url, newestInside: nil) ? .arrivedRecently : nil)
+                ))
+            }
+        }
+        return items
+    }
+
+    /// Sparkle's `<identifier>/org.sparkle-project.Sparkle`, with `.sparkle` after an identifier that ends like a
+    /// bundle (`SPULocalCacheDirectory.m`), Squirrel's `<identifier>.ShipIt` (`SQRLShipItLauncher.m`), and
+    /// electron-updater's folder. A folder Developer lists is left to Developer.
+    static func updateDownloads(
+        home: URL,
+        installedApps: [InstalledApp],
+        exclusions: Exclusions,
+        minimumSize: Int64,
+        measure: LeftoverScanner.Measure,
+        syncKeeper: (URL) -> SyncKeeper?,
+        openFiles: OpenFiles
+    ) async -> [InstallerItem] {
+        let caches = home.appending(path: "Library/Caches", directoryHint: .isDirectory)
+        let developers = Set(DeveloperCaches.definitions.flatMap(\.folders).filter { $0.base == .home }.map {
+            $0.path.lowercased()
+        })
+        let installed = { (identifier: String) in installedApps.first { $0.bundleIdentifier == identifier } }
+        let updaters = Dictionary(
+            installedApps.compactMap { app in app.updaterFolder.map { ($0.lowercased(), app) } }
+        ) { first, _ in first }
+        var found: [(url: URL, identifier: String?, app: InstalledApp?)] = []
+        // A folder an installed app's settings name, or one named as electron-builder names them all.
+        let addIfElectronUpdaters = { (url: URL) in
+            let name = url.lastPathComponent.lowercased()
+            let app = updaters[name]
+            guard app != nil || name.hasSuffix("-updater"), ElectronUpdater.holdsADownload(url) else { return }
+            found.append((url, app?.bundleIdentifier, app))
+        }
+        for url in files(in: caches) where url.isRealFolder {
+            let name = url.lastPathComponent
+            guard !developers.contains("library/caches/" + name.lowercased()) else { continue }
+            if name.hasSuffix(Squirrel.folderSuffix) {
+                let identifier = String(name.dropLast(Squirrel.folderSuffix.count))
+                found.append((url, identifier, installed(identifier)))
+            }
+            let sparkle = url.appending(path: "org.sparkle-project.Sparkle", directoryHint: .isDirectory)
+            if sparkle.isRealFolder {
+                let identifier = name.removingSuffix(".sparkle")
+                found.append((sparkle, identifier, installed(identifier)))
+            }
+            addIfElectronUpdaters(url)
+        }
+        let velopacks = Dictionary(
+            installedApps.compactMap { app in app.velopackID.map { ($0.lowercased(), app) } }
+        ) { first, _ in first }
+        for url in files(in: home.appending(path: Velopack.place, directoryHint: .isDirectory))
+        where url.isRealFolder && Velopack.holdsAnUpdate(url) {
+            let app = velopacks[url.lastPathComponent.lowercased()]
+            found.append((url, app?.bundleIdentifier, app))
+        }
+        let former = home.appending(path: ElectronUpdater.formerPlace, directoryHint: .isDirectory)
+        for url in files(in: former) where url.isRealFolder {
+            guard !developers.contains("\(ElectronUpdater.formerPlace)/\(url.lastPathComponent)".lowercased()) else {
+                continue
+            }
+            addIfElectronUpdaters(url)
+        }
+        let place = Folder(url: caches, isSharedWithEveryone: false)
+        let elsewhere = found.contains { $0.identifier == nil } ? electronAppsRunning(openFiles) : [:]
+        var items: [InstallerItem] = []
+        for (url, identifier, app) in found {
+            guard !Task.isCancelled else { return items }
+            guard !exclusions.excludes(url), !exclusions.holds(url) else { continue }
+            // An excluded app's update stays with the app, whatever the updater named its folder.
+            let isAnExcludedApps = app.map(exclusions.excludes)
+                ?? identifier.map(exclusions.excludes(bundleIdentifier:))
+            guard isAnExcludedApps != true else { continue }
+            let (size, seen, _) = await measured(url, by: measure)
+            guard isWorthARow(size, minimumSize) else { continue }
+            let isElectrons = url.lastPathComponent.lowercased().hasSuffix("-updater")
+            let fromElsewhere = identifier == nil && isElectrons ? elsewhere[url.lastPathComponent.lowercased()] : nil
+            let running = identifier.map(NSRunningApplication.runningApplications(withBundleIdentifier:)) ?? []
+            let name = app?.name ?? fromElsewhere?.name ?? running.first?.localizedName
+            items.append(InstallerItem(
+                url: url,
+                kind: .updateDownload,
+                name: url.lastPathComponent,
+                size: size,
+                date: (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+                installedApp: nil,
+                isReadOnly: false,
+                notes: (app?.name ?? fromElsewhere?.name).map { [.downloadedBy($0)] } ?? [],
+                requiresPrivileges: FileAccess.requiresPrivilegesToRemove(url),
+                heldBack: heldBack(
+                    url, seen: seen, in: place, syncKeeper: syncKeeper, openFiles: openFiles
+                )
+                    ?? (!running.isEmpty || fromElsewhere != nil ? .appIsRunning : nil),
+                updatesApp: (identifier ?? fromElsewhere?.identifier).flatMap { identifier in
+                    name.map { InstallerItem.UpdatedApp(identifier: identifier, name: $0) }
+                }
+            ))
+        }
+        return items
+    }
+
+    /// The Electron apps running now, listed or not, by the folder each names for its updates in `app-update.yml`.
+    private static func electronAppsRunning(
+        _ openFiles: OpenFiles
+    ) -> [String: (identifier: String?, name: String)] {
+        var apps: [String: (identifier: String?, name: String)] = [:]
+        for app in openFiles.runningApps() {
+            let contents = app.appending(path: "Contents", directoryHint: .isDirectory)
+            guard let folder = ElectronUpdater.configuration(in: contents)
+                .flatMap(ElectronUpdater.downloadsFolder(fromConfiguration:))
+            else { continue }
+            let identifier = AppInspector.stated(AppInspector.infoDictionary(in: contents)?["CFBundleIdentifier"])
+            apps[folder.lowercased()] = (identifier, app.deletingPathExtension().lastPathComponent)
+        }
+        return apps
+    }
+
+    /// Installers and system images in `~/Library/Application Support`, up to three levels down, never inside a
+    /// package, a virtual machine, or what macOS keeps there for its own services, the device backups and Contacts
+    /// among them, and the images Parallels Desktop and VMware Fusion keep for making virtual machines. A package or a
+    /// disk image is matched by its name to an installed app, or else by the folder it sits in.
+    static func installersKeptByApps(
+        home: URL,
+        installedApps: [InstalledApp],
+        exclusions: Exclusions,
+        minimumSize: Int64,
+        measure: LeftoverScanner.Measure,
+        syncKeeper: (URL) -> SyncKeeper?,
+        openFiles: OpenFiles
+    ) async -> [InstallerItem] {
+        let support = home.appending(path: "Library/Application Support", directoryHint: .isDirectory)
+        var items: [InstallerItem] = []
+        // Parallels Desktop's cask names its downloads folder, and Broadcom's guide VMware Fusion's folder of images:
+        // what they keep there is for making machines, no app's installer.
+        var folders: [(url: URL, depth: Int, owner: String?)] = [
+            (support, 1, nil),
+            (home.appending(path: "Library/Parallels/Downloads", directoryHint: .isDirectory), 3, nil),
+            (home.appending(path: "Virtual Machines.localized/VMWIsoImages", directoryHint: .isDirectory), 3, nil),
+        ]
+        let virtualBuddy = support.appending(path: "VirtualBuddy", directoryHint: .isDirectory)
+        let virtualBuddysImages = PathPattern.comparablePath(of: virtualBuddy.appending(path: "_Downloads"))
+        let imagesInUse = VirtualBuddyLibrary.imagesInUse(in: virtualBuddy)
+        while let (folder, depth, owner) = folders.popLast() {
+            for url in files(in: folder) {
+                guard !Task.isCancelled else { return items }
+                let kind = url.pathExtension.lowercased()
+                guard installerExtensions.contains(kind) || firmwareExtensions.contains(kind) else {
+                    if depth < 3, url.isRealFolder, !FileSize.isDataless(url),
+                       (try? url.resourceValues(forKeys: [.isPackageKey]).isPackage) != true,
+                       !KeptOnlyHere.namesAVirtualMachine(url.lastPathComponent),
+                       depth > 1 || !SystemFolders.keeps(url.lastPathComponent, in: .applicationSupport) {
+                        folders.append((url, depth + 1, owner ?? url.lastPathComponent))
+                    }
+                    continue
+                }
+                guard !exclusions.excludes(url), !exclusions.holds(url) else { continue }
+                let (size, seen, _) = await measured(url, by: measure)
+                guard isWorthARow(size, minimumSize) else { continue }
+                let place = Folder(url: folder, isSharedWithEveryone: false)
+                let heldBack = heldBack(
+                    url, seen: seen, in: place, syncKeeper: syncKeeper, openFiles: openFiles
+                )
+                // The folder an app keeps names the app a package or a disk image there installs. A system image, an
+                // `.iso` or an `.ipsw`, installs no app.
+                let installsAnApp = kind != "iso" && !firmwareExtensions.contains(kind)
+                let named = installsAnApp && installedApp(for: url, in: installedApps) == nil ? owner : nil
+                guard firmwareExtensions.contains(kind) else {
+                    items.append(appInstaller(
+                        at: url, size: size, heldBack: heldBack ?? .keptByAnApp, installedApps: installedApps,
+                        named: named
+                    ))
+                    continue
+                }
+                let isUnused = PathPattern.comparablePath(of: folder) == virtualBuddysImages
+                    && imagesInUse.map { !$0.contains(PathPattern.comparablePath(of: url)) } == true
+                items.append(firmware(
+                    at: url, size: size, heldBack: heldBack ?? .keptByAnApp,
+                    notes: isUnused ? [.unusedByAnyVirtualMachine] : []
+                ))
+            }
+        }
+        return items
+    }
+
+    /// Makes the item for an unfinished download. One that changed within `stillDownloading` may still be going, so
+    /// it is left for the person to choose. A package changes when the file growing inside it does (`newestInside`).
+    /// A `.part` file is a browser's only beside the empty file Firefox makes under the final name before it starts
+    /// (`DownloadCore.sys.mjs`): torrent clients and other programs that resume downloads use `.part` too.
+    static func incompleteDownload(
+        at url: URL, size: Int64?, heldBack: HoldBack?, newestInside: Date?
+    ) -> InstallerItem {
+        let own = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        let changed = [own, newestInside].compactMap(\.self).max()
+        let isRecent = changed.map { Date.now.timeIntervalSince($0) < stillDownloading } ?? true
+        let mayBeResumed = url.pathExtension.lowercased() == "part" && !isEmptyFile(url.deletingPathExtension())
+        return InstallerItem(
+            url: url,
+            kind: .incompleteDownload,
+            name: url.lastPathComponent,
+            size: size,
+            date: changed,
+            installedApp: nil,
+            isReadOnly: false,
+            notes: [],
+            requiresPrivileges: FileAccess.requiresPrivilegesToRemove(url),
+            heldBack: heldBack ?? (isRecent ? .changedRecently : mayBeResumed ? .mayStillBeResumed : nil)
+        )
+    }
+
+    private static func isEmptyFile(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path(percentEncoded: false), &info) == 0 else { return false }
+        return info.st_mode & S_IFMT == S_IFREG && info.st_size == 0
+    }
+
+    static func firmware(
+        at url: URL, size: Int64?, heldBack: HoldBack?, notes: [InstallerItem.Note] = []
+    ) -> InstallerItem {
+        InstallerItem(
+            url: url,
+            kind: .firmware,
+            name: url.lastPathComponent,
+            size: size,
+            date: creationDate(of: url),
+            installedApp: nil,
+            isReadOnly: false,
+            notes: notes,
+            requiresPrivileges: FileAccess.requiresPrivilegesToRemove(url),
+            heldBack: heldBack
+        )
+    }
+
+    /// Lists the device backups in `folder`, with what each says about itself: the device, its system, the
+    /// date of the last backup, and whether it is encrypted.
+    static func backups(in folder: URL, measure: LeftoverScanner.Measure) async -> [InstallerItem] {
+        var items: [InstallerItem] = []
+        for url in files(in: folder) {
+            guard (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true, !Task.isCancelled else {
+                continue
+            }
+            let info = plist(at: url.appending(path: "Info.plist"))
+            let manifest = plist(at: url.appending(path: "Manifest.plist"))
+            var notes: [InstallerItem.Note] = []
+            if let product = info?["Product Name"] as? String ?? info?["Product Type"] as? String {
+                notes.append(.name(product))
+            }
+            if let version = info?["Product Version"] as? String {
+                // The product type is a model code, such as `iPad13,4`, which tells iPadOS apart from iOS.
+                let system = (info?["Product Type"] as? String)?.hasPrefix("iPad") == true ? "iPadOS" : "iOS"
+                notes.append(.name("\(system) \(version)"))
+            }
+            if manifest?["IsEncrypted"] as? Bool == true {
+                notes.append(.encrypted)
+            }
+            items.append(InstallerItem(
+                url: url,
+                kind: .deviceBackup,
+                name: info?["Device Name"] as? String ?? url.lastPathComponent,
+                size: await measured(url, by: measure).size,
+                date: info?["Last Backup Date"] as? Date ?? creationDate(of: url),
+                installedApp: nil,
+                isReadOnly: true,
+                notes: notes
+            ))
+        }
+        return items
+    }
+
+    private static func files(in folder: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(
+            at: folder,
+            includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+    }
+
+    private static func plist(at url: URL) -> [String: Any]? {
+        guard let data = BoundedRead.data(at: url) else { return nil }
+        return try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+    }
+
+    private static func creationDate(of url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.creationDateKey]).creationDate
+    }
+}

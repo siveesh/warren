@@ -1,0 +1,23 @@
+# Upstream
+
+Vendored from https://github.com/TuguiDragos/Peel (GPL-3.0-or-later) at commit
+`094681646d9c0f9fa87fd1ab0c508108262300d8` (Packages/PeelCore: Sources/PeelCore,
+Sources/PeelPrivileged and Tests/PeelCoreTests).
+
+Not vendored: `PeelCommandLine`, `PeelLink`, the Peel app, helper, Finder extension
+and CLI targets. Tests that import those modules were removed.
+
+Keep edits to vendored files small and listed here so later syncs are a diff
+against the commit above.
+
+## Local changes
+- `Sources/PeelCore/Removal/ExternalRemovalGate.swift` (new) and one line in `RemovalGuard.judgement(of:typeOf:)` that consults it.
+
+Tests removed because they read Peel's repository files (app sources, docs, string
+catalogs, helper plist) that do not exist here: AlertDefaultButton, DebugBuild,
+DecorativeSymbol, Documentation, HeldBanner, HelperPolicy, LineLength, MotionKind,
+OwnUpdates, PackageResolved, PageBinding, ScanAnnouncement, StringCatalog,
+TerminalTheme, and `safetyMDCountsEveryPlace` in DesktopWalletTests.
+`launchdHasEveryJob` trait copied into `LaunchdJobsTrait.swift` (original lives in
+a test file that needs the CLI target).
+Also removed (depended on removed tests): SystemSettingsStep, TargetSize, TerminalThemeLedger, PrivateDatabase, InflectionMarkup, LinkedText tests.

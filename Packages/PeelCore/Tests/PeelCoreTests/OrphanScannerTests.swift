@@ -1,0 +1,2363 @@
+import Foundation
+import Synchronization
+@testable import PeelCore
+import Testing
+
+struct OrphanScannerTests {
+    @Test func aFinderAliasLeadsToTheAppThatWentAsALinkDoes() throws {
+        let directory = try TemporaryDirectory()
+        let app = try directory.directory("Apps/Gone.app")
+        try directory.file("Apps/Gone.app/Contents/Info.plist")
+        let alias = try directory.directory("Applications").appending(path: "Gone alias")
+        try URL.writeBookmarkData(try app.bookmarkData(options: .suitableForBookmarkFile), to: alias)
+        #expect(OrphanScanner.goneApp(behind: alias) == nil)
+
+        try FileManager.default.removeItem(at: app)
+
+        #expect(OrphanScanner.goneApp(behind: alias)?.lastPathComponent == "Gone.app")
+    }
+
+    @Test func aStoppedScanStops() async throws {
+        let directory = try TemporaryDirectory()
+        for index in 1...30 {
+            try directory.directory("home/Library/Application Support/com.gone.app\(index)")
+        }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            userCacheDirectory: directory.url.appending(path: "var/C", directoryHint: .isDirectory),
+            userTemporaryDirectory: directory.url.appending(path: "var/T", directoryHint: .isDirectory)
+        )
+        let unanswered = Unanswered()
+        let scanner = OrphanScanner(
+            environment: environment,
+            isRegisteredApp: { _ in false },
+            systemApps: [],
+            walk: unanswered.walk
+        )
+
+        let stop = try await unanswered.stop {
+            _ = await scanner.scan(installedApps: [])
+        }
+
+        #expect(stop.took < Unanswered.returnsForTheCancel)
+        #expect(stop.askedBefore < 30)
+        #expect(stop.askedAfter == 0)
+    }
+
+    @Test func aScanStoppedWhileMeasuringWhatAnUninstallLeftStops() async throws {
+        let directory = try TemporaryDirectory()
+        let left = try directory.directory("root/Library/Example Audio/Gone")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            userCacheDirectory: directory.url.appending(path: "var/C", directoryHint: .isDirectory),
+            userTemporaryDirectory: directory.url.appending(path: "var/T", directoryHint: .isDirectory)
+        )
+        let unanswered = Unanswered()
+        let scanner = OrphanScanner(
+            environment: environment,
+            isRegisteredApp: { _ in false },
+            systemApps: [],
+            walk: unanswered.walk,
+            installedByApple: { _ in false }
+        )
+        let record = LeftForAnAdministrator.Record(
+            path: PathPattern.comparablePath(of: left), kind: .library,
+            apps: [.init(reference: "org.example.gone", name: "Gone")], reason: .bundleIdentifier, confidence: .certain
+        )
+
+        let stop = try await unanswered.stop {
+            _ = await scanner.scan(installedApps: [], leftForAnAdministrator: [record])
+        }
+
+        #expect(stop.took < Unanswered.returnsForTheCancel)
+        #expect(stop.askedBefore == 1)
+        #expect(stop.askedAfter == 0)
+    }
+
+
+    /// The index only chooses which apps are asked: for every kind of claim, the answer is what asking each app gives.
+    @Test func ownershipAnswersAsAskingEveryAppDoes() {
+        let apps = [
+            InstalledApp(
+                url: URL(filePath: "/Applications/Tide.app"), bundleIdentifier: "org.example.tide", name: "Tide",
+                teamIdentifier: "ABCDE12345", applicationGroups: ["group.org.example.tide"],
+                embeddedBundleIdentifiers: ["org.example.tide.helper"]
+            ),
+            InstalledApp(
+                url: URL(filePath: "/Applications/Gale Nightly.app"), bundleIdentifier: "org.sample.gale.nightly",
+                name: "Gale Nightly"
+            ),
+            InstalledApp(url: URL(filePath: "/Applications/Harbor.app"), bundleIdentifier: "md.harbor", name: "Harbor"),
+            InstalledApp(
+                url: URL(filePath: "/Applications/Reed Pool.app"), bundleIdentifier: "com.maker.reedpool",
+                name: "Reed Pool"
+            ),
+            InstalledApp(
+                url: URL(filePath: "/Applications/Fern.app"), bundleIdentifier: "maccatalyst.net.fernworks.fern",
+                name: "Fern"
+            ),
+        ]
+        let names = [
+            "org.example.tide", "org.example.tide.helper", "group.org.example.tide", "org.example.tide-cache",
+            "org.example.tide_data", "abcde12345.org.other", "org.example.other", "Tide", "tide 2.1", "Gale", "gale",
+            "md.harbor.sync", "md.harbor", "Harbor", "harbor-data", "com.maker.other", "reed-pool-sdk",
+            "ReedPool-Data", "reed-pooling", "net.fernworks.other", "maccatalyst.net.fernworks.fern", "Fern", "fern",
+            "unrelated", "com.unknown.thing", "--", "Σ", "Ηarbor",
+        ]
+        let ownership = AppOwnership(installedApps: apps) { _ in false }
+        let profiles = apps.map(LeftoverMatcher.Profile.init)
+
+        for kind in [SearchLocation.Kind.applicationSupport, .preferences, .groupContainers, .caches] {
+            for name in names {
+                let key = LeftoverMatcher.key(from: name, kind: kind)
+                let candidates = [LeftoverMatcher.Candidate(key)]
+                    + (key.lowercased() != name.lowercased() ? [LeftoverMatcher.Candidate(name)] : [])
+                let askingEveryApp = profiles.contains { profile in
+                    candidates.contains { profile.claim(for: $0) != nil }
+                }
+                #expect(ownership.isClaimed(fileName: name, kind: kind, identifier: name) == askingEveryApp, "\(name)")
+            }
+        }
+    }
+
+    @Test func anItemComesWithAGoneAppItExtendsOrWhoseMakerItShares() {
+        let gone = ["org.example.tide", "com.maker.reed", "org.mixed.case"]
+        let ownership = AppOwnership(installedApps: [], goneApps: gone) { _ in false }
+        let identifiers = [
+            "org.example.tide", "org.example.tide.helper", "org.example.tidal", "com.maker.other.plugin", "com.maker",
+            "Org.Mixed.Case", "org.mixed.case.x", "net.other.thing", "maccatalyst.com.maker.fern",
+        ]
+
+        for identifier in identifiers {
+            let plugIn = identifier.lowercased()
+            let maker = Identifier.vendor(of: plugIn)
+            let expected = gone.contains { app in
+                plugIn == app || plugIn.hasPrefix(app + ".") || (maker != nil && maker == Identifier.vendor(of: app))
+            }
+            #expect(ownership.cameWithAnAppThatLeft(identifier) == expected, "\(identifier)")
+        }
+    }
+
+    @Test func anInstalledReleaseChannelClaimsTheFoldersNamedForItsApp() {
+        let nightly = InstalledApp(
+            url: URL(filePath: "/Applications/Harbor Nightly.app"), bundleIdentifier: "org.example.harbor-nightly",
+            name: "Harbor Nightly"
+        )
+        let ownership = AppOwnership(installedApps: [nightly]) { _ in false }
+
+        #expect(ownership.isClaimed(fileName: "harbor", kind: .hiddenHomeFiles, identifier: "harbor"))
+        #expect(!ownership.isClaimed(fileName: "anchor", kind: .hiddenHomeFiles, identifier: "anchor"))
+    }
+
+    /// Launch Services is asked about apps outside the scanned folders. It knows an app by its bundle identifier,
+    /// never by a group container's name, which has a team or `group.` in front.
+    @Test func asksMacOSAboutTheAppBehindAGroupContainer() {
+        let asked = Mutex<[String]>([])
+        let ownership = AppOwnership(installedApps: []) { identifier in
+            asked.withLock { $0.append(identifier) }
+            return identifier == "com.example.app"
+        }
+
+        #expect(ownership.isClaimed(fileName: "ABCDE12345.com.example.app", kind: .groupContainers, identifier: "ABCDE12345.com.example.app"))
+        #expect(ownership.isClaimed(fileName: "group.com.example.app.shared", kind: .groupContainers, identifier: "group.com.example.app.shared"))
+        #expect(!ownership.isClaimed(fileName: "ABCDE12345.org.other.thing", kind: .groupContainers, identifier: "ABCDE12345.org.other.thing"))
+        #expect(!asked.withLock { $0 }.contains { $0.hasPrefix("ABCDE12345") || $0.hasPrefix("group.") })
+    }
+    @Test func anOrphanThatIsALinkSaysWhereItLeads() async throws {
+        let directory = try TemporaryDirectory()
+        let data = try directory.directory("elsewhere/TideCache")
+        try directory.file("elsewhere/TideCache/cache.db", bytes: 64)
+        let caches = try directory.directory("home/Library/Caches")
+        try FileManager.default.createSymbolicLink(at: caches.appending(path: "org.example.tide"), withDestinationURL: data)
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.tide", name: "Tide", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-30 * 86_400), lastPath: "/Applications/Tide.app",
+            goneSince: .now.addingTimeInterval(-30 * 86_400)
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: [], remembered: [gone])
+
+        let link = try #require(scan.groups.flatMap(\.items).first { $0.url.lastPathComponent == "org.example.tide" })
+        #expect(link.leadsTo == PathPattern.canonicalWithoutOpening(data))
+    }
+
+    @Test func aTwoPartAppMacOSKnowsElsewhereKeepsItsFiles() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Preferences/md.example.plist")
+        try directory.file("home/Library/Caches/md.example.helper/data")
+        let gone = RememberedApp(
+            bundleIdentifier: "md.example", name: "Example", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-30 * 86_400),
+            lastPath: "/Applications/Example.app",
+            goneSince: .now.addingTimeInterval(-30 * 86_400)
+        )
+
+        let nobodyKnowsIt = await scanner(in: directory).scan(installedApps: [], remembered: [gone])
+        #expect(nobodyKnowsIt.groups.map(\.identifier) == ["md.example"])
+        #expect(nobodyKnowsIt.groups.flatMap(\.items).count == 2)
+
+        let known = scanner(in: directory, registered: ["md.example"])
+        let scan = await known.scan(installedApps: [], remembered: [gone])
+        #expect(scan.groups.isEmpty)
+        let stillOrphaned = await known.stillOrphaned(
+            nobodyKnowsIt.groups.flatMap(\.items), installedApps: [], remembered: [gone]
+        )
+        #expect(stillOrphaned.isEmpty)
+    }
+
+    @Test func aLinkIntoAnAppOnADiskWhoseNameAnotherDiskTookLeadsIntoNoGoneApp() throws {
+        let directory = try TemporaryDirectory()
+        let place = "/Volumes/\(try AppMemoryTests.startupDisksName())/org.example.missing/On Disk.app"
+        let link = directory.url.appending(path: "On Disk")
+        try FileManager.default.createSymbolicLink(atPath: link.path(percentEncoded: false), withDestinationPath: place)
+        let remembered = RememberedApp(
+            bundleIdentifier: "org.example.ondisk", name: "On Disk", teamIdentifier: nil, lastSeen: .now,
+            lastPath: place, disks: [place: DiskPlace(volume: UUID().uuidString, path: "org.example.missing/On Disk.app")]
+        )
+
+        #expect(OrphanScanner.goneApp(behind: link, among: .init([remembered])) == nil)
+        #expect(OrphanScanner.goneApp(behind: link) != nil, "a link into a place no remembered disk holds goes by its name")
+    }
+
+    @Test func aLinkIntoAnAppOnADiskThatSharesItsVolumeLeadsIntoNoGoneApp() async throws {
+        let directory = try TemporaryDirectory()
+        let (disks, apps) = try await AppMemoryTests.appsOnTwinDisks(in: directory.url, serial: 0x5EED_0002)
+        let links = try apps.enumerated().map { index, app in
+            let link = directory.url.appending(path: "twin \(index)")
+            try FileManager.default.createSymbolicLink(
+                atPath: link.path(percentEncoded: false), withDestinationPath: app.lastPath + "/Contents/MacOS/Twin"
+            )
+            return link
+        }
+
+        #expect(links.compactMap { OrphanScanner.goneApp(behind: $0, among: .init(apps)) }.isEmpty)
+        withExtendedLifetime(disks) {}
+    }
+
+    @Test func whatAGoneAppStoreAppsOwnIdentifierNamesIsListedUnderApplesNameToo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Containers/com.apple.iWork.Pages/Data/data")
+        try directory.file("home/Library/Preferences/com.apple.iWork.Pages.plist")
+        try directory.file("home/Library/Caches/com.apple.iWork.Pages/data")
+        try directory.file("home/Library/Caches/com.apple.iWork.Keynote/data")
+        try directory.file("home/Library/Caches/com.apple.iWork.Pages.helper/data")
+        func pages(signedByTheAppStore: Bool?) -> RememberedApp {
+            RememberedApp(
+                bundleIdentifier: "com.apple.iWork.Pages", name: "Pages", teamIdentifier: "ABCDE12345",
+                lastSeen: .now.addingTimeInterval(-30 * 86_400), lastPath: "/Applications/Pages.app",
+                goneSince: .now.addingTimeInterval(-30 * 86_400), isSignedByTheAppStore: signedByTheAppStore
+            )
+        }
+        let calculator = InstalledApp(
+            url: URL(filePath: "/System/Applications/Calculator.app"), bundleIdentifier: "com.apple.calculator",
+            name: "Calculator", isSystemProtected: true
+        )
+        let scanner = scanner(in: directory, systemApps: [calculator])
+
+        let signed = await scanner.scan(installedApps: [], remembered: [pages(signedByTheAppStore: true)])
+        let unsigned = await scanner.scan(installedApps: [], remembered: [pages(signedByTheAppStore: nil)])
+        let still = await scanner.stillOrphaned(
+            signed.groups.flatMap(\.items), installedApps: [], remembered: [pages(signedByTheAppStore: true)]
+        )
+
+        #expect(signed.groups.map(\.identifier) == ["com.apple.iWork.Pages"])
+        #expect(signed.groups.first?.items.count == 3)
+        #expect(still.count == 3)
+        #expect(unsigned.groups.isEmpty)
+    }
+
+    @Test(arguments: ["ABCDE12345.md.example", "ABCDE12345.group.md.example"])
+    func aTeamContainerOfATwoPartAppJoinsItsGroup(container: String) async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Group Containers/\(container)/data")
+        try directory.file("home/Library/Preferences/md.example.plist")
+        let gone = RememberedApp(
+            bundleIdentifier: "md.example", name: "Example", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-30 * 86_400),
+            lastPath: "/Applications/Example.app",
+            goneSince: .now.addingTimeInterval(-30 * 86_400)
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: [], remembered: [gone])
+        #expect(scan.groups.map(\.identifier) == ["md.example"])
+        #expect(scan.groups.first?.items.count == 2)
+        #expect(scan.groups.first?.rememberedApp?.bundleIdentifier == "md.example")
+
+        let given = await scanner(in: directory).scan(
+            installedApps: installed, remembered: [gone], owners: ["md.example": .app("com.installed.app")]
+        )
+        #expect(given.groups.isEmpty)
+
+        let known = await scanner(in: directory, registered: ["md.example"]).scan(installedApps: [], remembered: [gone])
+        #expect(known.groups.isEmpty)
+    }
+
+    @Test func aTeamContainerNamesAGoneAppOnly() {
+        let gone = { (name: String) in name == "md.example" }
+        #expect(
+            OrphanScanner.orphanIdentifier(forKey: "ABCDE12345.md.example", kind: .groupContainers, isAGoneApp: gone)
+                == "md.example"
+        )
+        #expect(
+            OrphanScanner.orphanIdentifier(forKey: "ABCDE12345.md.installed", kind: .groupContainers, isAGoneApp: gone)
+                == "ABCDE12345.md.installed"
+        )
+    }
+
+    @Test func aScanThatLandsLeavesOutWhatThePersonGaveAwayMeanwhile() {
+        let item = { (name: String) in
+            OrphanItem(
+                url: URL(filePath: "/Users/me/Library/Caches/\(name)"), kind: .caches, size: 1, modificationDate: nil,
+                requiresPrivileges: false
+            )
+        }
+        let groups = ["org.example.given", "org.example.kept", "org.example.gone", "org.example.tool"].map {
+            OrphanGroup(identifier: $0, items: [item($0)])
+        }
+        let scan = OrphanScan(groups: groups, unreadableLocations: [])
+        let owners: [String: OrphanOwner] = [
+            "org.example.given": .app("com.installed.app"), "org.example.gone": .app("org.example.notinstalled"),
+            "org.example.tool": .formula("exampletool"),
+        ]
+
+        let left = scan.leavingOut(
+            given: owners, installedApps: installed, tools: InstalledTools(formulae: ["exampletool"])
+        )
+        #expect(left.groups.map(\.identifier) == ["org.example.kept", "org.example.gone"])
+
+        let toolGone = scan.leavingOut(given: owners, installedApps: installed, tools: InstalledTools(formulae: []))
+        #expect(toolGone.groups.map(\.identifier) == ["org.example.kept", "org.example.gone", "org.example.tool"])
+
+        let toolsNotKnown = scan.leavingOut(given: owners, installedApps: installed, tools: .notKnown)
+        #expect(toolsNotKnown.groups.map(\.identifier) == ["org.example.kept", "org.example.gone"])
+    }
+
+    @Test func aGroupThePersonGaveToAHomebrewToolIsNotListedWhileItIsInstalled() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/org.example.tool/cache.db")
+        let scanner = scanner(in: directory)
+        let owners: [String: OrphanOwner] = ["org.example.tool": .formula("exampletool")]
+
+        let given = await scanner.scan(
+            installedApps: installed, owners: owners, tools: InstalledTools(formulae: ["exampletool"])
+        )
+        #expect(given.groups.isEmpty)
+
+        let toolGone = await scanner.scan(installedApps: installed, owners: owners, tools: InstalledTools(formulae: []))
+        #expect(toolGone.groups.map(\.identifier) == ["org.example.tool"])
+
+        let toolsNotKnown = await scanner.scan(installedApps: installed, owners: owners, tools: .notKnown)
+        #expect(toolsNotKnown.groups.isEmpty)
+    }
+
+    @Test func aGroupThePersonGaveToACommandIsNotListedWhileTheCommandIsThere() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/org.example.cmd/cache.db")
+        let scanner = scanner(in: directory)
+        let owners: [String: OrphanOwner] = ["org.example.cmd": .command("mytool")]
+
+        let given = await scanner.scan(installedApps: installed, owners: owners, tools: InstalledTools(commands: ["mytool"]))
+        #expect(given.groups.isEmpty)
+
+        let commandGone = await scanner.scan(
+            installedApps: installed, owners: owners, tools: InstalledTools(commands: [])
+        )
+        #expect(commandGone.groups.map(\.identifier) == ["org.example.cmd"])
+    }
+
+    @Test func aTwoPartIdentifierNoAppDeclaredIsNeverAskedAboutAsAPrefix() {
+        let asked = Mutex<[String]>([])
+        let ownership = AppOwnership(installedApps: [], goneApps: ["com.example.gone"]) { identifier in
+            asked.withLock { $0.append(identifier) }
+            return false
+        }
+
+        #expect(!ownership.isClaimed(
+            fileName: "com.example.other.plist", kind: .preferences, identifier: "com.example.other"
+        ))
+        #expect(asked.withLock { $0 } == ["com.example.other"])
+    }
+
+    private let installed = [
+        InstalledApp(url: URL(filePath: "/Applications/Installed.app"), bundleIdentifier: "com.installed.app", name: "Installed"),
+        InstalledApp(url: URL(filePath: "/Applications/Word.app"), bundleIdentifier: "com.microsoft.Word", name: "Microsoft Word", teamIdentifier: "UBF8T346G9"),
+    ]
+
+    private func scanner(
+        in directory: borrowing TemporaryDirectory,
+        registered: Set<String> = [],
+        systemApps: [InstalledApp] = [],
+        nestedFolderLimit: Int = NestedSearch.folderLimit,
+        systemExtensions: @escaping AppExtensions.SystemExtensionsAnswer = { [] }
+    ) -> OrphanScanner {
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        return OrphanScanner(
+            environment: environment,
+            isRegisteredApp: { registered.contains($0) },
+            systemApps: systemApps,
+            nestedFolderLimit: nestedFolderLimit,
+            systemExtensions: systemExtensions
+        )
+    }
+
+    @Test(.permissionsHold) func aContainerPeelCannotLookIntoIsCountedAsNotRead() async throws {
+        let directory = try TemporaryDirectory()
+        let closed = try directory.directory("home/Library/Containers/org.example.closed")
+        try directory.file("home/Library/Containers/org.example.closed/Data/data.db")
+        try directory.file("home/Library/Containers/org.example.open/Data/data.db")
+        try directory.setPermissions(0o000, of: closed)
+        defer { try? directory.setPermissions(0o755, of: closed) }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["org.example.open"])
+        #expect(scan.unreadableLocations.map(\.url.lastPathComponent) == ["org.example.closed"])
+    }
+
+    @Test func aSystemExtensionACopyOfWhichMacOSKeepsIsLeftToMacOS() async throws {
+        let directory = try TemporaryDirectory()
+        let kept = try directory.directory("root/Library/SystemExtensions/5DF88A99/org.example.mixer.camera.systemextension")
+        let going = try directory.directory("root/Library/SystemExtensions/77689A22/org.example.mixer.filter.systemextension")
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.mixer", name: "Mixer", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Mixer.app"
+        )
+        let removing = AppExtension(
+            identifier: "org.example.mixer.filter", name: "Mixer Filter", kind: .systemExtension, point: nil,
+            owner: nil, url: going, election: .beingRemoved, teamIdentifier: nil, reportedState: nil
+        )
+
+        let scan = await scanner(in: directory) { [removing] }.scan(installedApps: installed, remembered: [gone])
+
+        let items = scan.groups.flatMap(\.items)
+        func item(_ url: URL) -> OrphanItem? {
+            items.first { PathPattern.comparablePath(of: $0.url) == PathPattern.comparablePath(of: url) }
+        }
+        #expect(item(kept)?.leftAlone == .systemExtension)
+        #expect(item(going)?.leftAlone == .systemExtensionGoingAtRestart)
+    }
+
+    @Test func aNetworkExtensionsCopySaysSystemSettingsDeletesIt() async throws {
+        let directory = try TemporaryDirectory()
+        let copy = try directory.directory("root/Library/SystemExtensions/DC0C6705/org.example.tunnel.net.systemextension")
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.tunnel", name: "Tunnel", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Tunnel.app"
+        )
+        let network = AppExtension(
+            identifier: "org.example.tunnel.net", name: "Tunnel Network Extension", kind: .systemExtension, point: nil,
+            owner: nil, url: copy, election: .on, teamIdentifier: nil, reportedState: nil,
+            category: "com.apple.system_extension.network_extension"
+        )
+
+        let scan = await scanner(in: directory) { [network] }.scan(installedApps: installed, remembered: [gone])
+
+        let item = scan.groups.flatMap(\.items).first {
+            PathPattern.comparablePath(of: $0.url) == PathPattern.comparablePath(of: copy)
+        }
+        if #available(macOS 27, *) {
+            #expect(item?.leftAlone == .deletableSystemExtension)
+        } else {
+            #expect(item?.leftAlone == .systemExtension)
+        }
+    }
+
+    @Test func namesTheGoneAppMacOSInstalledASystemExtensionFor() async throws {
+        let directory = try TemporaryDirectory()
+        let copy = try directory.directory("root/Library/SystemExtensions/77689A22/org.example.guard.ext.systemextension")
+        let going = try directory.directory("root/Library/SystemExtensions/837351C0/org.example.shield.ext.systemextension")
+        let other = try directory.directory("root/Library/SystemExtensions/5DF88A99/org.example.kept.ext.systemextension")
+        let kept = try directory.directory("root/Applications/Kept.app")
+        let gone = { (name: String) in directory.url.appending(path: "root/Applications/\(name).app") }
+        let copies: [(URL, URL, AppExtension.Election)] = [
+            (copy, gone("Guard"), .on), (going, gone("Shield"), .beingRemoved), (other, kept, .waitingForApproval),
+        ]
+        let extensions = copies.map { url, app, election in
+            AppExtension(
+                identifier: url.deletingPathExtension().lastPathComponent, name: "Extension", kind: .systemExtension,
+                point: nil, owner: nil, url: url, election: election, teamIdentifier: nil,
+                reportedState: nil, installedFor: app.path(percentEncoded: false)
+            )
+        }
+
+        let maker = RememberedApp(
+            bundleIdentifier: "org.example.other", name: "Other", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Other.app"
+        )
+
+        let scan = await scanner(in: directory) { extensions }.scan(installedApps: installed, remembered: [maker])
+        let confidence = { (url: URL) in
+            scan.groups.first { group in group.items.contains { $0.url.lastPathComponent == url.lastPathComponent } }?
+                .confidence
+        }
+
+        #expect(confidence(copy) == OrphanConfidence(level: .likely, reasons: [.installedForAnAppThatIsGone(name: "Guard")]))
+        #expect(confidence(going) == OrphanConfidence(level: .certain, reasons: [.installedForAnAppThatIsGone(name: "Shield")]))
+        #expect(confidence(other)?.reasons.isEmpty == false)
+        #expect(confidence(other)?.reasons.contains(.installedForAnAppThatIsGone(name: "Kept")) == false)
+    }
+
+    @Test func listsTheFoldersAGoneAppsProductFileNamed() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/.example-editor/argv.json")
+        try directory.file("home/Library/Application Support/ExampleVendor/ExampleIDE2025.2/scratches/scratch.txt")
+        try directory.file("home/Library/Caches/ExampleVendor/ExampleIDE2025.2/index/a", bytes: 64)
+        try directory.file("home/.unproved-editor/settings.json")
+        try directory.file("home/.kept-editor/argv.json")
+        try directory.file("home/.config/settings.json")
+        let gone = { (identifier: String, folders: [ProductFolder]) in
+            RememberedApp(
+                bundleIdentifier: identifier, name: identifier, teamIdentifier: nil, lastSeen: .now,
+                lastPath: "/Applications/\(identifier).app", productFolders: folders
+            )
+        }
+        let editors = { (name: String) in ProductFolders.vsCodeFolders(in: ["dataFolderName": name]) }
+        let editor = gone("org.example.editor", editors(".example-editor") + editors(".unproved-editor")
+            + [ProductFolder(path: ".config", proof: nil)])
+        let ide = gone("org.example.ide", ProductFolders.jetBrainsFolders(in: [
+            "productVendor": "ExampleVendor", "dataDirectoryName": "ExampleIDE2025.2",
+        ]))
+        let old = gone("org.example.oldeditor", editors(".kept-editor"))
+        let kept = InstalledApp(
+            url: URL(filePath: "/Applications/Kept Editor.app"), bundleIdentifier: "org.example.kepteditor",
+            name: "Kept Editor", productFolders: editors(".kept-editor")
+        )
+        let scanner = scanner(in: directory)
+
+        let scan = await scanner.scan(installedApps: installed + [kept], remembered: [editor, ide, old])
+        let listed = Dictionary(
+            scan.groups.flatMap { group in group.items.map { ($0.url.lastPathComponent, (group.identifier, $0)) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let settings = scan.groups.flatMap(\.items).first { $0.url.path(percentEncoded: false).contains("Support/ExampleVendor") }
+
+        #expect(listed[".example-editor"]?.0 == "org.example.editor")
+        #expect(Set(scan.groups.filter { $0.identifier == "org.example.ide" }.flatMap(\.items).map(\.kind))
+            == [.applicationSupport, .caches])
+        #expect(settings?.heldBack == .holdsWorkMadeWithTheApp)
+        for name in [".unproved-editor", ".kept-editor", ".config"] {
+            #expect(listed[name] == nil, "\(name)")
+        }
+        let item = try #require(listed[".example-editor"]?.1)
+        let back = InstalledApp(
+            url: URL(filePath: "/Applications/Back.app"), bundleIdentifier: "org.example.back", name: "Back",
+            productFolders: editors(".example-editor")
+        )
+        #expect(await scanner.stillOrphaned([item], installedApps: installed, remembered: [editor]).count == 1)
+        #expect(await scanner.stillOrphaned([item], installedApps: installed + [back], remembered: [editor]).isEmpty)
+    }
+
+    @Test func holdsBackAGoneAppsFolderThatHoldsItsBackups() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/org.example.quillworks/Backups/My Novel.bak.zip", bytes: 64)
+        try directory.file("home/Library/Application Support/org.example.inkpot/Settings.plist", bytes: 64)
+        let gone = { (identifier: String, name: String) in
+            RememberedApp(
+                bundleIdentifier: identifier, name: name, teamIdentifier: nil, lastSeen: .now,
+                lastPath: "/Applications/\(name).app"
+            )
+        }
+
+        let scan = await scanner(in: directory).scan(
+            installedApps: installed,
+            remembered: [gone("org.example.quillworks", "Quillworks"), gone("org.example.inkpot", "Inkpot")]
+        )
+
+        let items = scan.groups.flatMap(\.items)
+        #expect(items.first { $0.url.lastPathComponent == "org.example.quillworks" }?.heldBack == .holdsWorkMadeWithTheApp)
+        #expect(items.contains { $0.url.lastPathComponent == "org.example.inkpot" && $0.heldBack == nil })
+    }
+
+    @Test func listsTheDataFolderOfACodeEditorThatLeftAndHoldsItsWorkBack() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/Inkwell/User/globalStorage/storage.json", bytes: 64)
+        try directory.file("home/Library/Application Support/Inkwell/User/History/-5c6d/entries.json", bytes: 64)
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.inkwell", name: "Inkwell Editor", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Inkwell Editor.app",
+            productFolders: ProductFolders.vsCodeFolders(in: ["nameShort": "Inkwell", "dataFolderName": ".inkwell"])
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: [gone])
+
+        let group = scan.groups.first { $0.identifier == "org.example.inkwell" }
+        let folder = group?.items.first { $0.url.lastPathComponent == "Inkwell" }
+        #expect(folder?.heldBack == .holdsWorkMadeWithTheApp)
+    }
+
+    @Test func listsABrowsersManifestThatStartsNothing() async throws {
+        let directory = try TemporaryDirectory()
+        let hosts = "root/Library/Google/Chrome/NativeMessagingHosts"
+        let program = try directory.file("programs/host")
+        let manifest = { (name: String, program: String) in
+            _ = try directory.file("\(hosts)/\(name).json", contents: Data(#"{"name": "\#(name)", "path": "\#(program)"}"#.utf8))
+        }
+        try manifest("org.example.gone.host", "/Library/PrivilegedHelperTools/Gone.app/Contents/MacOS/host")
+        try manifest("org.example.here.host", program.path(percentEncoded: false))
+        let link = { (name: String, target: URL) in
+            try FileManager.default.createSymbolicLink(
+                at: directory.url.appending(path: "\(hosts)/\(name).json"), withDestinationURL: target
+            )
+        }
+        try link("org.example.nowhere.host", directory.url.appending(path: "root/Applications/Gone.app/host.json"))
+        try link("org.example.somewhere.host", directory.url.appending(path: "\(hosts)/org.example.here.host.json"))
+        try link("com.apple.example.host", directory.url.appending(path: "root/System/host.json"))
+
+        let scanner = scanner(in: directory)
+        let scan = await scanner.scan(installedApps: installed)
+        let groups = Dictionary(scan.groups.map { ($0.identifier, $0) }, uniquingKeysWith: { first, _ in first })
+        let items = scan.groups.flatMap(\.items)
+
+        #expect(Set(groups.keys) == ["org.example.gone.host", "org.example.nowhere.host"])
+        let startsNothing = OrphanConfidence(level: .certain, reasons: [.startsAProgramThatIsGone])
+        #expect(groups.values.allSatisfy { $0.confidence == startsNothing })
+        #expect(await scanner.stillOrphaned(items, installedApps: installed, remembered: []).count == 2)
+        try directory.file("root/Applications/Gone.app/host.json")
+        let still = await scanner.stillOrphaned(items, installedApps: installed, remembered: [])
+        #expect(still.map { $0.url.lastPathComponent } == ["org.example.gone.host.json"])
+    }
+
+    @Test func listsAFileTwoPlacesReachOnce() async throws {
+        let directory = try TemporaryDirectory()
+        let recents = "home/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments"
+        try directory.file("\(recents)/org.example.viewer.sfl4", bytes: 64)
+        let viewer = RememberedApp(
+            bundleIdentifier: "org.example.viewer", name: "Viewer", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Viewer.app"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: [viewer])
+        let items = scan.groups.flatMap(\.items)
+
+        #expect(items.map(\.url.lastPathComponent) == ["org.example.viewer.sfl4"])
+    }
+
+    @Test func aBrowsersManifestIsAnOrphanOnlyOnceItsProgramIsGone() async throws {
+        let directory = try TemporaryDirectory()
+        let folder = "home/Library/Application Support/Mozilla/NativeMessagingHosts"
+        let live = try directory.file("programs/host")
+        let gone = directory.url.appending(path: "programs/assist")
+        func manifest(_ name: String, program: URL) throws {
+            let text = #"{"name": "\#(name)", "path": "\#(program.path(percentEncoded: false))", "type": "stdio"}"#
+            try directory.file("\(folder)/\(name).json", contents: Data(text.utf8))
+        }
+        try manifest("org.example.remote", program: live)
+        try manifest("org.example.remote.assist", program: gone)
+        try directory.file("\(folder)/org.example.remote.broken.json", contents: Data("not a manifest".utf8))
+        let remote = RememberedApp(
+            bundleIdentifier: "org.example.remote", name: "Remote", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Remote.app"
+        )
+        let scanner = scanner(in: directory)
+
+        let items = await scanner.scan(installedApps: installed, remembered: [remote]).groups.flatMap(\.items)
+
+        #expect(items.map(\.url.lastPathComponent) == ["org.example.remote.assist.json"])
+        try directory.file("programs/assist")
+        #expect(await scanner.stillOrphaned(items, installedApps: installed, remembered: [remote]).isEmpty)
+    }
+
+    /// The recent documents list macOS 26 writes (`.sfl4`) belongs to the installed app it is named for.
+    @Test func anInstalledAppsRecentDocumentListIsNoOrphan() async throws {
+        let directory = try TemporaryDirectory()
+        let lists = "home/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments"
+        try directory.file("\(lists)/org.notebook.sfl4")
+        try directory.file("\(lists)/com.gone.app.sfl4")
+        let notebook = InstalledApp(url: URL(filePath: "/Applications/Notebook.app"), bundleIdentifier: "org.notebook", name: "Notebook")
+
+        let scan = await scanner(in: directory).scan(installedApps: installed + [notebook])
+
+        let listed = scan.groups.flatMap(\.items).map(\.url.lastPathComponent)
+        #expect(!listed.contains("org.notebook.sfl4"))
+        #expect(listed.contains("com.gone.app.sfl4"))
+    }
+
+    /// What an app left behind can be the biggest folder in the Library. A folder that did not answer in time
+    /// is listed first with an unknown size, and the group's total says it is incomplete. It may hold a wallet
+    /// all the same, so it is left to be chosen by hand.
+    @Test func anItemThatDidNotAnswerInTimeIsNotReadAsEmpty() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.gone.app/library.db", bytes: 400_000)
+        try directory.file("home/Library/Caches/com.gone.app/blob", bytes: 50_000)
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let scanner = OrphanScanner(environment: environment, isRegisteredApp: { _ in false }) { url in
+            url.path(percentEncoded: false).contains("Application Support") ? nil : await FileSize.contents(of: url)
+        }
+
+        let group = try #require(await scanner.scan(installedApps: installed).groups.first)
+
+        #expect(group.items.map(\.kind) == [.applicationSupport, .caches])
+        #expect(group.items.first?.size == nil)
+        #expect(!group.total.isComplete)
+        #expect(group.total.known >= 50_000)
+        #expect(group.items.map(\.heldBack) == [.notMeasured, nil])
+    }
+
+    /// A crash reporter keeps a folder for each app inside its own. When macOS will not let Peel list that folder,
+    /// what it holds is not known, so it is not reported as nobody's, the same as a folder that did not answer.
+    @Test(.permissionsHold) func aFolderThatCannotBeListedIsNotNobodys() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.vendor.reports/com.installed.app/report.log")
+        try directory.setPermissions(0, of: "home/Library/Application Support/com.vendor.reports")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/Application Support/com.vendor.reports") }
+
+        let groups = await scanner(in: directory).scan(installedApps: installed).groups
+
+        #expect(!groups.contains { $0.identifier == "com.vendor.reports" }, "a folder nobody could read was called nobody's")
+    }
+
+    /// An item that needs an administrator, in a place the helper does not serve, is left alone rather than
+    /// offered and then refused.
+    @Test(.permissionsHold) func whatTheHelperMayNotMoveIsLeftAlone() async throws {
+        let directory = try TemporaryDirectory()
+        let served = try directory.directory("root/Library/Application Support/com.gone.app")
+        let beyond = try directory.directory("root/Users/Shared/com.gone.app")
+        try directory.file("root/Users/Shared/com.gone.app/wallet.dat")
+        for folder in [served, beyond] {
+            try directory.setPermissions(0o555, of: folder)
+        }
+        defer {
+            for folder in [served, beyond] {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: folder.path(percentEncoded: false)
+                )
+            }
+        }
+
+        let group = try #require(
+            await scanner(in: directory).scan(installedApps: installed).groups.first { $0.identifier == "com.gone.app" }
+        )
+        func item(_ url: URL) throws -> OrphanItem {
+            try #require(
+                group.items.first { PathPattern.comparablePath(of: $0.url) == PathPattern.comparablePath(of: url) }
+            )
+        }
+
+        #expect(try item(served).requiresPrivileges)
+        #expect(try item(served).leftAlone == nil)
+        #expect(try item(beyond).requiresPrivileges)
+        #expect(try item(beyond).leftAlone == .beyondTheHelper)
+    }
+
+    @Test(.permissionsHold) func listsWhatAnUninstallLeftForAnAdministrator() async throws {
+        let directory = try TemporaryDirectory()
+        let left = try directory.directory("root/Library/Example Audio/Hexachord")
+        let hinted = try directory.directory("root/Library/Example Audio/Updater")
+        let found = try directory.directory("root/Library/org.example.hexachord")
+        let tritone = try directory.directory("root/Library/org.example.tritone")
+        let back = try directory.directory("root/Library/Example Audio/Reinstalled")
+        let claimed = try directory.directory("root/Library/Example Audio/Installed")
+        let excluded = try directory.directory("root/Library/Example Audio/Excluded")
+        let apples = try directory.directory("root/Library/Example Audio/Apples")
+        let outside = try directory.directory("root/opt/org.example.hexachord")
+        let missing = directory.url.appending(path: "root/Library/Example Audio/Missing")
+        let locked = [left, hinted, found, tritone, back, claimed, excluded, apples, outside]
+        for folder in locked {
+            try directory.setPermissions(0o555, of: folder)
+        }
+        defer {
+            for folder in locked {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: folder.path(percentEncoded: false)
+                )
+            }
+        }
+        let path = { (url: URL) in PathPattern.comparablePath(of: url) }
+        func record(
+            _ url: URL, app: String = "org.example.hexachord", name: String = "Hexachord",
+            confidence: MatchConfidence = .likely
+        ) -> LeftForAnAdministrator.Record {
+            LeftForAnAdministrator.Record(
+                path: path(url), kind: .library, apps: [.init(reference: app, name: name)], reason: .homebrewCask,
+                confidence: confidence
+            )
+        }
+        let hexachord = RememberedApp(
+            bundleIdentifier: "org.example.hexachord", name: "Hexachord", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Hexachord.app"
+        )
+        let tritoneApp = RememberedApp(
+            bundleIdentifier: "org.example.tritone", name: "Tritone", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Tritone.app"
+        )
+        let scanner = OrphanScanner(
+            environment: SearchEnvironment(
+                homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+                rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+            ),
+            exclusions: Exclusions(paths: [excluded]),
+            isRegisteredApp: { _ in false },
+            systemApps: [],
+            installedByApple: { [applesPath = path(apples)] in PathPattern.comparablePath(of: $0) == applesPath }
+        )
+
+        var spelledElsewhere = record(found)
+        spelledElsewhere = LeftForAnAdministrator.Record(
+            path: "/private" + path(found), kind: spelledElsewhere.kind, apps: spelledElsewhere.apps,
+            reason: spelledElsewhere.reason, confidence: spelledElsewhere.confidence
+        )
+        #expect(path(found).hasPrefix("/var/"), "the temporary folder is not under /var, so /private names it no other way")
+
+        let scan = await scanner.scan(
+            installedApps: installed,
+            remembered: [hexachord, tritoneApp],
+            leftForAnAdministrator: [
+                record(left), record(hinted, confidence: .possible), spelledElsewhere,
+                record(back, app: "com.installed.app", name: "Installed"), record(claimed), record(excluded),
+                record(missing), record(left), record(apples), record(outside), record(URL(filePath: "/private/etc/hosts")),
+                record(left, app: "org.example.other", name: "Other", confidence: .possible),
+                record(tritone, app: "org.example.other", name: "Other", confidence: .possible),
+            ]
+        )
+        let listed = Dictionary(
+            scan.forAnAdministrator.map { (path($0.item.url), $0) }, uniquingKeysWith: { first, _ in first }
+        )
+
+        #expect(scan.forAnAdministrator.count == 4)
+        #expect(Set(listed.keys) == [path(left), path(hinted), path(found), path(tritone)])
+        #expect(listed[path(left)]?.apps == ["Hexachord"])
+        #expect(listed[path(left)]?.claim == AdministratorItem.Claim(reason: .homebrewCask, confidence: .likely))
+        #expect(listed[path(hinted)]?.claim?.confidence == .possible)
+        #expect(listed[path(found)]?.claim != nil)
+        #expect(listed[path(tritone)]?.apps == ["Tritone"])
+        #expect(listed[path(tritone)]?.claim == nil)
+        #expect(listed.values.allSatisfy { $0.item.leftAlone == .beyondTheHelper })
+        #expect(!scan.groups.contains { $0.items.contains { path($0.url) == path(found) } })
+    }
+
+    @Test(.permissionsHold) func whatOnlyAnAdministratorCanMoveIsListedApart() async throws {
+        let directory = try TemporaryDirectory()
+        let beyond = try directory.directory("root/Library/com.gone.app")
+        let served = try directory.directory("root/Library/Application Support/com.gone.app")
+        let own = try directory.directory("home/Library/Caches/com.gone.app")
+        let alone = try directory.directory("root/Library/com.gone.solo")
+        let coin = try directory.directory("root/Library/com.gone.coin")
+        try directory.file("root/Library/com.gone.coin/wallet.dat")
+        let busy = try directory.directory("root/Library/com.gone.busy")
+        let locked = [beyond, served, alone, coin, busy]
+        for folder in locked {
+            try directory.setPermissions(0o555, of: folder)
+        }
+        defer {
+            for folder in locked {
+                try? FileManager.default.setAttributes(
+                    [.posixPermissions: 0o755],
+                    ofItemAtPath: folder.path(percentEncoded: false)
+                )
+            }
+        }
+        let gone = ["com.gone.app", "com.gone.solo", "com.gone.coin", "com.gone.busy"].map { identifier in
+            RememberedApp(
+                bundleIdentifier: identifier, name: identifier.uppercased(), teamIdentifier: nil, lastSeen: .now,
+                lastPath: "/Applications/\(identifier).app"
+            )
+        }
+
+        let scan = await scanner(in: directory).scan(
+            installedApps: installed, remembered: gone,
+            running: [RunningCopies.Process(
+                identifier: 1, bundleIdentifier: "com.gone.busy",
+                bundleURL: URL(filePath: "/Volumes/org.example.none/Busy.app", directoryHint: .isDirectory)
+            )]
+        )
+        let paths = { (urls: [URL]) in Set(urls.map(PathPattern.comparablePath(of:))) }
+        func group(_ identifier: String) -> OrphanGroup? { scan.groups.first { $0.identifier == identifier } }
+
+        #expect(paths(scan.forAnAdministrator.map(\.item.url)) == paths([beyond, alone]))
+        #expect(scan.forAnAdministrator.first { $0.item.url.lastPathComponent == "com.gone.app" }?.apps == ["COM.GONE.APP"])
+        #expect(scan.forAnAdministrator.allSatisfy { $0.item.leftAlone == .beyondTheHelper })
+        #expect(paths(group("com.gone.app")?.items.map(\.url) ?? []) == paths([served, own]))
+        #expect(group("com.gone.solo") == nil)
+        #expect(paths(group("com.gone.coin")?.items.map(\.url) ?? []) == paths([coin]))
+        #expect(paths(group("com.gone.busy")?.items.map(\.url) ?? []) == paths([busy]))
+        #expect(group("com.gone.busy")?.confidence.reasons == [.running("Busy")])
+    }
+
+    /// What the walk saw inside may exist nowhere else. A folder with a wallet, a signing key, or a repository
+    /// in it says so and is moved only when chosen by hand: Select All and `peel orphans --remove` pass it by.
+    @Test func aFolderWithAWalletOrARepositoryInsideIsChosenOnlyByHand() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.gone.coin/wallet.dat")
+        try directory.file("home/Library/Application Support/com.gone.code/work/.git/HEAD")
+        try directory.file("home/Library/Application Support/com.gone.cache/cache.db")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+        func item(_ name: String) throws -> OrphanItem {
+            try #require(items.first { $0.url.lastPathComponent == name })
+        }
+
+        #expect(try item("com.gone.coin").heldBack == .holdsAWallet)
+        #expect(try item("com.gone.code").heldBack == .holdsRepository)
+        #expect(try item("com.gone.cache").heldBack == nil)
+        #expect(items.allSatisfy { $0.leftAlone == nil })
+    }
+
+    /// A folder macOS would not open is not known to be empty either.
+    @Test func aFolderMacOSWouldNotOpenIsChosenOnlyByHand() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.gone.app/blob")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let scanner = OrphanScanner(environment: environment, isRegisteredApp: { _ in false }) { _ in
+            FolderContents(size: 0, holdsRepository: false, couldNotBeRead: true)
+        }
+
+        let item = try #require(await scanner.scan(installedApps: installed).groups.first?.items.first)
+
+        #expect(item.heldBack == .couldNotBeRead)
+        #expect(item.leftAlone == nil)
+        #expect(item.size == nil)
+    }
+
+    @Test(.permissionsHold) func leavesAloneAFolderItCannotSearchForAnExclusion() async throws {
+        let directory = try TemporaryDirectory()
+        let place = "root/Library/Application Support/com.gone.app"
+        try directory.file(place + "/kept/org.example.excluded/state.db")
+        try directory.setPermissions(0, of: place + "/kept")
+        try directory.setPermissions(0o555, of: place)
+        defer {
+            try? directory.setPermissions(0o755, of: place)
+            try? directory.setPermissions(0o755, of: place + "/kept")
+        }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let scanner = OrphanScanner(
+            environment: environment, exclusions: Exclusions(bundleIdentifiers: ["org.example.excluded"]),
+            isRegisteredApp: { _ in false }
+        )
+
+        let item = try #require(await scanner.scan(installedApps: installed).groups.first?.items.first)
+
+        #expect(item.requiresPrivileges)
+        #expect(item.heldBack == .couldNotLookInside)
+    }
+
+    @Test func leavesOutAFolderHoldingAnExcludedApp() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.gone.app/kept/org.example.excluded/state.db")
+        try directory.file("home/Library/Application Support/com.gone.other/state.db")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let scanner = OrphanScanner(
+            environment: environment, exclusions: Exclusions(bundleIdentifiers: ["org.example.excluded"]),
+            isRegisteredApp: { _ in false }
+        )
+
+        let items = await scanner.scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.map(\.url.lastPathComponent) == ["com.gone.other"])
+    }
+
+    /// A reason that keeps a folder where it is outranks what the walk saw, which only leaves it to be chosen.
+    @Test func whatKeepsAFolderInPlaceOutranksWhatTheWalkSaw() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.gone.photos/Main.photoslibrary/database/Photos.sqlite")
+        try directory.file("home/Library/Application Support/com.gone.photos/.git/HEAD")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.map(\.leftAlone) == [.holdsALibrary])
+    }
+
+    /// An agent writes to a log two folders down, while the folder's own date is from the day of the install.
+    @Test func readsTheNewestWriteInsideAFolderNotTheFoldersOwnDate() async throws {
+        let directory = try TemporaryDirectory()
+        let log = try directory.file("home/Library/Application Support/com.gone.app/logs/agent.log")
+        let written = try #require(
+            try log.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        )
+        let folder = log.deletingLastPathComponent().deletingLastPathComponent()
+        let lastYear = Date(timeIntervalSinceNow: -400 * 24 * 60 * 60)
+        for old in [log.deletingLastPathComponent(), folder] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: lastYear],
+                ofItemAtPath: old.path(percentEncoded: false)
+            )
+        }
+
+        let group = try #require(await scanner(in: directory).scan(installedApps: installed).groups.first)
+
+        #expect(group.confidence.level == .unsure)
+        #expect(abs(try #require(group.lastModified).timeIntervalSince(written)) < 1)
+    }
+
+    /// An installed app may not claim a group container from its old team, but the app has not left, so the
+    /// container is not attributed to it as a leftover.
+    @Test func anAppThatIsStillInstalledIsNotTheOneThatLeft() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Group Containers/OLDTEAM123.com.installed.app/data.db")
+        let remembered = [
+            RememberedApp(bundleIdentifier: "com.installed.app", name: "Installed", teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/Installed.app"),
+        ]
+
+        let group = try #require(
+            await scanner(in: directory).scan(installedApps: installed, remembered: remembered).groups.first
+        )
+
+        #expect(group.rememberedApp == nil)
+        #expect(group.confidence.level != .certain)
+    }
+
+    /// A group the person said belongs to an installed app is not listed while that app is installed. Once the app
+    /// is gone, the files are orphaned again.
+    @Test func aGroupThePersonGaveToAnInstalledAppIsNotListed() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/org.example.helper/state.db")
+        try directory.file("home/Library/Caches/org.example.other/cache.db")
+        let scanner = scanner(in: directory)
+
+        let given = await scanner.scan(installedApps: installed, owners: ["org.example.helper": .app("com.installed.app")])
+        #expect(given.groups.map(\.identifier) == ["org.example.other"])
+
+        let ownerGone = await scanner.scan(installedApps: installed, owners: ["org.example.helper": .app("org.example.gone")])
+        #expect(Set(ownerGone.groups.map(\.identifier)) == ["org.example.helper", "org.example.other"])
+    }
+
+    @Test func aGroupGivenToAnInstalledAppStaysOutWithEveryIdentifierInIt() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Preferences/org.example.helper.plist")
+        try directory.file("home/Library/Caches/org.example.helper.ShipIt/update.zip")
+        try directory.file("home/Library/Group Containers/ABCDE12345.org.example.helper/data.db")
+        let scanner = scanner(in: directory)
+
+        let listed = await scanner.scan(installedApps: installed)
+        #expect(listed.groups.map(\.identifier) == ["org.example.helper"])
+        #expect(listed.groups.first?.items.count == 3)
+
+        let given = await scanner.scan(installedApps: installed, owners: ["org.example.helper": .app("com.installed.app")])
+        #expect(given.groups.isEmpty)
+    }
+
+    @Test func listsWhatAGoneAppNamedWithAnIdentifierOfAnyShape() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Preferences/example.notes.plist")
+        try directory.file("home/Library/Caches/exampleco.browser.app/cache.db")
+        try directory.file("home/Library/Caches/example.other/cache.db")
+        let gone = [("example.notes", "Notes Example"), ("exampleco.browser.app", "Browser Example")].map {
+            RememberedApp(
+                bundleIdentifier: $0.0, name: $0.1, teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/\($0.1).app"
+            )
+        }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: gone)
+
+        #expect(Set(scan.groups.map(\.identifier)) == ["example.notes", "exampleco.browser.app"])
+    }
+
+    @Test func remembersWhichAppAGroupBelongsToUntilToldOtherwise() throws {
+        let directory = try TemporaryDirectory()
+        let owners = OrphanOwners(url: directory.url.appending(path: "orphan-owners.json"))
+        #expect(owners.load() == [:])
+
+        #expect(owners.give("org.example.Helper", to: .app("com.installed.app")) == .saved)
+        #expect(owners.give("org.example.other", to: .formula("exampletool")) == .saved)
+        #expect(
+            owners.load() == ["org.example.helper": .app("com.installed.app"), "org.example.other": .formula("exampletool")]
+        )
+
+        #expect(owners.take(["org.example.helper"]) == .saved)
+        #expect(owners.load() == ["org.example.other": .formula("exampletool")])
+    }
+
+    @Test func aListOfOwnersIsReadWithoutWritingAndADamagedOneIsStartedOver() throws {
+        let directory = try TemporaryDirectory()
+        let folder = directory.url.appending(path: "Peel", directoryHint: .isDirectory)
+        let owners = OrphanOwners(url: folder.appending(path: "orphan-owners.json"))
+
+        #expect(owners.load() == [:])
+        #expect(folder.isMissing, "a read made Peel's folder")
+
+        try directory.file("Peel/orphan-owners.json", bytes: 16)
+        #expect(owners.load() == nil, "a list that can't be read read as no choices")
+        #expect(owners.whyUnreadable() == .damaged)
+        #expect(owners.give("org.example.helper", to: .app("com.installed.app")) == .notSaved(.damaged))
+        #expect(owners.startOver() == .started)
+        #expect(owners.load() == [:])
+        #expect(owners.whyUnreadable() == nil)
+        #expect(owners.startOver() == .notNeeded)
+        #expect(owners.give("org.example.helper", to: .app("com.installed.app")) == .saved)
+    }
+
+    @Test(.permissionsHold) func saysWhyWhatBelongsToAnAppCouldNotBeSaved() throws {
+        let directory = try TemporaryDirectory()
+        let folder = try directory.directory("Peel")
+        try directory.setPermissions(0o500, of: folder)
+        defer { try? directory.setPermissions(0o755, of: folder) }
+
+        let refusedWrite = SystemError(domain: NSCocoaErrorDomain, code: NSFileWriteNoPermissionError)
+        let owners = OrphanOwners(url: folder.appending(path: "orphan-owners.json"))
+        #expect(owners.give("org.example.helper", to: .app("com.installed.app")) == .notSaved(.failed(refusedWrite)))
+    }
+
+    /// An app installed since the scan owns what the list still calls orphaned.
+    @Test func whatAnAppInstalledSinceClaimsIsNoLongerOrphaned() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Preferences/com.back.again.plist")
+        try directory.file("home/Library/Application Support/com.back.again/data.db")
+        try directory.file("home/Library/Caches/com.gone.app/cache.db")
+        let scanner = scanner(in: directory)
+        let listed = await scanner.scan(installedApps: installed).groups.flatMap(\.items)
+        #expect(listed.count == 3)
+
+        let back = InstalledApp(url: URL(filePath: "/Applications/Back.app"), bundleIdentifier: "com.back.again", name: "Back")
+        let still = await scanner.stillOrphaned(listed, installedApps: installed + [back], remembered: [])
+
+        #expect(still.map(\.url.lastPathComponent) == ["com.gone.app"])
+    }
+
+    @Test func findsWhatAnAppThatLeftKeptUnderItsNameAndSelectsNone() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/Figma/index.db", bytes: 50_000)
+        try directory.file("home/Library/Logs/Figma/main.log")
+        try directory.file("home/Library/Application Support/Figma/settings.json")
+        try directory.file("home/Library/Preferences/Figma.plist")
+        try directory.file("home/Library/Caches/Installed/cache.db")
+        try directory.file("home/Library/Caches/Sketchbook/cache.db")
+        let figma = RememberedApp(
+            bundleIdentifier: "com.figma.Desktop", name: "Figma", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-90 * 24 * 60 * 60), lastPath: "/Applications/org.example.Figma.app"
+        )
+        let scanner = scanner(in: directory)
+
+        let groups = await scanner.scan(installedApps: installed, remembered: [figma]).groups
+
+        #expect(groups.map(\.identifier) == ["com.figma.Desktop"])
+        let group = try #require(groups.first)
+        #expect(Set(group.items.map { "\($0.kind.rawValue)/\($0.url.lastPathComponent)" }) == [
+            "caches/Figma", "logs/Figma", "applicationSupport/Figma",
+        ])
+        #expect(group.items.allSatisfy { $0.heldBack == .namedLikeTheApp && $0.namedAfter == "com.figma.Desktop" })
+        #expect(group.confidence == OrphanConfidence(level: .unsure, reasons: [.onlyTheName(of: "Figma")]))
+
+        #expect(await scanner.stillOrphaned(group.items, installedApps: installed, remembered: [figma]).count == 3)
+        let back = InstalledApp(url: URL(filePath: "/Applications/Figma.app"), bundleIdentifier: "com.figma.Desktop2", name: "Figma")
+        let afterwards = await scanner.stillOrphaned(
+            group.items, installedApps: installed + [back], remembered: [figma]
+        )
+        #expect(afterwards.isEmpty)
+    }
+
+    @Test func findsAGoneAppsNameWrittenAnotherWayAndAtTheTopOfTheLibrary() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/tide-pool/extensions/index.json")
+        try directory.file("home/Library/Tide Pool/settings.json")
+        try directory.file("home/.tidepool/config.yaml")
+        try directory.file("home/Library/Fonts/Tide.ttf")
+        let tidePool = RememberedApp(
+            bundleIdentifier: "org.example.tidepool", name: "Tide Pool", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-90 * 24 * 60 * 60), lastPath: "/Applications/org.example.TidePool.app"
+        )
+        let fonts = RememberedApp(
+            bundleIdentifier: "org.example.fonts", name: "Fonts", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-90 * 24 * 60 * 60), lastPath: "/Applications/org.example.Fonts.app"
+        )
+        let scanner = scanner(in: directory)
+
+        let groups = await scanner.scan(installedApps: installed, remembered: [tidePool, fonts]).groups
+
+        #expect(groups.map(\.identifier) == ["org.example.tidepool"])
+        let items = try #require(groups.first).items
+        #expect(Set(items.map { "\($0.kind.rawValue)/\($0.url.lastPathComponent)" }) == [
+            "applicationSupport/tide-pool", "library/Tide Pool",
+        ])
+        #expect(items.allSatisfy { $0.heldBack == .namedLikeTheApp && $0.namedAfter == "org.example.tidepool" })
+        #expect(await scanner.stillOrphaned(items, installedApps: installed, remembered: [tidePool]).count == 2)
+    }
+
+    @Test func learnsAGoneAppsNameFromTheIdentifiersItLeft() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/org.example.tidewater/cache.db")
+        try directory.file("home/Library/Preferences/org.example.tidewater.plist")
+        try directory.file("home/Library/Application Support/Tidewater/library.db")
+        try directory.file("home/Library/Tidewater/settings.json")
+        try directory.file("home/.tidewater/state")
+        let scanner = scanner(in: directory)
+
+        let groups = await scanner.scan(installedApps: installed).groups
+
+        #expect(groups.map(\.identifier) == ["org.example.tidewater"])
+        let items = try #require(groups.first).items
+        let named = items.filter { $0.namedAfter != nil }
+        #expect(named.map { "\($0.kind.rawValue)/\($0.url.lastPathComponent)" } == ["applicationSupport/Tidewater"])
+        #expect(named.allSatisfy { $0.heldBack == .namedLikeTheApp && $0.namedAfter == "org.example.tidewater" })
+        #expect(items.count == 3)
+        #expect(await scanner.stillOrphaned(named, installedApps: installed, remembered: []).count == 1)
+        let tidewater = InstalledApp(
+            url: URL(filePath: "/Applications/Tidewater.app"), bundleIdentifier: "net.other.tidewater", name: "Tidewater"
+        )
+        #expect(await scanner.stillOrphaned(named, installedApps: installed + [tidewater], remembered: []).isEmpty)
+        #expect(await scanner.scan(installedApps: installed + [tidewater]).groups.flatMap(\.items)
+            .allSatisfy { $0.namedAfter == nil })
+    }
+
+    @Test func learnsNoMakersNameNoNameTwoIdentifiersGiveAndNoGenericName() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/regid.1986-12.org.vendorco/cache.db")
+        try directory.file("home/Library/Caches/org.vendorco.editor/cache.db")
+        try directory.file("home/Library/Application Support/VendorCo/shared.db")
+        try directory.file("home/Library/Caches/org.alpha.studio/cache.db")
+        try directory.file("home/Library/Caches/org.beta.studio/cache.db")
+        try directory.file("home/Library/Application Support/Studio/projects.db")
+        try directory.file("home/Library/Caches/org.example.updater/cache.db")
+        try directory.file("home/Library/Application Support/Updater/state.json")
+        try directory.file("home/Library/Caches/org.example.reader.ProfileManager/cache.db")
+        try directory.file("home/Library/Logs/ProfileManager/main.log")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.allSatisfy { $0.namedAfter == nil }, "\(items.filter { $0.namedAfter != nil }.map(\.url))")
+    }
+
+    @Test func aFolderAnInstalledAppsNameHoldsAsWholeWordsIsNoOrphan() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/Atlas/cache.db")
+        try directory.file("home/Library/Application Support/Atlas/settings.json")
+        let atlas = RememberedApp(
+            bundleIdentifier: "org.example.atlas", name: "Atlas", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-90 * 24 * 60 * 60), lastPath: "/Applications/org.example.Atlas.app"
+        )
+        let launcher = InstalledApp(
+            url: URL(filePath: "/Applications/Atlas Games Launcher.app"), bundleIdentifier: "net.other.launcher",
+            name: "Atlas Games Launcher"
+        )
+        let scanner = scanner(in: directory)
+
+        let alone = await scanner.scan(installedApps: installed, remembered: [atlas]).groups
+        #expect(alone.map(\.identifier) == ["org.example.atlas"])
+        #expect(await scanner.scan(installedApps: installed + [launcher], remembered: [atlas]).groups.isEmpty)
+        let listed = try #require(alone.first).items
+        #expect(await scanner.stillOrphaned(listed, installedApps: installed + [launcher], remembered: [atlas]).isEmpty)
+    }
+
+    @Test func anAppUnderAToolsDefaultIdentifierKeepsNoOtherAppsOrphanBack() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/com.electron.gone/cache.db")
+        let alpha = InstalledApp(
+            url: URL(filePath: "/Applications/Alpha.app"), bundleIdentifier: "com.electron.alpha", name: "Alpha"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed + [alpha])
+
+        #expect(scan.groups.map(\.identifier) == ["com.electron.gone"])
+    }
+
+    @Test func anotherAppsWordsLeaveWhatAGoneAppNamedByItsIdentifierListed() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/.atlas/argv.json")
+        let info = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>org.example.atlas</string></dict></plist>
+        """
+        try directory.file(
+            "root/Library/Audio/Plug-Ins/Components/Atlas.component/Contents/Info.plist", contents: Data(info.utf8)
+        )
+        let atlas = RememberedApp(
+            bundleIdentifier: "org.example.atlas", name: "Atlas", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Atlas.app",
+            productFolders: ProductFolders.vsCodeFolders(in: ["dataFolderName": ".atlas"])
+        )
+        let launcher = InstalledApp(
+            url: URL(filePath: "/Applications/Atlas Games Launcher.app"), bundleIdentifier: "net.other.launcher",
+            name: "Atlas Games Launcher"
+        )
+
+        let scanner = scanner(in: directory)
+
+        for apps in [installed, installed + [launcher]] {
+            let scan = await scanner.scan(installedApps: apps, remembered: [atlas])
+            #expect(Set(scan.groups.flatMap(\.items).map(\.url.lastPathComponent)) == [".atlas", "Atlas.component"])
+        }
+    }
+
+    /// The settings a Safari web app leaves are named by its own identifier, which begins with `com.apple.`. Once
+    /// the web app is gone they are orphans, while an installed web app keeps its own and Safari keeps Safari's.
+    /// Launch Services is this Mac's own, which knows Safari's web app template, `com.apple.Safari.WebApp`.
+    @Test func findsTheSettingsASafariWebAppThatLeftKept() async throws {
+        let directory = try TemporaryDirectory()
+        let gone = "com.apple.Safari.WebApp.0E4F6A2C-1B3D-4E5F-8A9B-0C1D2E3F4A5B"
+        let kept = "com.apple.Safari.WebApp.1A2B3C4D-0000-4000-8000-000000000000"
+        try directory.file("home/Library/Preferences/\(gone).plist", bytes: 4096)
+        try directory.file("home/Library/Preferences/\(kept).plist")
+        try directory.file("home/Library/Preferences/com.apple.Safari.plist")
+        let wiki = RememberedApp(
+            bundleIdentifier: gone, name: "Wiki", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-24 * 60 * 60), lastPath: "/Users/x/Applications/Wiki.app"
+        )
+        let news = InstalledApp(
+            url: URL(filePath: "/Users/x/Applications/News Site.app"), bundleIdentifier: kept, name: "News Site",
+            webApp: .safari
+        )
+
+        let scanner = OrphanScanner(environment: SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        ))
+
+        let groups = await scanner.scan(installedApps: installed + [news], remembered: [wiki]).groups
+
+        #expect(groups.map(\.identifier) == [gone])
+        #expect(groups.first?.items.map(\.url.lastPathComponent) == ["\(gone).plist"])
+    }
+
+    @Test func reportsOnlyUnclaimedAppItems() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Preferences/com.gone.app.plist")
+        try directory.file("home/Library/Caches/com.gone.app/cache.db", bytes: 50_000)
+        try directory.directory("home/Library/Caches/com.gone.app.helper")
+        try directory.file("root/Library/LaunchAgents/com.gone.app.updater.plist")
+        try directory.directory("home/Library/Group Containers/ABCDE12345.shared")
+        try directory.directory("home/Library/Group Containers/ABCDE12345.com.gone.app")
+        try directory.directory("home/Library/Containers/com.installed.app")
+        try directory.directory("home/Library/Caches/com.installed.app.ShipIt")
+        try directory.directory("home/Library/Group Containers/UBF8T346G9.Office")
+        try directory.file("home/Library/Preferences/com.microsoft.autoupdate2.plist")
+        try directory.directory("home/Library/Caches/com.apple.Safari")
+        try directory.file("root/Library/Preferences/org.cups.printers.plist")
+        try directory.directory("home/Library/Application Support/SomeFolder")
+        try directory.directory("home/Library/Caches/com.elsewhere.tool")
+        try directory.directory("home/Library/Caches/com.elsewhere.tool.helper")
+
+        let scan = await scanner(in: directory, registered: ["com.elsewhere.tool"]).scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["com.gone.app", "ABCDE12345.shared"])
+        let gone = try #require(scan.groups.first)
+        #expect(Set(gone.items.map(\.url.lastPathComponent)) == [
+            "com.gone.app.plist", "com.gone.app", "com.gone.app.helper", "com.gone.app.updater.plist", "ABCDE12345.com.gone.app",
+        ])
+        #expect(gone.items.first?.url.lastPathComponent == "com.gone.app")
+        #expect(gone.total.isComplete)
+        #expect(gone.total.known >= 50_000)
+        #expect(gone.lastModified != nil)
+        #expect(scan.unreadableLocations.isEmpty)
+    }
+
+    @Test func findsTheFolderAWebKitProcessKeptForAnAppThatLeft() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("var/C/com.apple.WebKit.Networking+com.gone.app")
+        try directory.directory("var/C/com.apple.WebKit.GPU+com.installed.app")
+        try directory.directory("var/C/com.apple.WebKit.WebContent+com.apple.Safari")
+        let scanner = OrphanScanner(
+            environment: SearchEnvironment(
+                homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+                rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory),
+                userCacheDirectory: directory.url.appending(path: "var/C", directoryHint: .isDirectory)
+            ),
+            isRegisteredApp: { _ in false },
+            systemApps: []
+        )
+
+        let scan = await scanner.scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["com.gone.app"])
+        #expect(scan.groups.first?.items.map(\.url.lastPathComponent) == ["com.apple.WebKit.Networking+com.gone.app"])
+    }
+
+    @Test func findsAFolderAnAppThatLeftHidWithADotBeforeItsIdentifier() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Application Support/.com.gone.app.backups")
+        try directory.directory("home/Library/Application Support/.com.installed.app.backups")
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["com.gone.app.backups"])
+        #expect(scan.groups.first?.items.map(\.url.lastPathComponent) == [".com.gone.app.backups"])
+    }
+
+    /// A location closed by ordinary permissions is reported, but Full Disk Access would not open it, so the scan
+    /// does not ask for it.
+    @Test(.permissionsHold) func aLocationClosedByPermissionsDoesNotAskForFullDiskAccess() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Logs/com.gone.app")
+        try directory.setPermissions(0, of: "home/Library/Logs")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/Logs") }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.unreadableLocations.map(\.kind) == [.logs])
+        #expect(!scan.needsFullDiskAccess)
+    }
+
+    /// With the app gone, what it kept in `Data/Documents` may be the only copy of what its user made.
+    @Test func anOrphanedContainerThatHoldsDocumentsSaysSo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Containers/com.gone.notes/Data/Documents/novel.txt")
+        try directory.file("home/Library/Containers/com.gone.cache/Data/Library/Caches/cache.db")
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+        let items = scan.groups.flatMap(\.items)
+
+        #expect(items.first { $0.url.lastPathComponent == "com.gone.notes" }?.leftAlone == .holdsDocuments)
+        #expect(items.first { $0.url.lastPathComponent == "com.gone.cache" }?.leftAlone == nil)
+    }
+
+    /// The same for a library kept by an app that is gone: `RemovalGuard` refuses the folder around it.
+    @Test func anOrphanedFolderThatHoldsALibrarySaysSo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.gone.photos/Main.photoslibrary/database/Photos.sqlite")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.first?.leftAlone == .holdsALibrary)
+    }
+
+    @Test func anOrphanedCacheThatKeepsAnEditorsLocalHistorySaysSo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/org.example.editor/LocalHistory/changes.storageData")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.map(\.leftAlone) == [.holdsWorkKeptInACache])
+    }
+
+    /// An app that is gone can leave its wallet behind in its container, and `RemovalGuard` refuses the
+    /// container around it.
+    @Test func anOrphanedFolderThatHoldsAProtectedWalletSaysSo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Containers/io.bluewallet.bluewallet/Data/Library/Caches/keyvalue.realm")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.first?.leftAlone == .holdsKeys)
+    }
+
+    /// A browser that is gone can leave its profile behind, and a wallet extension's vault in it.
+    @Test func anOrphanedBrowserFolderHoldingAWalletIsLeftAlone() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/com.operasoftware.Opera/Local Extension Settings/\(WalletIDs.metaMask)/000003.log")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.map(\.leftAlone) == [.holdsKeys])
+    }
+
+    /// The apps macOS ships claim their folders like any other app, and none of them is in the list Peel scans.
+    @Test func ignoresGroupsDeclaredBySystemApps() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Group Containers/group.net.example.shared")
+        let systemApp = InstalledApp(
+            url: URL(filePath: "/System/Applications/Example.app"),
+            bundleIdentifier: "org.example.system",
+            name: "Example",
+            applicationGroups: ["group.net.example.shared"]
+        )
+
+        #expect(await scanner(in: directory, systemApps: [systemApp]).scan(installedApps: installed).groups.isEmpty)
+        #expect(await !scanner(in: directory).scan(installedApps: installed).groups.isEmpty, "with no rival it is nobody's")
+    }
+
+    @Test(arguments: [
+        ("S8EX82NJP6.org.example.Sample5", "org.example.Sample5"),
+        ("6H4HRTU5E3.group.org.example.osx", "org.example.osx"),
+        ("group.is.workflow.my.app", "is.workflow.my.app"),
+        ("ABCDE12345.shared", "ABCDE12345.shared"),
+    ])
+    func groupsTeamContainersWithTheirApp(identifier: String, expected: String) {
+        #expect(OrphanScanner.groupingKey(for: identifier) == expected)
+    }
+
+    @Test(arguments: [
+        ("com.example.app", SearchLocation.Kind.caches, "com.example.app"),
+        ("group.com.example.shared", .groupContainers, "com.example.shared"),
+        ("ABCDE12345.shared", .groupContainers, "ABCDE12345.shared"),
+        ("ABCDE12345.shared", .caches, nil),
+        ("com.apple.Safari", .caches, nil),
+        ("group.com.apple.notes", .groupContainers, nil),
+        ("243LU875E5.groups.com.apple.podcasts", .groupContainers, nil),
+        ("homebrew.mxcl.postgresql", .launchAgents, nil),
+        ("Spotify", .applicationSupport, nil),
+        ("com.example", .caches, nil),
+        ("Com.Example.App", .caches, nil),
+        ("maccatalyst.org.example.notes", .containers, "maccatalyst.org.example.notes"),
+        ("maccatalyst.org.example", .caches, nil),
+        ("maccatalyst.com.apple.news", .containers, nil),
+        ("tomcat.8080.10018690101673077448", .temporaryItems, nil),
+        ("tomcat.8080.10018690101673077448", .caches, nil),
+        ("com.sublimetext.4", .caches, "com.sublimetext.4"),
+        ("xyz.960960.koodo", .caches, "xyz.960960.koodo"),
+    ] as [(String, SearchLocation.Kind, String?)])
+    func identifiesAppShapedNames(key: String, kind: SearchLocation.Kind, expected: String?) {
+        #expect(OrphanScanner.orphanIdentifier(forKey: key, kind: kind) == expected)
+    }
+
+    @Test func leavesTheFoldersSpringBootsServersMakeInTheTemporaryFolderAlone() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("var/T/tomcat.8080.10018690101673077448/work/Tomcat/localhost/ROOT/SESSIONS.ser")
+        try directory.file("var/T/tomcat.8080.10054962961815905490/work/Tomcat/localhost/ROOT/SESSIONS.ser")
+        try directory.file("var/T/com.gone.app/cache.db")
+
+        let scan = await scannerOfTheTemporaryFolder(in: directory)
+            .scan(installedApps: installed, remembered: [goneApp])
+
+        #expect(scan.groups.map(\.identifier) == ["com.gone.app"])
+    }
+
+    @Test func listsInTheTemporaryFolderOnlyWhatCameWithAnAppPeelSawGo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("var/T/tool.registry.545355")
+        try directory.file("var/T/com.unseen.app/cache.db")
+        try directory.file("var/T/com.gone.app/cache.db")
+        try directory.file("var/T/com.gone.app.helper/state.db")
+
+        let scan = await scannerOfTheTemporaryFolder(in: directory)
+            .scan(installedApps: installed, remembered: [goneApp])
+
+        #expect(scan.groups.map(\.identifier) == ["com.gone.app"])
+        #expect(
+            Set(scan.groups.flatMap(\.items).map(\.url.lastPathComponent)) == ["com.gone.app", "com.gone.app.helper"]
+        )
+    }
+
+    private let goneApp = RememberedApp(
+        bundleIdentifier: "com.gone.app", name: "Gone", teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/Gone.app"
+    )
+
+    private func scannerOfTheTemporaryFolder(in directory: borrowing TemporaryDirectory) -> OrphanScanner {
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            userTemporaryDirectory: directory.url.appending(path: "var/T", directoryHint: .isDirectory)
+        )
+        return OrphanScanner(environment: environment, isRegisteredApp: { _ in false }, systemApps: [])
+    }
+
+    @Test func findsWhatAMacCatalystBuildLeft() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Containers/maccatalyst.org.example.notes/Data/Library/Caches/cache.db")
+        try directory.file("home/Library/Preferences/maccatalyst.org.example.notes.plist")
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["maccatalyst.org.example.notes"])
+        #expect(scan.groups.first?.items.count == 2)
+    }
+    /// A crash reporter keeps a folder per app inside its own. The folder is named after the reporter, which
+    /// nothing installed answers to, but what is inside belongs to an app that is still here.
+    @Test func leavesAloneAFolderHoldingAnInstalledAppsFiles() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/com.plausiblelabs.crashreporter.data/com.installed.app/report.plist")
+        try directory.file("home/Library/Caches/com.otherreporter.data/com.gone.app/report.plist")
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["com.otherreporter.data"])
+    }
+
+    private func job(_ label: String, runs arguments: [String]) throws -> Data {
+        try PropertyListSerialization.data(fromPropertyList: ["Label": label, "ProgramArguments": arguments], format: .xml, options: 0)
+    }
+
+    /// A job that Nix, MacPorts, or Tailscale installed belongs to no app bundle, and its file is as old as the
+    /// install. It is still not a leftover while the program it runs is there.
+    @Test func aJobThatStillHasSomethingToRunIsNobodysLeftover() async throws {
+        let directory = try TemporaryDirectory()
+        let daemon = try directory.file("root/nix/bin/nix-daemon").path(percentEncoded: false)
+        let gone = directory.url.appending(path: "root/opt/gone/bin/helper").path(percentEncoded: false)
+        try directory.file("root/Library/LaunchDaemons/org.nixos.nix-daemon.plist", contents: job("org.nixos.nix-daemon", runs: [daemon]))
+        try directory.file("home/Library/LaunchAgents/org.example.sync.plist", contents: job("org.example.sync", runs: ["sh", "-c", "exit 0"]))
+        try directory.file("root/Library/LaunchDaemons/com.gone.app.helper.plist", contents: job("com.gone.app.helper", runs: [gone]))
+        // A plist kept in a dotfiles repository and linked into place is read through the link.
+        try FileManager.default.createSymbolicLink(
+            at: directory.url.appending(path: "home/Library/LaunchAgents/org.example.linked.plist"),
+            withDestinationURL: try directory.file("home/dotfiles/linked.plist", contents: job("org.example.linked", runs: [daemon]))
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.flatMap(\.items).map(\.url.lastPathComponent) == ["com.gone.app.helper.plist"])
+    }
+
+    /// A file that cannot be read is not called a leftover on its name; one that is no job at all still is.
+    @Test(.permissionsHold) func aJobThatCannotBeReadIsNotCalledALeftover() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/org.example.closed.plist", contents: job("org.example.closed", runs: ["/bin/sh"]))
+        try directory.setPermissions(0o000, of: "home/Library/LaunchAgents/org.example.closed.plist")
+        try directory.file("home/Library/LaunchAgents/org.example.empty.plist", contents: Data())
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.flatMap(\.items).map(\.url.lastPathComponent) == ["org.example.empty.plist"])
+    }
+
+    @Test func aFileNamedForAJobThatStillRunsIsThatJobs() async throws {
+        let directory = try TemporaryDirectory()
+        let host = try directory.file("root/Library/PrivilegedHelperTools/Remote Host.app/Contents/MacOS/host")
+        let gone = directory.url.appending(path: "root/opt/gone/bin/agent").path(percentEncoded: false)
+        try directory.file("root/Library/PrivilegedHelperTools/org.example.remote.json")
+        try directory.file("root/Library/PrivilegedHelperTools/org.example.remote.settings.json")
+        try directory.file("root/Library/LaunchAgents/org.example.gone.plist", contents: job("org.example.gone", runs: [gone]))
+        try directory.file("root/Library/PrivilegedHelperTools/org.example.gone.json")
+        let scanner = scanner(in: directory)
+        let before = await scanner.scan(installedApps: installed).groups.flatMap(\.items)
+        try directory.file(
+            "root/Library/LaunchAgents/org.example.remote.plist",
+            contents: job("org.example.remote", runs: [host.path(percentEncoded: false)])
+        )
+
+        let scan = await scanner.scan(installedApps: installed)
+        let still = await scanner.stillOrphaned(before, installedApps: installed, remembered: [])
+
+        let gonesFiles: Set<String> = ["org.example.gone.json", "org.example.gone.plist"]
+        #expect(Set(scan.groups.flatMap(\.items).map(\.url.lastPathComponent)) == gonesFiles)
+        #expect(Set(still.map(\.url.lastPathComponent)) == gonesFiles)
+    }
+
+    /// A plug-in is named for what it does, so it is listed under the identifier it declares inside, and only when
+    /// Peel saw the app it came with go: its identifier is that app's, extends it, or is its maker's. One an installer
+    /// put there on its own, with no app, is no orphan however old it is, and neither is one an installed app claims.
+    @Test func listsAPlugInOnlyWhenItsAppLeft() async throws {
+        let directory = try TemporaryDirectory()
+        let info = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>%@</string></dict></plist>
+        """
+        let plugIns = [
+            "root/Library/Audio/Plug-Ins/VST3/Gone.vst3": "com.gonevendor.gone",
+            "root/Library/Audio/Plug-Ins/Components/Gone Reverb.component": "com.gonevendor.reverb",
+            "root/Library/Audio/Plug-Ins/Components/Standalone.component": "com.independent.synth",
+            "root/Library/QuickLook/Still Here.qlgenerator": "com.installed.app.quicklook",
+        ]
+        for (path, identifier) in plugIns {
+            try directory.file("\(path)/Contents/Info.plist", contents: Data(info.replacingOccurrences(of: "%@", with: identifier).utf8))
+        }
+        let gone = RememberedApp(
+            bundleIdentifier: "com.gonevendor.gone", name: "Gone", teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/Gone.app"
+        )
+
+        let scan = await scanner(in: directory, registered: ["com.installed.app"]).scan(installedApps: installed, remembered: [gone])
+
+        #expect(Set(scan.groups.map(\.identifier)) == ["com.gonevendor.gone", "com.gonevendor.reverb"])
+        #expect(Set(scan.groups.flatMap(\.items).map(\.url.lastPathComponent)) == ["Gone.vst3", "Gone Reverb.component"])
+    }
+
+    @Test func listsAGoneAppsCameraPlugIn() async throws {
+        let directory = try TemporaryDirectory()
+        let info = #"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.gonevendor.gone.camera</string></dict></plist>"#
+        try directory.file("root/Library/CoreMediaIO/Plug-Ins/DAL/Gone Camera.plugin/Contents/Info.plist", contents: Data(info.utf8))
+        try directory.file("root/Library/CoreMediaIO/Plug-Ins/DAL/plugins-info.txt")
+        let gone = RememberedApp(
+            bundleIdentifier: "com.gonevendor.gone", name: "Gone", teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/Gone.app"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: [gone])
+
+        let items = scan.groups.flatMap(\.items)
+        #expect(items.map(\.url.lastPathComponent) == ["Gone Camera.plugin"])
+        #expect(items.first?.heldBack == nil)
+    }
+
+    @Test func aGoneAppsAudioPlugInMakesItsGroupUnsure() async throws {
+        let directory = try TemporaryDirectory()
+        let info = #"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.gonevendor.gone.vst3</string></dict></plist>"#
+        try directory.file("home/Library/Audio/Plug-Ins/VST3/Gone.vst3/Contents/Info.plist", contents: Data(info.utf8))
+        let gone = RememberedApp(
+            bundleIdentifier: "com.gonevendor.gone", name: "Gone", teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/Gone.app"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: [gone])
+
+        let group = try #require(scan.groups.first { $0.items.contains { $0.url.lastPathComponent == "Gone.vst3" } })
+        #expect(group.items.map(\.heldBack) == [.loadedByOtherApps])
+        #expect(group.confidence.level == .unsure)
+        #expect(group.confidence.reasons == [.loadedByOtherApps])
+    }
+
+    @Test func listsAGoneAppsSignInPlugInAndNeverOffersIt() async throws {
+        let directory = try TemporaryDirectory()
+        let info = #"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.gonevendor.AuthorizationPlugin</string></dict></plist>"#
+        try directory.file(
+            "root/Library/Security/SecurityAgentPlugins/GoneAuthPlugin.bundle/Contents/Info.plist",
+            contents: Data(info.utf8)
+        )
+        let gone = RememberedApp(
+            bundleIdentifier: "com.gonevendor.gone", name: "Gone", teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/Gone.app"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: [gone])
+
+        let item = try #require(scan.groups.flatMap(\.items).first { $0.url.lastPathComponent == "GoneAuthPlugin.bundle" })
+        #expect(item.heldBack == .signInPlugIn)
+        #expect(item.leftAlone == .signInPlugIn)
+    }
+
+    @Test func showsWhatAnAppThatLeftKeptWhileAnotherOfItsMakerStays() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Caches/org.example.solo.nightly/cache.db")
+        try directory.file("home/Library/Application Support/org.example.gonetool/data.db")
+        try directory.file("home/Library/Caches/org.example.solo.helper/cache.db")
+        let solo = InstalledApp(url: URL(filePath: "/Applications/Solo.app"), bundleIdentifier: "org.example.solo", name: "Solo")
+        let gone = ["org.example.solo.nightly", "org.example.gonetool"].map {
+            RememberedApp(bundleIdentifier: $0, name: $0, teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/\($0).app")
+        }
+
+        let scan = await scanner(in: directory, registered: ["org.example.solo"]).scan(installedApps: [solo], remembered: gone)
+
+        #expect(Set(scan.groups.map(\.identifier)) == ["org.example.solo.nightly", "org.example.gonetool"])
+    }
+
+    @Test func listsAMailBundleOfAnAppThatLeft() async throws {
+        let directory = try TemporaryDirectory()
+        let info = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>org.example.mailer.bundle</string></dict></plist>
+        """
+        try directory.file("home/Library/Mail/Bundles/Mailer.mailbundle/Contents/Info.plist", contents: Data(info.utf8))
+        try directory.file("home/Library/Caches/org.example.mailer/blob")
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.mailer", name: "Mailer", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Mailer.app"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: [gone])
+
+        #expect(Set(scan.groups.flatMap(\.items).map(\.url.lastPathComponent)) == ["Mailer.mailbundle", "org.example.mailer"])
+    }
+
+    /// Below the top of a place a dotted name is often a lock or a backup, so only what came with a gone app counts.
+    @Test func findsWhatAnAppThatLeftKeptInsideSomebodyElsesFolder() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Library/Application Support/Example Software/org.example.mixer/settings.json")
+        try directory.file("home/Library/Application Support/Browser/NativeMessagingHosts/org.example.mixer.host.json")
+        try directory.file("root/Users/Shared/Library/Application Support/org.example.mixer/presets.db")
+        try directory.file("home/Library/Application Support/Example Editor/state.json.lock")
+        try directory.file("home/.config/example/config.bak.2026-09-06")
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.mixer", name: "Mixer", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Mixer.app"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: [gone])
+
+        #expect(scan.groups.map(\.identifier) == ["org.example.mixer"])
+        let items = scan.groups.flatMap(\.items)
+        let temporary = directory.url.path(percentEncoded: false)
+        let found = items.map { $0.url.path(percentEncoded: false).replacingOccurrences(of: temporary, with: "") }
+        #expect(Set(found) == [
+            "root/Library/Application Support/Example Software/org.example.mixer",
+            "home/Library/Application Support/Browser/NativeMessagingHosts/org.example.mixer.host.json",
+            "root/Users/Shared/Library/Application Support/org.example.mixer",
+        ])
+        #expect(items.first { $0.kind == .sharedFolder }?.heldBack == .sharedWithEveryone)
+    }
+
+    @Test func dataKeptOnlyOnThisMacOfAnAppThatLeftSaysSo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/Viscosity/OpenVPN/1/config.conf")
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.viscosity", name: "Viscosity", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Viscosity.app"
+        )
+
+        let items = await scanner(in: directory).scan(installedApps: installed, remembered: [gone]).groups
+            .flatMap(\.items)
+
+        #expect(items.map(\.url.lastPathComponent) == ["Viscosity"])
+        #expect(items.map(\.heldBack) == [.holdsVPNConnections])
+    }
+
+    @Test func aVPNsIdentityInTheMacsLibraryOfAnAppThatLeftSaysSo() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Library/Application Support/ZeroTier/One/identity.secret")
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.zerotier", name: "ZeroTier", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/ZeroTier.app"
+        )
+
+        let items = await scanner(in: directory).scan(installedApps: installed, remembered: [gone]).groups
+            .flatMap(\.items)
+
+        #expect(items.map(\.url.lastPathComponent) == ["ZeroTier"])
+        #expect(items.map(\.heldBack) == [.holdsVPNConnections])
+    }
+
+    /// As on an app's page, since the app's developer may still ask for the report.
+    @Test func aCrashReportOfAnAppThatLeftIsLeftForThePersonToChoose() async throws {
+        let directory = try TemporaryDirectory()
+        let report = """
+        {"app_name":"Mixer","bug_type":"309","bundleID":"org.example.mixer","name":"Mixer","incident_id":"1"}
+        {"procName":"Mixer","exception":{"type":"EXC_CRASH"}}
+        """
+        try directory.file("home/Library/Logs/DiagnosticReports/Mixer-2026-09-01-101010.ips", contents: Data(report.utf8))
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.mixer", name: "Mixer", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Mixer.app"
+        )
+
+        let items = await scanner(in: directory).scan(installedApps: installed, remembered: [gone]).groups
+            .flatMap(\.items)
+
+        #expect(items.map(\.url.lastPathComponent) == ["Mixer-2026-09-01-101010.ips"])
+        #expect(items.map(\.heldBack) == [.crashReport])
+    }
+
+    /// macOS names a diagnostic report for the process and the time, and a `.diag` names no bundle, so its name is
+    /// never read as an app's identifier, even when the process is named like one by a maker whose app Peel saw go.
+    @Test func aDiagnosticReportIsNoAppsOrphan() async throws {
+        let directory = try TemporaryDirectory()
+        let name = "org.example.updater_2026-09-29-214451_MacBook-Air.diag"
+        try directory.file("root/Library/Logs/DiagnosticReports/\(name)", bytes: 12_000)
+        try directory.file("home/Library/Logs/DiagnosticReports/\(name)", bytes: 12_000)
+        try directory.file("home/Library/Logs/DiagnosticReports/Retired/\(name)", bytes: 12_000)
+        let gone = RememberedApp(
+            bundleIdentifier: "org.example.browser", name: "Browser", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Browser.app"
+        )
+
+        let groups = await scanner(in: directory).scan(installedApps: installed, remembered: [gone]).groups
+
+        #expect(groups.isEmpty)
+    }
+
+    @Test(.permissionsHold) func saysWhichFolderInsideAPlaceItCouldNotRead() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/Example Software/org.example.mixer/settings.json")
+        try directory.setPermissions(0, of: "home/Library/Application Support/Example Software")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/Application Support/Example Software") }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.unreadableLocations.map(\.url.lastPathComponent) == ["Example Software"])
+        #expect(scan.unreadableLocations.map(\.kind) == [.applicationSupport])
+        #expect(!scan.needsFullDiskAccess)
+    }
+
+    @Test(.permissionsHold) func saysNothingOfAFolderOfMacOSsOwnItCouldNotRead() async throws {
+        let directory = try TemporaryDirectory()
+        let folders = ["ApplePushService", "Example Software"]
+        try directory.file("root/Library/Application Support/ApplePushService/aps.db")
+        try directory.file("root/Library/Application Support/Example Software/org.example.mixer/settings.json")
+        for folder in folders {
+            try directory.setPermissions(0, of: "root/Library/Application Support/\(folder)")
+        }
+        defer {
+            for folder in folders {
+                try? directory.setPermissions(0o755, of: "root/Library/Application Support/\(folder)")
+            }
+        }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.unreadableLocations.map(\.url.lastPathComponent) == ["Example Software"])
+    }
+
+    @Test(.permissionsHold) func saysNothingOfAFolderOfMacOSsOwnAtTheTopOfALibrary() async throws {
+        let directory = try TemporaryDirectory()
+        let folders = ["Bluetooth", "OSAnalytics", "Trial", "Example Software"]
+        try directory.file("root/Library/Bluetooth/Library/Preferences/com.apple.Bluetooth.plist")
+        try directory.file("root/Library/OSAnalytics/Diagnostics/report.ips")
+        try directory.file("root/Library/Trial/Treatments/state")
+        try directory.file("root/Library/Example Software/org.example.mixer/settings.json")
+        for folder in folders {
+            try directory.setPermissions(0, of: "root/Library/\(folder)")
+        }
+        defer {
+            for folder in folders {
+                try? directory.setPermissions(0o755, of: "root/Library/\(folder)")
+            }
+        }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.unreadableLocations.map(\.url.lastPathComponent) == ["Example Software"])
+    }
+
+    @Test func saysWhereItStoppedLookingInsideFolders() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/Vendor One/notes.txt")
+        try directory.file("home/Library/Application Support/Vendor Two/notes.txt")
+
+        let cut = await scanner(in: directory, nestedFolderLimit: 1).scan(installedApps: installed)
+        let whole = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(cut.cutShortLocations.map(\.kind) == [.applicationSupport])
+        #expect(whole.cutShortLocations.isEmpty)
+    }
+
+    @Test func marksAPreferenceFileThatIsNoPropertyList() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Preferences/org.example.gone.plist", contents: Data("<plist".utf8))
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        #expect(items.map(\.holdsDamagedSettings) == [true])
+    }
+
+    /// An app Peel no longer lists has left only when the place it was can be looked at and it is not there. One on
+    /// a disk that is not connected, or still in a folder Peel stopped looking in, is still installed, and its
+    /// files are not orphaned.
+    @Test func anAppThatIsOnlyOutOfSightHasNotLeft() async throws {
+        let directory = try TemporaryDirectory()
+        let info = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>org.example-tools.app</string></dict></plist>
+        """
+        let tools = try directory.file("Tools/Tools.app/Contents/Info.plist", contents: Data(info.utf8))
+            .deletingLastPathComponent().deletingLastPathComponent()
+        for identifier in ["org.example-studio.app", "org.example-tools.app", "org.example-gone.app"] {
+            try directory.file("home/Library/Caches/\(identifier)/cache.db")
+        }
+        let remembered = [
+            ("org.example-studio.app", "/Volumes/org.example.NotConnected/Apps/Studio.app"),
+            ("org.example-tools.app", tools.path(percentEncoded: false)),
+            ("org.example-gone.app", "/Applications/org.example.Gone.app"),
+        ].map { RememberedApp(bundleIdentifier: $0, name: "App", teamIdentifier: nil, lastSeen: .now, lastPath: $1) }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: remembered)
+
+        #expect(scan.groups.map(\.identifier) == ["org.example-gone.app"])
+    }
+
+    @Test func notesTheAppsMacOSKnowsOnAnotherDiskThatClaimFiles() async throws {
+        let directory = try TemporaryDirectory()
+        let info = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>org.example.extern</string>
+        <key>CFBundleName</key><string>Extern</string></dict></plist>
+        """
+        let extern = try directory.file("Disk/Applications/Extern.app/Contents/Info.plist", contents: Data(info.utf8))
+            .deletingLastPathComponent().deletingLastPathComponent()
+        try directory.file("home/Library/Preferences/org.example.extern.plist")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let scan = { (onAnotherDisk: Bool) in
+            await OrphanScanner(
+                environment: environment,
+                isRegisteredApp: { $0 == "org.example.extern" },
+                systemApps: [],
+                knownPlaces: { $0 == "org.example.extern" ? [extern] : [] },
+                isOnAnotherDisk: { _ in onAnotherDisk }
+            ).scan(installedApps: installed)
+        }
+
+        let elsewhere = await scan(true)
+        let here = await scan(false)
+
+        #expect(elsewhere.groups.isEmpty)
+        #expect(elsewhere.appsOnOtherDisks.map(\.bundleIdentifier) == ["org.example.extern"])
+        #expect(here.appsOnOtherDisks.isEmpty)
+    }
+
+    @Test(.permissionsHold) func anAppInAPlacePeelCannotReadHasNotLeft() async throws {
+        let directory = try TemporaryDirectory()
+        var remembered: [RememberedApp] = []
+        for name in ["Closed", "Sealed"] {
+            let identifier = "org.example-\(name.lowercased()).app"
+            let info = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>\(identifier)</string></dict></plist>
+            """
+            let app = try directory.file("\(name)/\(name).app/Contents/Info.plist", contents: Data(info.utf8))
+                .deletingLastPathComponent().deletingLastPathComponent()
+            try directory.file("home/Library/Caches/\(identifier)/cache.db")
+            remembered.append(RememberedApp(
+                bundleIdentifier: identifier,
+                name: name,
+                teamIdentifier: nil,
+                lastSeen: .now,
+                lastPath: app.path(percentEncoded: false)
+            ))
+        }
+        try directory.file("home/Library/Caches/org.example-gone.app/cache.db")
+        remembered.append(RememberedApp(
+            bundleIdentifier: "org.example-gone.app",
+            name: "Gone",
+            teamIdentifier: nil,
+            lastSeen: .now,
+            lastPath: try directory.directory("Open").appending(path: "Gone.app").path(percentEncoded: false)
+        ))
+        try directory.setPermissions(0o000, of: "Closed")
+        try directory.setPermissions(0o000, of: "Sealed/Sealed.app/Contents/Info.plist")
+        defer {
+            try? directory.setPermissions(0o755, of: "Closed")
+            try? directory.setPermissions(0o644, of: "Sealed/Sealed.app/Contents/Info.plist")
+        }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: remembered)
+
+        #expect(scan.groups.map(\.identifier) == ["org.example-gone.app"])
+    }
+
+    /// What an item declares about itself is asked of the installed apps as its name is: a maker's plug-in, named for
+    /// what it does, and a container named by a UUID for an extension an installed app embeds are that app's.
+    @Test func anItemsDeclaredIdentifierIsAskedOfTheInstalledApps() async throws {
+        let directory = try TemporaryDirectory()
+        let plugIn = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.vendor.effectx.au</string></dict></plist>
+        """
+        let container = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict><key>MCMMetadataIdentifier</key><string>com.vendor.helperext</string></dict></plist>
+        """
+        try directory.file("root/Library/Audio/Plug-Ins/Components/Effect X.component/Contents/Info.plist", contents: Data(plugIn.utf8))
+        try directory.file(
+            "home/Library/Containers/5F1D2C3B-8A9E-4B7C-9D0E-1F2A3B4C5D6E/.com.apple.containermanagerd.metadata.plist",
+            contents: Data(container.utf8)
+        )
+        let hub = InstalledApp(
+            url: URL(filePath: "/Applications/Hub.app"), bundleIdentifier: "com.vendor.hub", name: "Hub",
+            embeddedBundleIdentifiers: ["com.vendor.helperext"]
+        )
+        let old = RememberedApp(bundleIdentifier: "com.vendor.old", name: "Old", teamIdentifier: nil, lastSeen: .now, lastPath: "/Applications/Old.app")
+
+        let scan = await scanner(in: directory).scan(installedApps: installed + [hub], remembered: [old])
+
+        #expect(scan.groups.map(\.identifier) == [])
+    }
+
+    /// `/Users/Shared` belongs to every account on the Mac, and another account's apps are not known here, so what
+    /// is found there is listed but left for the user to choose, as an uninstall leaves it.
+    @Test func whatIsInTheSharedFolderIsHeldBack() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("root/Users/Shared/com.gone.app/library.db")
+        try directory.file("home/Library/Caches/com.gone.app/cache.db")
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+
+        let heldBack = items.map { "\($0.kind): \($0.heldBack.map(\.rawValue) ?? "none")" }.sorted()
+        #expect(heldBack == ["caches: none", "sharedFolder: sharedWithEveryone"])
+    }
+
+    @Test func aMakersInstallerFolderStaysWhileAnotherAppOfTheMakerIsInstalled() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/org.example-maker.installer/state.db")
+        let editor = InstalledApp(
+            url: URL(filePath: "/Applications/Editor.app"), bundleIdentifier: "org.example-maker.editor", name: "Editor"
+        )
+
+        let withTheMaker = await scanner(in: directory).scan(installedApps: installed + [editor])
+        let withoutIt = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(withTheMaker.groups.isEmpty)
+        #expect(withoutIt.groups.map(\.identifier) == ["org.example-maker.installer"])
+    }
+
+    @Test func whatCarriesOnAnInstalledAppsTwoPartIdentifierIsNoOrphan() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Preferences/org.example.ShipIt.plist")
+        let quill = InstalledApp(
+            url: URL(filePath: "/Applications/Quillnote.app"), bundleIdentifier: "org.example", name: "Quillnote"
+        )
+
+        #expect(await scanner(in: directory).scan(installedApps: installed + [quill]).groups.isEmpty)
+        #expect(await scanner(in: directory).scan(installedApps: installed).groups.map(\.identifier) == ["org.example.ShipIt"])
+    }
+
+    /// A group container is there for a maker's apps to share, so another app of that maker claims it as it claims
+    /// the maker's other files, with `group.` in front of the name or not.
+    @Test func anotherAppOfTheMakerClaimsItsGroupContainer() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Group Containers/group.com.vendor.notes")
+        try directory.directory("home/Library/Containers/com.vendor.notes")
+        let mail = InstalledApp(url: URL(filePath: "/Applications/Mail Pro.app"), bundleIdentifier: "com.vendor.mail", name: "Mail Pro")
+
+        #expect(await scanner(in: directory).scan(installedApps: installed + [mail]).groups.isEmpty)
+        #expect(await scanner(in: directory).scan(installedApps: installed).groups.map(\.identifier) == ["com.vendor.notes"])
+    }
+
+    /// A link an app was put in an Applications folder through leads nowhere once the app is gone, and is listed
+    /// under that app. One to an app on a disk that isn't connected, which may come back, is not.
+    @Test func listsALinkInAnApplicationsFolderToAnAppThatIsGone() async throws {
+        let directory = try TemporaryDirectory()
+        let applications = try directory.directory("home/Applications")
+        try FileManager.default.createSymbolicLink(
+            atPath: applications.appending(path: "Gone.app").path(percentEncoded: false),
+            withDestinationPath: directory.url.appending(path: "root/Elsewhere/Gone.app").path(percentEncoded: false)
+        )
+        try FileManager.default.createSymbolicLink(
+            atPath: applications.appending(path: "Away.app").path(percentEncoded: false),
+            withDestinationPath: "/Volumes/Peel Test Disk Not Connected/Away.app"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+        let gone = try #require(scan.groups.first { $0.identifier == "Gone" }, "\(scan.groups.map(\.identifier))")
+
+        #expect(gone.items.map(\.url.lastPathComponent) == ["Gone.app"])
+        #expect(gone.items.allSatisfy { $0.kind == .applicationLinks })
+        #expect(gone.confidence.reasons == [.leadsIntoAnAppThatIsGone])
+        #expect(!scan.groups.contains { $0.items.contains { $0.url.lastPathComponent == "Away.app" } })
+    }
+
+    /// A link to a tool inside an app that is gone leads nowhere, and an app's uninstaller can leave such links
+    /// behind. A tool's name says nothing about its app, so the group is named after the app the link led into,
+    /// or given that app's identifier when Peel remembers it.
+    @Test func listsLinksIntoAnAppThatIsGone() async throws {
+        let directory = try TemporaryDirectory()
+        let root = directory.url.appending(path: "root", directoryHint: .isDirectory)
+        let bin = try directory.directory("root/usr/local/bin")
+        try directory.file("root/Applications/Here.app/Contents/MacOS/here")
+        try directory.file("home/Library/Application Support/com.remembered.app/state.db")
+        func link(_ name: String, to destination: String) throws {
+            try FileManager.default.createSymbolicLink(
+                atPath: bin.appending(path: name).path(percentEncoded: false),
+                withDestinationPath: destination
+            )
+        }
+        try link("docker", to: root.appending(path: "Applications/Gone.app/Contents/MacOS/xbin/docker").path(percentEncoded: false))
+        try link("orb", to: "../../../Applications/Gone.app/Contents/MacOS/bin/orb")
+        try link("here", to: root.appending(path: "Applications/Here.app/Contents/MacOS/here").path(percentEncoded: false))
+        try link("node", to: root.appending(path: "opt/node/bin/node").path(percentEncoded: false))
+        try link("rem", to: root.appending(path: "Applications/Remembered.app/Contents/MacOS/rem").path(percentEncoded: false))
+        let remembered = [
+            RememberedApp(
+                bundleIdentifier: "com.remembered.app",
+                name: "Remembered",
+                teamIdentifier: nil,
+                lastSeen: .now,
+                lastPath: root.appending(path: "Applications/Remembered.app").path(percentEncoded: false)
+            )
+        ]
+
+        let scan = await scanner(in: directory).scan(installedApps: installed, remembered: remembered)
+        let groups = Dictionary(uniqueKeysWithValues: scan.groups.map { ($0.identifier, $0) })
+
+        #expect(Set(groups.keys) == ["Gone", "com.remembered.app"])
+        let gone = try #require(groups["Gone"])
+        #expect(Set(gone.items.map(\.url.lastPathComponent)) == ["docker", "orb"])
+        #expect(gone.items.allSatisfy { $0.kind == .commandLineTools })
+        #expect(gone.confidence.level == .certain)
+        #expect(gone.confidence.reasons == [.leadsIntoAnAppThatIsGone])
+        #expect(Set(try #require(groups["com.remembered.app"]).items.map(\.url.lastPathComponent)) == ["rem", "com.remembered.app"])
+    }
+
+    @Test func listsLinksIntoAnAppThatIsGoneInEveryFolderCommandsRunFrom() async throws {
+        let directory = try TemporaryDirectory()
+        let tool = directory.url.appending(path: "root/Applications/Gone.app/Contents/MacOS/gone").path(percentEncoded: false)
+        for folder in ["root/opt/local/sbin", "home/bin", "home/.local/bin"] {
+            try FileManager.default.createSymbolicLink(
+                atPath: try directory.directory(folder).appending(path: "gone").path(percentEncoded: false),
+                withDestinationPath: tool
+            )
+        }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["Gone"])
+        #expect(scan.groups.first?.items.count == 3)
+    }
+
+    @Test func listsALinkThatLeadsIntoAnAppThatIsGoneThroughAnother() async throws {
+        let directory = try TemporaryDirectory()
+        let homebrew = try directory.directory("root/opt/homebrew/bin")
+        let bin = try directory.directory("root/usr/local/bin")
+        try FileManager.default.createSymbolicLink(
+            at: homebrew.appending(path: "gone"),
+            withDestinationURL: directory.url.appending(path: "root/Applications/Gone.app/Contents/MacOS/gone")
+        )
+        try FileManager.default.createSymbolicLink(
+            at: bin.appending(path: "gone"), withDestinationURL: homebrew.appending(path: "gone")
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.map(\.identifier) == ["Gone"])
+        #expect(scan.groups.first?.items.count == 2)
+    }
+
+    @Test func namesAnItemByTheNameOfAGoneAppWrittenInTwoIdeograms() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/抖音/state.db")
+        let douyin = RememberedApp(
+            bundleIdentifier: "org.example.douyin", name: "抖音", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-90 * 24 * 60 * 60), lastPath: "/Applications/抖音.app"
+        )
+
+        let groups = await scanner(in: directory).scan(installedApps: installed, remembered: [douyin]).groups
+
+        #expect(groups.map(\.identifier) == ["org.example.douyin"])
+    }
+
+    @Test func leavesAToolsFolderTheDeveloperPageKnowsToIt() async throws {
+        let directory = try TemporaryDirectory()
+        let old = Date(timeIntervalSinceNow: -2 * 365 * 24 * 60 * 60)
+        for path in [
+            "home/Library/Caches/org.carthage.CarthageKit/dependencies/x.zip",
+            "home/Library/Caches/com.vercel.cli/cache.json",
+            "home/Library/Caches/com.panic.Nova/cache.db",
+            "home/Library/Caches/org.R-project.R/R/renv/cache/v5/x.tar",
+            "home/Library/Caches/org.example.gone/data.db",
+        ] {
+            let file = try directory.file(path)
+            try FileManager.default.setAttributes(
+                [.modificationDate: old], ofItemAtPath: file.path(percentEncoded: false)
+            )
+        }
+        let nova = RememberedApp(
+            bundleIdentifier: "com.panic.Nova", name: "Nova", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-90 * 24 * 60 * 60), lastPath: "/Applications/Nova.app"
+        )
+
+        let alone = await scanner(in: directory).scan(installedApps: installed).groups.map(\.identifier)
+        let afterNova = await scanner(in: directory).scan(installedApps: installed, remembered: [nova]).groups
+            .map(\.identifier)
+
+        #expect(Set(alone) == ["org.R-project.R", "org.example.gone"])
+        #expect(Set(afterNova) == ["com.panic.Nova", "org.R-project.R", "org.example.gone"])
+    }
+
+    @Test func aLinkIntoAnAppOnADiskThatIsNotConnectedIsNotListed() async throws {
+        let directory = try TemporaryDirectory()
+        let bin = try directory.directory("root/opt/homebrew/bin")
+        let disk = "/Volumes/org.example.NotConnected-\(UUID().uuidString)"
+        try FileManager.default.createSymbolicLink(
+            atPath: bin.appending(path: "extern").path(percentEncoded: false),
+            withDestinationPath: "\(disk)/Applications/Extern.app/Contents/MacOS/extern"
+        )
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.isEmpty)
+    }
+
+    @Test(.permissionsHold) func aLinkIntoAnAppInAPlacePeelCannotLookIsNotListed() async throws {
+        let directory = try TemporaryDirectory()
+        let bin = try directory.directory("root/usr/local/bin")
+        let tool = try directory.file("Closed/Closed.app/Contents/MacOS/closed")
+        try FileManager.default.createSymbolicLink(
+            atPath: bin.appending(path: "closed").path(percentEncoded: false),
+            withDestinationPath: tool.path(percentEncoded: false)
+        )
+        try directory.setPermissions(0o000, of: "Closed")
+        defer { try? directory.setPermissions(0o755, of: "Closed") }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.groups.isEmpty)
+    }
+
+    /// A shell completion an app's installer linked into zsh's folder leads nowhere once the app is gone, and zsh
+    /// then complains in every new shell. It is listed as a tool's link is.
+    @Test func listsAShellCompletionThatLeadsIntoAnAppThatIsGone() async throws {
+        let directory = try TemporaryDirectory()
+        let folder = try directory.directory("root/usr/local/share/zsh/site-functions")
+        try FileManager.default.createSymbolicLink(
+            atPath: folder.appending(path: "_gone").path(percentEncoded: false),
+            withDestinationPath: directory.url.appending(path: "root/Applications/Gone.app/Contents/Resources/_gone")
+                .path(percentEncoded: false)
+        )
+
+        let groups = await scanner(in: directory).scan(installedApps: installed).groups
+
+        let gone = try #require(groups.first { $0.identifier == "Gone" })
+        #expect(gone.items.map(\.url.lastPathComponent) == ["_gone"])
+        #expect(gone.items.allSatisfy { $0.kind == .shellCompletions })
+        #expect(gone.confidence.reasons == [.leadsIntoAnAppThatIsGone])
+    }
+
+    /// In root's `/usr/local/bin`, a link into an app that is gone leads nowhere, which is the one kind of item the
+    /// helper takes from there, so it is offered like anything else the helper can move.
+    @Test(.permissionsHold) func aLinkIntoAnAppThatIsGoneIsWithinTheHelpersReach() async throws {
+        let directory = try TemporaryDirectory()
+        let bin = try directory.directory("root/usr/local/bin")
+        let link = bin.appending(path: "docker")
+        try FileManager.default.createSymbolicLink(atPath: link.path(percentEncoded: false), withDestinationPath: "../../../Applications/Gone.app/Contents/MacOS/docker")
+        try directory.setPermissions(0o555, of: bin)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: bin.path(percentEncoded: false)
+            )
+        }
+
+        let items = await scanner(in: directory).scan(installedApps: installed).groups.flatMap(\.items)
+        let item = try #require(items.first { $0.url.lastPathComponent == "docker" })
+        #expect(item.requiresPrivileges)
+        #expect(item.leftAlone == nil, "left alone: \(String(describing: item.leftAlone))")
+    }
+
+    /// A socket or a pipe holds nothing, and a live one belongs to something running. A name such as JetBrains
+    /// Toolbox's `jb.station.<user>.sock` reads as reverse DNS, so the item's type is checked before its name.
+    @Test func aSocketOrAPipeIsNobodysLeftover() async throws {
+        let directory = try TemporaryDirectory()
+        // A socket's path has to fit in 104 bytes, and the test folder's does not.
+        let temporary = URL(filePath: "/private/tmp/peel-\(UUID().uuidString.prefix(8))", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: temporary.appending(path: "com.gone.app"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+
+        let listening = socket(AF_UNIX, SOCK_STREAM, 0)
+        defer { close(listening) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &address.sun_path) { path in
+            path.copyBytes(from: temporary.appending(path: "jb.station.someone.sock").path(percentEncoded: false).utf8.prefix(path.count - 1))
+        }
+        let bound = withUnsafePointer(to: address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(listening, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        try #require(bound == 0)
+        try #require(mkfifo(temporary.appending(path: "com.gone.pipe").path(percentEncoded: false), 0o600) == 0)
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory),
+            userTemporaryDirectory: temporary
+        )
+
+        let scan = await OrphanScanner(environment: environment, isRegisteredApp: { _ in false }, systemApps: [])
+            .scan(installedApps: installed, remembered: [goneApp])
+
+        #expect(scan.groups.flatMap(\.items).map(\.url.lastPathComponent) == ["com.gone.app"])
+    }
+
+    @Test func neverNamesAFolderMacOSKeepsAfterAnAppThatLeft() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Application Support/Knowledge/knowledgeC.db")
+        try directory.file("home/Library/Caches/Knowledge/cache.db")
+        let knowledge = RememberedApp(
+            bundleIdentifier: "org.example.knowledge", name: "Knowledge", teamIdentifier: nil,
+            lastSeen: .now.addingTimeInterval(-90 * 24 * 60 * 60), lastPath: "/Applications/Knowledge.app"
+        )
+
+        let groups = await scanner(in: directory).scan(installedApps: installed, remembered: [knowledge]).groups
+
+        #expect(groups.flatMap(\.items).map { "\($0.kind.rawValue)/\($0.url.lastPathComponent)" } == ["caches/Knowledge"])
+    }
+
+    @Test(.permissionsHold) func saysNothingOfALogFolderOfMacOSsOwnItCouldNotRead() async throws {
+        let directory = try TemporaryDirectory()
+        let folders = ["Assistant", "Knowledge"]
+        for folder in folders {
+            try directory.file("home/Library/Logs/\(folder)/org.example.mixer/mixer.log")
+            try directory.setPermissions(0, of: "home/Library/Logs/\(folder)")
+        }
+        defer {
+            for folder in folders {
+                try? directory.setPermissions(0o755, of: "home/Library/Logs/\(folder)")
+            }
+        }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.unreadableLocations.map(\.url.lastPathComponent) == ["Knowledge"])
+    }
+
+    @Test(.permissionsHold) func saysNothingOfWhatIsInsideAFolderOfMacOSsOwnItCouldNotRead() async throws {
+        let directory = try TemporaryDirectory()
+        let account = "home/Library/Caches/Desktop Pictures/00000000-0000-4000-8000-000000000001"
+        try directory.file("\(account)/state")
+        try directory.setPermissions(0, of: account)
+        defer { try? directory.setPermissions(0o755, of: account) }
+
+        let scan = await scanner(in: directory).scan(installedApps: installed)
+
+        #expect(scan.unreadableLocations.isEmpty)
+    }
+}

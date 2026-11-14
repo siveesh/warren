@@ -1,0 +1,395 @@
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Testing
+
+struct PluginsTests {
+    @Test func aStoppedScanStops() async throws {
+        let directory = try TemporaryDirectory()
+        for index in 1...30 {
+            try directory.directory("home/Library/Audio/Plug-Ins/VST3/Plug-in \(index).vst3/Contents")
+        }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let unanswered = Unanswered()
+
+        let stop = try await unanswered.stop {
+            _ = await Plugins.scan(environment: environment, exclusions: .none, measure: unanswered.measure)
+        }
+
+        #expect(stop.took < Unanswered.returnsForTheCancel)
+        #expect(stop.askedBefore < 30)
+        #expect(stop.askedAfter == 0)
+    }
+
+    @Test(.permissionsHold) func readsAFolderOfPlugInsThatIsALinkAndNamesOneItCannotRead() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("Elsewhere/VST3/Reverb.vst3/Contents")
+        try directory.directory("home/Library/Audio/Plug-Ins")
+        try FileManager.default.createSymbolicLink(
+            at: directory.url.appending(path: "home/Library/Audio/Plug-Ins/VST3"),
+            withDestinationURL: directory.url.appending(path: "Elsewhere/VST3")
+        )
+        let closed = try directory.directory("root/Library/Audio/Plug-Ins/Components/Vendor")
+        try directory.directory("root/Library/Audio/Plug-Ins/Components/Vendor/Synth.component")
+        try directory.setPermissions(0o000, of: closed)
+        defer { try? directory.setPermissions(0o755, of: closed) }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let scan = await Plugins.scan(environment: environment)
+
+        #expect(scan.plugins.map(\.name) == ["Reverb"])
+        #expect(scan.unreadable.map(\.lastPathComponent) == ["Vendor"])
+    }
+
+    @Test(.permissionsHold) func knowsAPlugInHistoryCouldNotPutBack() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("root/Library/Audio/Plug-Ins/Components/Synth.component/Contents")
+        try directory.directory("home/Library/Audio/Plug-Ins/Components/Own.component/Contents")
+        let components = directory.url.appending(path: "root/Library/Audio/Plug-Ins/Components", directoryHint: .isDirectory)
+        try directory.setPermissions(0o555, of: components)
+        defer { try? directory.setPermissions(0o755, of: components) }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(plugins.first { $0.name == "Synth" }?.staysInTheTrash == true)
+        #expect(plugins.first { $0.name == "Own" }?.staysInTheTrash == false)
+    }
+
+    @Test(.permissionsHold) func knowsAPlugInHistoryCouldNotPutBackInAFolderOfApplicationSupport() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("root/Library/Application Support/Avid/Audio/Plug-Ins/Synth.aaxplugin/Contents")
+        let folder = directory.url.appending(
+            path: "root/Library/Application Support/Avid/Audio/Plug-Ins", directoryHint: .isDirectory
+        )
+        try directory.setPermissions(0o555, of: folder)
+        defer { try? directory.setPermissions(0o755, of: folder) }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(plugins.first { $0.name == "Synth" }?.staysInTheTrash == true)
+    }
+
+    @Test func knowsThePlugInsNothingLoadsAnymore() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/QuickLook/Markdown.qlgenerator/Contents")
+        try directory.directory("home/Library/QuickLook/Preview.appex/Contents")
+        try directory.directory("root/Library/Internet Plug-Ins/Flash Player.plugin/Contents")
+        try directory.directory("root/Library/Internet Plug-Ins/Viewer.webplugin/Contents")
+        try Data("WBPL????".utf8).write(to: directory.file("root/Library/Internet Plug-Ins/Reader.plugin/Contents/PkgInfo"))
+        try directory.directory("home/Library/Audio/Plug-Ins/Components/Echo.component/Contents")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+        let noLongerLoaded = Dictionary(uniqueKeysWithValues: plugins.map { ($0.name, $0.noLongerLoaded) })
+
+        #expect(noLongerLoaded == [
+            "Markdown": .quickLookGenerator, "Preview": nil, "Flash Player": .internetPlugIn, "Viewer": nil,
+            "Reader": nil, "Echo": nil,
+        ])
+    }
+
+    @Test func knowsNothingLoadsAContextualMenuItem() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Contextual Menu Items/Old Menu.plugin/Contents")
+        try directory.directory("root/Library/Contextual Menu Items/Vendor Menu.plugin/Contents")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(plugins.map(\.name) == ["Old Menu", "Vendor Menu"])
+        #expect(plugins.allSatisfy { $0.noLongerLoaded == .contextualMenuItem })
+    }
+
+    @Test func saysWhichAppAPlugInCameWith() {
+        let surge = InstalledApp(
+            url: URL(filePath: "/Applications/Surge XT.app"), bundleIdentifier: "org.example.surgext", name: "Surge XT"
+        )
+        let compressor = InstalledApp(
+            url: URL(filePath: "/Applications/Compressor.app"), bundleIdentifier: "org.example.compressor",
+            name: "Compressor"
+        )
+        let gone = RememberedApp(
+            bundleIdentifier: "com.gonevendor.gone", name: "Gone", teamIdentifier: nil, lastSeen: .now,
+            lastPath: "/Applications/Gone.app"
+        )
+        func origin(_ name: String, _ identifier: String?) -> Plugin.Origin? {
+            Plugins.origin(
+                of: URL(filePath: "/Library/Audio/Plug-Ins/Components/\(name)"), identifier: identifier,
+                claimants: [surge, compressor].map(Plugins.Claimant.init), goneApps: [gone]
+            )
+        }
+
+        #expect(origin("Surge XT.component", "org.example.surgext.au") == .installedApp(name: "Surge XT"))
+        #expect(origin("Compressor.component", nil) == .installedApp(name: "Compressor"))
+        #expect(origin("Compressor.component", "com.othervendor.compressor") == nil)
+        #expect(origin("Gone.component", "com.gonevendor.gone.au") == .goneApp(name: "Gone"))
+        #expect(origin("Other.component", "com.gonevendor.other") == nil, "sharing a maker says nothing of which app")
+        #expect(origin("Nobody.component", "org.nobody.thing") == nil)
+    }
+
+    @Test func namesAQuickActionAsTheServicesMenuDoes() {
+        let workflow = URL(filePath: "/org.example/Library/Services/Example - ask.workflow")
+        let menu: [String: Any] = ["NSServices": [["NSMenuItem": ["default": "Ask Example"]]]]
+
+        #expect(Plugins.name(of: workflow, info: menu) == "Ask Example")
+        #expect(Plugins.name(of: workflow, info: nil) == "Example - ask")
+        #expect(Plugins.name(of: workflow, info: ["NSServices": [["NSMenuItem": ["default": ""]]]]) == "Example - ask")
+    }
+
+    @Test func namesAPlugInAsItsLanguageDoesOrByItsFile() throws {
+        let directory = try TemporaryDirectory()
+        func bundle(_ name: String, info: [String: Any], strings: String? = nil) throws -> URL {
+            try directory.file(
+                "\(name)/Contents/Info.plist",
+                contents: PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            )
+            if let strings {
+                try directory.file("\(name)/Contents/Resources/en.lproj/InfoPlist.strings", contents: Data(strings.utf8))
+            }
+            return directory.url.appending(path: name, directoryHint: .isDirectory)
+        }
+        let unnamed = try bundle("Vendor Product.component", info: ["CFBundleName": " "])
+        let localized = try bundle(
+            "Input.app", info: ["CFBundleName": "Input"], strings: "\"CFBundleName\" = \"Kana Input\";\n"
+        )
+
+        #expect(Plugins.name(of: unnamed, info: ["CFBundleName": " "]) == "Vendor Product")
+        #expect(Plugins.name(of: localized, info: ["CFBundleName": "Input"]) == "Kana Input")
+    }
+
+    @Test func aPlugInThatStatesNoVersionShowsNone() async throws {
+        let directory = try TemporaryDirectory()
+        for (name, info) in [("Blank", ["CFBundleShortVersionString": "", "CFBundleVersion": ""]), ("Build", ["CFBundleShortVersionString": " ", "CFBundleVersion": "12"])] {
+            let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            try data.write(to: directory.file("home/Library/Audio/Plug-Ins/Components/\(name).component/Contents/Info.plist"))
+        }
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(try #require(plugins.first { $0.name == "Blank" }).version == nil)
+        #expect(try #require(plugins.first { $0.name == "Build" }).version == "12")
+    }
+
+    @Test func findsPluginBundlesInUserAndSystemLibraries() async throws {
+        let directory = try TemporaryDirectory()
+        let info = try PropertyListSerialization.data(
+            fromPropertyList: ["CFBundleName": "Reverb", "CFBundleIdentifier": "com.example.reverb", "CFBundleShortVersionString": "2.1"],
+            format: .xml,
+            options: 0
+        )
+        try info.write(to: directory.file("home/Library/Audio/Plug-Ins/Components/Reverb.component/Contents/Info.plist"))
+        try directory.directory("root/Library/Audio/Plug-Ins/HAL/Parrot.driver")
+        try directory.directory("home/Library/Services/Ask.workflow")
+        try directory.directory("home/Library/Spotlight/ExtensionsCache")
+        try directory.file("home/Library/QuickLook/readme.txt")
+
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(plugins.map(\.name) == ["Ask", "Parrot", "Reverb"])
+        let reverb = try #require(plugins.last)
+        #expect(reverb.category == .audioUnits)
+        #expect(reverb.bundleIdentifier == "com.example.reverb")
+        #expect(reverb.version == "2.1")
+        #expect(!reverb.isInstalledForAllUsers)
+        #expect(plugins.first { $0.name == "Parrot" }?.isInstalledForAllUsers == true)
+    }
+
+    /// Avid, MOTU and Apple each document a folder their plug-ins are installed in: AAX, MAS, Core Image's image
+    /// units, dictionaries, Automator's actions and Contacts' action plug-ins.
+    @Test func findsThePlugInsOfEveryFolderTheirMakersDocument() async throws {
+        let directory = try TemporaryDirectory()
+        let bundles = [
+            "root/Library/Application Support/Avid/Audio/Plug-Ins/Echo.aaxplugin",
+            "root/Library/Audio/Plug-Ins/MAS/Delay.bundle",
+            "home/Library/Graphics/Image Units/Grain.plugin",
+            "home/Library/Dictionaries/Glossary.dictionary",
+            "root/Library/Automator/Resize.action",
+            "home/Library/Address Book Plug-Ins/Dial.bundle",
+        ]
+        for bundle in bundles { try directory.directory("\(bundle)/Contents") }
+
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+        let plugins = await Plugins.scan(environment: environment).plugins
+        let found = Dictionary(uniqueKeysWithValues: plugins.map { ($0.name, $0.category) })
+
+        #expect(found == [
+            "Echo": .aax, "Delay": .mas, "Grain": .imageUnits, "Glossary": .dictionaries, "Resize": .automatorActions,
+            "Dial": .contactsPlugIns,
+        ])
+    }
+
+    @Test func findsACameraPlugInWhereMacOSLoadsThem() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("root/Library/CoreMediaIO/Plug-Ins/DAL/Lens.plugin/Contents")
+        try directory.file("root/Library/CoreMediaIO/Plug-Ins/DAL/plugins-info.txt")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(plugins.map { "\($0.name) \($0.category.rawValue)" } == ["Lens cameraPlugIns"])
+        #expect(plugins.first?.isInstalledForAllUsers == true)
+        #expect(plugins.first?.noLongerLoaded == nil)
+    }
+
+    @Test func listsTheCopyMailKeepsOfAPlugInBesideThePublicOne() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Mail/Bundles/Public.mailbundle/Contents")
+        try directory.directory("home/Library/Application Support/Mail/Plug-ins/Bundles/Copy.mailbundle/Contents")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins.filter { $0.category == .mailBundles }
+
+        #expect(Set(plugins.map(\.name)) == ["Public", "Copy"])
+        #expect(plugins.allSatisfy { $0.refusal == nil })
+        #expect(environment.locations.contains { $0.url.path(percentEncoded: false).hasSuffix("Mail/Plug-ins/Bundles/") })
+    }
+
+    @Test func offersAMailBundleInTheUsersLibrary() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Mail/Bundles/Example.mailbundle/Contents")
+        try directory.directory("home/Library/Audio/Plug-Ins/VST3/Synth.vst3/Contents")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(try #require(plugins.first { $0.category == .mailBundles }).refusal == nil)
+        #expect(try #require(plugins.first { $0.category == .vst3 }).refusal == nil)
+    }
+
+    /// Vendors keep their plug-ins in a folder of their own, and that folder's name can seem to have an
+    /// extension: `Waves 14.0` reads as extension `0`.
+    @Test func findsPluginsInsideAVendorsOwnFolder() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Audio/Plug-Ins/VST3/Waves 14.0/Reverb.vst3/Contents")
+        try directory.directory("home/Library/Audio/Plug-Ins/VST3/Company/Delay.vst3/Contents")
+        try directory.directory("home/Library/Audio/Plug-Ins/VST3/Loose.vst3/Contents")
+        try directory.file("home/Library/Audio/Plug-Ins/VST3/Company/readme.txt")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment).plugins
+
+        #expect(plugins.map(\.name) == ["Delay", "Loose", "Reverb"])
+        #expect(!plugins.contains { $0.name.hasPrefix("Waves") }, "the vendor's folder was taken for a plug-in")
+    }
+
+    @Test func aPluginThatDidNotAnswerInTimeIsNotReadAsEmpty() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/Audio/Plug-Ins/VST3/Slow.vst3/Contents/Resources/samples.bin", bytes: 400_000)
+        try directory.file("home/Library/Audio/Plug-Ins/VST3/Quick.vst3/Contents/Resources/samples.bin", bytes: 400_000)
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let plugins = await Plugins.scan(environment: environment, exclusions: .none) { url in
+            url.lastPathComponent == "Slow.vst3" ? nil : await FileSize.reclaimableSize(of: url, within: FileSize.budget)
+        }.plugins
+
+        #expect(plugins.map(\.name) == ["Quick", "Slow"])
+        #expect(try #require(plugins.first?.size) >= 400_000)
+        #expect(plugins.last?.size == nil)
+    }
+
+    /// Every folder the page reads plug-ins from in `/Library` is one the helper serves: a folder only the page
+    /// knew would list plug-ins the helper then refuses to move out of it. The two lists are kept apart because
+    /// the helper cannot see PeelCore, so this is where they meet.
+    @Test func theHelperServesEveryFolderPlugInsAreReadFrom() {
+        let served = Set(PrivilegedPathPolicy.systemLocations)
+        for (folder, _) in Plugins.folders {
+            #expect(served.contains("/Library/" + folder), "/Library/\(folder) is read and not served")
+        }
+    }
+
+    /// Apple installs components into `/Library` too, and removing one breaks macOS. Any bundle can call itself
+    /// `com.apple.…`, so Apple's code is known by its signature, not by its name.
+    @Test func tellsApplesOwnCodeFromAnAppsBySignature() throws {
+        // Finder is Apple's and is on every Mac. Its path starts with `/System`, which is Apple's by where it sits,
+        // so the signature is asked about through a link to it from a folder that is nobody's.
+        let finder = URL(filePath: "/System/Library/CoreServices/Finder.app", directoryHint: .isDirectory)
+        try #require(FileManager.default.fileExists(atPath: finder.path(percentEncoded: false)))
+        let directory = try TemporaryDirectory()
+        let link = directory.url.appending(path: "Finder.app")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: finder)
+        #expect(!AppleCode.isInASystemFolder(link.path(percentEncoded: false)))
+        #expect(AppleCode.isApples(link), "Apple's own signature wasn't recognized")
+
+        let impostor = try directory.directory("Impostor.driver/Contents")
+        try PropertyListSerialization
+            .data(fromPropertyList: ["CFBundleIdentifier": "com.apple.audio.Impostor"], format: .xml, options: 0)
+            .write(to: impostor.appending(path: "Info.plist"))
+        #expect(!AppleCode.isApples(impostor.deletingLastPathComponent()), "an Apple name was taken for an Apple signature")
+    }
+
+    /// macOS installs its own plug-ins into the same folders apps use, such as `ParrotAudioPlugin.driver` in
+    /// `/Library/Audio/Plug-Ins/HAL`. Apple's own, linked from the sealed system into the test's Library, are left
+    /// out by their signature, while a component nobody signed beside them is listed.
+    @Test func leavesApplesOwnComponentsOutOfTheList() async throws {
+        let directory = try TemporaryDirectory()
+        var linked = 0
+        for (system, folder) in [
+            ("/System/Library/Components", "Components"), ("/System/Library/Audio/Plug-Ins/HAL", "HAL"),
+        ] {
+            let library = try directory.directory("root/Library/Audio/Plug-Ins/\(folder)")
+            for name in try FileManager.default.contentsOfDirectory(atPath: system) {
+                try FileManager.default.createSymbolicLink(
+                    at: library.appending(path: name),
+                    withDestinationURL: URL(filePath: system, directoryHint: .isDirectory).appending(path: name)
+                )
+                linked += 1
+            }
+        }
+        try #require(linked > 0)
+        try directory.directory("root/Library/Audio/Plug-Ins/Components/Echo.component/Contents")
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+
+        let scan = await Plugins.scan(environment: environment)
+
+        #expect(scan.plugins.map(\.name) == ["Echo"])
+    }
+}

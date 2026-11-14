@@ -79,7 +79,7 @@ actor SystemGuard {
         home.appendingPathComponent("Documents")
     ]
 
-    private let protectedRoots: [String] = [
+    private static let protectedRoots: [String] = [
         "/System",
         "/bin",
         "/sbin",
@@ -90,20 +90,20 @@ actor SystemGuard {
         "/Library/Apple"
     ]
 
-    private lazy var sensitiveHomeRoots: [URL] = [
-        home.appendingPathComponent(".ssh"),
-        home.appendingPathComponent(".gnupg"),
-        home.appendingPathComponent(".aws"),
-        home.appendingPathComponent(".config"),
-        home.appendingPathComponent("Library/Keychains"),
-        home.appendingPathComponent("Library/Mail"),
-        home.appendingPathComponent("Library/Messages"),
-        home.appendingPathComponent("Library/Safari"),
-        home.appendingPathComponent("Library/Mobile Documents"),
-        home.appendingPathComponent("Pictures/Photos Library.photoslibrary")
+    private static let sensitiveHomeRoots: [URL] = [
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".ssh"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gnupg"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".aws"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Keychains"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mail"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Messages"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Safari"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mobile Documents"),
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Pictures/Photos Library.photoslibrary")
     ]
 
-    private let protectedDotComponents: Set<String> = [
+    private static let protectedDotComponents: Set<String> = [
         ".git",
         ".svn",
         ".hg",
@@ -112,7 +112,7 @@ actor SystemGuard {
         ".aws"
     ]
 
-    private let protectedDotFiles: Set<String> = [
+    private static let protectedDotFiles: Set<String> = [
         ".zshrc",
         ".bashrc",
         ".bash_profile",
@@ -126,11 +126,11 @@ actor SystemGuard {
 
         if purpose != .analyze,
            purpose != .developerTooling,
-           protectedRoots.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) {
+           Self.protectedRoots.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) {
             return false
         }
 
-        if hasSensitiveComponents(normalized) || isSensitiveHomePath(normalized) {
+        if Self.isSensitive(normalized) {
             return false
         }
 
@@ -318,7 +318,7 @@ actor SystemGuard {
             )
         }
 
-        guard !hasSensitiveComponents(normalized), !isSensitiveHomePath(normalized) else {
+        guard !Self.isSensitive(normalized) else {
             throw NSError(
                 domain: "SKMole.SystemGuard",
                 code: 4,
@@ -346,7 +346,22 @@ actor SystemGuard {
         }
     }
 
-    private func hasSensitiveComponents(_ url: URL) -> Bool {
+    /// Paths no Warren feature may ever touch: system roots, keychains, SSH keys, mail and similar.
+    /// Static so other code (for example the Peel removal gate) can ask without awaiting the actor.
+    nonisolated static func isNeverTouched(_ url: URL) -> Bool {
+        let normalized = URLPathSafety.standardized(url)
+        let path = normalized.path
+        if protectedRoots.contains(where: { path == $0 || path.hasPrefix($0 + "/") }) {
+            return true
+        }
+        return isSensitive(normalized)
+    }
+
+    private nonisolated static func isSensitive(_ url: URL) -> Bool {
+        hasSensitiveComponents(url) || isSensitiveHomePath(url)
+    }
+
+    private nonisolated static func hasSensitiveComponents(_ url: URL) -> Bool {
         let components = url.pathComponents.map { $0.lowercased() }
 
         if components.contains(where: { protectedDotComponents.contains($0) }) {
@@ -360,7 +375,7 @@ actor SystemGuard {
         return protectedDotFiles.contains(last)
     }
 
-    private func isSensitiveHomePath(_ url: URL) -> Bool {
+    private nonisolated static func isSensitiveHomePath(_ url: URL) -> Bool {
         sensitiveHomeRoots.contains(where: { URLPathSafety.isDescendant(url, of: $0) })
     }
 

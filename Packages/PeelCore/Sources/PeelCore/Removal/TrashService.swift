@@ -1,0 +1,1436 @@
+import CoreServices
+public import Foundation
+internal import PeelPrivileged
+import Synchronization
+
+public struct TrashedItem: Sendable, Hashable, Codable {
+    public let originalURL: URL
+    public let trashedURL: URL
+    public let date: Date
+    /// Which item went to the Trash, read there as it landed, so an item that lands in the same place once the Trash
+    /// is emptied is never taken for it. Nil in what was recorded before Peel kept it.
+    public let identity: Identity?
+    /// The launchd job Peel stopped once this file moved, by its label, which putting the file back starts again.
+    public internal(set) var stoppedJob: String?
+    /// The version that took this one's place, an edit of it or the version an edit replaced, which a Put Back moves
+    /// to the Trash before this goes back.
+    public internal(set) var replacedBy: Identity?
+
+    /// An item as its volume knows it: its inode and when it was made, which a move within the volume keeps. The
+    /// volume's device number is left out, since it follows the order volumes are mounted in.
+    public struct Identity: Sendable, Hashable, Codable {
+        let inode: UInt64
+        let birth: Int64
+        /// Whether it is a folder, and a file's size, kept for an item on a disk that gives it no lasting number,
+        /// such as FAT32 or exFAT. Nil on any other disk, and in what was recorded before Peel kept it.
+        let shape: Shape?
+
+        struct Shape: Sendable, Hashable, Codable {
+            let isFolder: Bool
+            let size: Int64
+
+            init(mode: mode_t, size: Int64) {
+                isFolder = mode & S_IFMT == S_IFDIR
+                self.size = isFolder ? 0 : size
+            }
+        }
+
+        init(_ identity: ItemIdentity, shape: Shape? = nil) {
+            inode = identity.inode
+            birth = identity.birth
+            self.shape = shape
+        }
+
+        /// The identity of the item at `url` itself, never of what a link there leads to.
+        init?(ofItemAt url: URL) {
+            var info = stat()
+            guard lstat(url.path(percentEncoded: false), &info) == 0 else { return nil }
+            self.init(ItemIdentity(info), shape: Self.shape(info.st_mode, info.st_size, at: url))
+        }
+
+        /// The identity of `item`, opened at `url`, as it was when it was opened.
+        init?(_ item: OpenItem, at url: URL) {
+            guard let identity = item.identity, let mode = item.mode, let size = item.size else { return nil }
+            self.init(identity, shape: Self.shape(mode, size, at: url))
+        }
+
+        private static func shape(_ mode: mode_t, _ size: Int64, at url: URL) -> Shape? {
+            let values = try? url.resourceValues(forKeys: [.volumeSupportsPersistentIDsKey])
+            return values?.volumeSupportsPersistentIDs == false ? Shape(mode: mode, size: size) : nil
+        }
+
+        func isTheItem(_ info: stat) -> Bool {
+            isTheItem(ItemIdentity(info), shape: Shape(mode: info.st_mode, size: info.st_size))
+        }
+
+        /// On a disk that gives an item no lasting number, an empty file gets another inode at every mount and every
+        /// rename, and FAT32 reads a time in the Mac's time zone of the moment. So there the kind and size have to
+        /// match, an empty file's inode is not compared, and the birth may be off by whole quarter hours, at most the
+        /// 26 hours between the farthest time zones.
+        func isTheItem(_ now: ItemIdentity, shape readNow: Shape) -> Bool {
+            guard let shape else { return inode == now.inode && birth == now.birth }
+            let quarterHour: UInt64 = 15 * 60 * 1_000_000_000
+            let shift = (now.birth &- birth).magnitude
+            return shape == readNow && (inode == now.inode || (!shape.isFolder && shape.size == 0))
+                && shift % quarterHour == 0 && shift <= 26 * 4 * quarterHour
+        }
+    }
+
+    init(
+        originalURL: URL, trashedURL: URL, date: Date, identity: Identity? = nil, stoppedJob: String? = nil,
+        replacedBy: Identity? = nil
+    ) {
+        self.originalURL = originalURL
+        self.trashedURL = trashedURL
+        self.date = date
+        self.identity = identity
+        self.stoppedJob = stoppedJob
+        self.replacedBy = replacedBy
+    }
+
+    /// True while the version that took this one's place stands there, never a link taken for it.
+    public var replacementStandsInItsPlace: Bool {
+        var info = stat()
+        guard let replacedBy, lstat(originalURL.path(percentEncoded: false), &info) == 0 else { return false }
+        return replacedBy.isTheItem(info)
+    }
+
+    /// Where the item stands now, as the disk says.
+    public enum Standing: Sendable, Equatable {
+        case inTheTrash
+        /// Nothing is where it went, or, when Peel knows which item went, another item is.
+        case gone
+        /// macOS would not let Peel look, so whether it is there is not known, and answered this.
+        case notKnown(SystemError)
+    }
+
+    public var standing: Standing {
+        var info = stat()
+        guard lstat(trashedURL.path(percentEncoded: false), &info) == 0 else {
+            let code = errno
+            guard code != ENOENT, code != ENOTDIR else { return .gone }
+            return .notKnown(SystemError(domain: NSPOSIXErrorDomain, code: Int(code)))
+        }
+        guard let identity else { return .inTheTrash }
+        return identity.isTheItem(info) ? .inTheTrash : .gone
+    }
+
+    /// Whether the item is still where it went in the Trash: something is there and, when Peel knows which item
+    /// went, it is that item.
+    public var isInTheTrash: Bool {
+        standing == .inTheTrash
+    }
+}
+
+public struct TrashFailure: Sendable, Hashable {
+    public enum Reason: Sendable, Hashable {
+        /// `RemovalGuard` refuses it, for that reason. Nil for a refusal recorded before Peel kept the reason.
+        case guarded(GuardRefusal?)
+        case changedSinceScan
+        /// Read again before it moves, and the read didn't end in time, so whether it changed isn't known.
+        case changeNotKnown
+        /// Listed as an orphan, but an app installed since the scan claims it.
+        case claimedSinceScan
+        case lastCopy
+        case notPermitted
+        /// It is locked, as Finder's Get Info locks an item, so it cannot move until the lock is taken off.
+        case locked
+        /// It needs administrator rights, and the helper that has them is not installed or not allowed.
+        case needsHelper
+        /// It is in the Trash, but macOS did not say where and Peel could not find it, so only Finder can put it back.
+        case movedWithoutATrace
+        /// What moved by name was not the item the guard checked. It is in the Trash under this name.
+        case somethingElseMoved(named: String)
+        /// History cannot be read, so nothing moves: what moved could not be listed for Put Back.
+        case historyUnreadable
+        /// History cannot be written, for the reason it names, so nothing moves: what moved could not be listed for Put
+        /// Back. Nil for a refusal recorded before Peel kept the reason.
+        case historyCannotBeWritten(HistoryWriteProblem?)
+        /// Peel is removing itself, History and its folder with it, so nothing else moves meanwhile.
+        case peelRemovesItself
+        /// These processes hold a file open in it, and moving it would pull it from under them.
+        case heldOpen(by: [String])
+        /// As `heldOpen`, with a background job among the programs, which Background Items can stop.
+        case heldOpenByAJob(by: [String])
+        /// Peel itself runs from it or from inside it, and only Remove Peel moves Peel.
+        case peelRunsFromIt
+        /// Processes of another account, root's included, run from it, and neither the person nor Peel may quit them.
+        case heldByAnotherAccount(by: [String])
+        /// Another user of this Mac has it open in their own account, where it can be quit.
+        case openForAnotherUser(by: [String])
+        /// Only build tools' daemons hold it, which the tools' own commands stop (`BuildDaemon`).
+        case heldByABuildTool(by: [String])
+        /// It is an input method running as one of this account's input sources, which System Settings removes.
+        case inUseAsAnInputSource
+        /// Only macOS's own programs hold it, and nobody quits those.
+        case inUseByMacOS(by: [String])
+        /// It is a disk image attached right now, or a folder holding one, which macOS holds open until it is ejected.
+        case attachedDiskImage
+        /// A link the helper takes only once it leads nowhere still leads to this path.
+        case stillLeadsTo(String)
+        case failed(String)
+    }
+
+    public let url: URL
+    public let reason: Reason
+    public let error: SystemError?
+
+    public init(url: URL, reason: Reason, error: SystemError? = nil) {
+        self.url = url
+        self.reason = reason
+        self.error = error
+    }
+}
+
+extension TrashFailure.Reason {
+    /// Whether the refusal is about the item, which as it is now would be refused again, rather than about Peel's own
+    /// state: History it cannot read, or the helper it needs.
+    public var isAboutTheItem: Bool {
+        switch self {
+        case .historyUnreadable, .historyCannotBeWritten, .peelRemovesItself, .needsHelper: false
+        case .guarded, .changedSinceScan, .changeNotKnown, .claimedSinceScan, .lastCopy, .notPermitted, .locked,
+             .movedWithoutATrace,
+             .somethingElseMoved, .heldOpen, .heldOpenByAJob, .peelRunsFromIt, .heldByAnotherAccount,
+             .openForAnotherUser,
+             .heldByABuildTool, .inUseAsAnInputSource, .inUseByMacOS, .attachedDiskImage, .stillLeadsTo, .failed: true
+        }
+    }
+
+    var isHeldByPrograms: Bool {
+        switch self {
+        case .heldOpen, .heldOpenByAJob, .heldByAnotherAccount, .openForAnotherUser, .heldByABuildTool,
+             .inUseAsAnInputSource: true
+        default: false
+        }
+    }
+
+    /// A fixed word for the reason, which the refusal log stores. It does not change with the text on screen, so
+    /// an old record still reads.
+    public var name: String {
+        switch self {
+        case .guarded(let refusal): refusal?.name ?? "protected-location"
+        case .changedSinceScan: "changed-since-scan"
+        case .changeNotKnown: "change-not-known"
+        case .claimedSinceScan: "claimed-since-scan"
+        case .lastCopy: "last-copy"
+        case .notPermitted: "not-permitted"
+        case .locked: "locked"
+        case .needsHelper: "needs-helper"
+        case .movedWithoutATrace: "moved-without-a-trace"
+        case .somethingElseMoved: "something-else-moved"
+        case .historyUnreadable: "history-unreadable"
+        case .historyCannotBeWritten: "history-cannot-be-written"
+        case .peelRemovesItself: "peel-removes-itself"
+        case .heldOpen: "held-open"
+        case .heldOpenByAJob: "held-open-by-a-job"
+        case .peelRunsFromIt: "peel-runs-from-it"
+        case .heldByAnotherAccount: "held-by-another-account"
+        case .openForAnotherUser: "open-for-another-user"
+        case .heldByABuildTool: "held-by-a-build-tool"
+        case .inUseAsAnInputSource: "in-use-as-an-input-source"
+        case .inUseByMacOS: "in-use-by-macos"
+        case .attachedDiskImage: "attached-disk-image"
+        case .stillLeadsTo: "still-leads-to"
+        case .failed: "failed"
+        }
+    }
+
+    public var detail: String? {
+        switch self {
+        case .guarded(let refusal): refusal?.detail
+        case .failed(let message): message
+        case .stillLeadsTo(let target): target
+        case .somethingElseMoved(let name): name
+        case .historyCannotBeWritten(let problem): problem?.detail
+        case .heldOpen(let processes), .heldOpenByAJob(let processes), .heldByAnotherAccount(let processes),
+             .openForAnotherUser(let processes),
+             .heldByABuildTool(let processes), .inUseByMacOS(let processes):
+            processes.joined(separator: "\n")
+        default: nil
+        }
+    }
+
+    /// The reason a refusal log stored as `name` and `detail`, or nil for a word this version doesn't know.
+    public init?(name: String, detail: String?) {
+        if let refusal = GuardRefusal(name: name, detail: detail) {
+            self = .guarded(refusal)
+            return
+        }
+        switch name {
+        case "protected-location": self = .guarded(nil)
+        case "changed-since-scan": self = .changedSinceScan
+        case "change-not-known": self = .changeNotKnown
+        case "claimed-since-scan": self = .claimedSinceScan
+        case "last-copy": self = .lastCopy
+        case "not-permitted": self = .notPermitted
+        case "locked": self = .locked
+        case "needs-helper": self = .needsHelper
+        case "moved-without-a-trace": self = .movedWithoutATrace
+        case "something-else-moved": self = .somethingElseMoved(named: detail ?? "")
+        case "history-unreadable": self = .historyUnreadable
+        case "history-cannot-be-written": self = .historyCannotBeWritten(detail.flatMap(HistoryWriteProblem.init(detail:)))
+        case "peel-removes-itself": self = .peelRemovesItself
+        case "held-open": self = .heldOpen(by: (detail ?? "").split(separator: "\n").map(String.init))
+        case "held-open-by-a-job": self = .heldOpenByAJob(by: (detail ?? "").split(separator: "\n").map(String.init))
+        case "peel-runs-from-it": self = .peelRunsFromIt
+        case "held-by-another-account":
+            self = .heldByAnotherAccount(by: (detail ?? "").split(separator: "\n").map(String.init))
+        case "open-for-another-user":
+            self = .openForAnotherUser(by: (detail ?? "").split(separator: "\n").map(String.init))
+        case "held-by-a-build-tool":
+            self = .heldByABuildTool(by: (detail ?? "").split(separator: "\n").map(String.init))
+        case "in-use-as-an-input-source": self = .inUseAsAnInputSource
+        case "in-use-by-macos": self = .inUseByMacOS(by: (detail ?? "").split(separator: "\n").map(String.init))
+        case "attached-disk-image": self = .attachedDiskImage
+        case "still-leads-to": self = .stillLeadsTo(detail ?? "")
+        case "failed": self = .failed(detail ?? "")
+        default: return nil
+        }
+    }
+}
+
+public enum RestoreFailure: Sendable, Hashable {
+    case missingFromTrash
+    case alreadyThere
+    case needsHelper
+    /// The guard refuses the place it would go back to, for this reason.
+    case notAllowed(GuardRefusal)
+    /// The helper's own rule refuses the place it would go back to, in the helper's words.
+    case notAllowedByTheHelper(String)
+    /// The record names something that isn't in a Trash where Peel put it.
+    case notInATrash
+    /// It is locked in the Trash, as Finder's Get Info locks it.
+    case locked
+    case folderLocked
+    case folderGone
+    /// Another developer's app, which macOS lets Peel change only with App Management.
+    case needsAppManagement
+    /// macOS's privacy protection refused it.
+    case notPermitted
+    case failed(String)
+    /// The version in its place couldn't move to the Trash first, for this reason.
+    case replacementStays(TrashFailure.Reason)
+
+    /// True when asking again can't help: the item left the Trash, or Peel puts nothing back from or to there.
+    public var isFinal: Bool {
+        switch self {
+        case .missingFromTrash, .notAllowed, .notAllowedByTheHelper, .notInATrash: true
+        case .alreadyThere, .needsHelper, .locked, .folderLocked, .folderGone, .needsAppManagement, .notPermitted,
+             .failed, .replacementStays:
+            false
+        }
+    }
+}
+
+public struct TrashResult: Sendable {
+    public var trashed: [TrashedItem] = []
+    public var failures: [TrashFailure] = []
+    /// The folders an uninstall left empty and moved too, which free nothing.
+    public internal(set) var emptied: Set<URL> = []
+    /// The apps that moved whose background items macOS still starts at login, now from the Trash, until it is emptied.
+    public internal(set) var startsFromTheTrash: [URL] = []
+
+    public init(trashed: [TrashedItem] = [], failures: [TrashFailure] = []) {
+        self.trashed = trashed
+        self.failures = failures
+    }
+
+    /// Where each item that moved is now, by the place it was moved from.
+    public var trashedAt: [URL: URL] {
+        Dictionary(trashed.map { ($0.originalURL, $0.trashedURL) }) { first, _ in first }
+    }
+
+    /// Marks each item whose move stopped the job it declares.
+    mutating func note(_ stopped: [LaunchdCleanup.Job]) {
+        for job in stopped {
+            for index in trashed.indices where trashed[index].originalURL == job.plist {
+                trashed[index].stoppedJob = job.label
+            }
+        }
+    }
+}
+
+public struct TrashService: Sendable {
+    /// Answers the jobs it stopped.
+    typealias StopJobs = @Sendable ([LaunchdCleanup.Job], _ canUseHelper: Bool) async -> [LaunchdCleanup.Job]
+    typealias StartJob = @Sendable (LaunchdCleanup.Job, _ canUseHelper: Bool) async -> Void
+    typealias ForgetDomains = @Sendable ([URL], _ owner: String?) async -> Void
+    typealias MoveThroughHelper = @Sendable ([URL]) async -> TrashResult
+    typealias PutBackDockTiles = @Sendable (_ items: [URL]) async -> Void
+    typealias RunningInside = @Sendable (_ app: URL) async -> [LaunchdCleanup.Running]
+    typealias RunningJobs = @Sendable () async -> Set<pid_t>
+    typealias StopRunning = @Sendable ([LaunchdCleanup.Running], _ canUseHelper: Bool) async -> [LaunchdCleanup.Running]
+    typealias RegistrationAtLogin = @Sendable (_ app: URL) async -> StartsAtLogin.Registration?
+    typealias RegisterApp = @Sendable (_ app: URL) async -> Void
+    typealias EndExtensions = @Sendable (_ trashedApps: [URL]) async -> Void
+
+    let environment: SearchEnvironment
+    private let exclusions: Exclusions
+    private let judging: Judging
+    private let stopJobs: StopJobs
+    private let startJob: StartJob
+    private let forgetDomains: ForgetDomains
+    private let moveThroughHelper: MoveThroughHelper
+    private let putBackDockTiles: PutBackDockTiles
+    private let runningInside: RunningInside
+    private let stopRunning: StopRunning
+    private let runningJobs: RunningJobs
+    private let registrationAtLogin: RegistrationAtLogin
+    private let registerApp: RegisterApp
+    private let endExtensions: EndExtensions
+    /// Makes the move for a guard, so a service made again for other exclusions moves the same way.
+    private let movingJudgedBy: @Sendable (RemovalGuard) -> @Sendable (URL) throws -> URL
+    private let ownMoves: OwnTrashMoves
+    /// Where each item is written down as soon as it moves, so a removal cut short still reaches History.
+    private let journal: RemovalJournal?
+
+    public init(environment: SearchEnvironment = .current, exclusions: Exclusions = .none) {
+        self.init(environment: environment, exclusions: exclusions, history: RemovalHistory.defaultURL)
+    }
+
+    /// The pieces every move of Peel's goes through, with the journal beside `history`.
+    init(environment: SearchEnvironment, exclusions: Exclusions, history: URL) {
+        self.init(
+            environment: environment,
+            exclusions: exclusions,
+            makingTheGuard: { RemovalGuard(environment: environment, exclusions: exclusions) },
+            stopJobs: LaunchdCleanup.stop,
+            startJob: LaunchdCleanup.start,
+            forgetDomains: { await PreferenceCleanup.forgetDomains(for: $0, ownedBy: $1) },
+            moveThroughHelper: Self.moveThroughTheHelper,
+            putBackDockTiles: { await DockTiles().putBack($0) },
+            runningInside: { await LaunchdCleanup.running(inside: $0, environment: environment) },
+            stopRunning: { await LaunchdCleanup.stop($0, canUseHelper: $1) },
+            runningJobs: { await Launchctl.runningJobs() },
+            registrationAtLogin: { await StartsAtLogin.registration(of: $0) },
+            registerApp: { app in _ = LSRegisterURL(app as CFURL, true) },
+            endExtensions: { await ExtensionsLeftRunning.end(runningFrom: $0) },
+            movingJudgedBy: { judge in { try Self.moveToSystemTrash($0, refusal: judge.refusal(of:)) } },
+            ownMoves: .shared,
+            journal: RemovalJournal(beside: history)
+        )
+    }
+
+    /// For tests. Unless a test passes its own, it stops and starts no launchd job, asks launchd nothing, forgets no
+    /// preference domain, registers no app with Launch Services, acts as if there were no helper, changes no Dock,
+    /// writes no journal, and ends no app extension.
+    init(
+        environment: SearchEnvironment,
+        exclusions: Exclusions = .none,
+        stopJobs: @escaping StopJobs = { _, _ in [] },
+        startJob: @escaping StartJob = { _, _ in },
+        forgetDomains: @escaping ForgetDomains = { _, _ in },
+        moveThroughHelper: @escaping MoveThroughHelper = Self.asIfThereWereNoHelper,
+        putBackDockTiles: @escaping PutBackDockTiles = { _ in },
+        runningInside: @escaping RunningInside = { _ in [] },
+        stopRunning: @escaping StopRunning = { _, _ in [] },
+        runningJobs: @escaping RunningJobs = { [] },
+        registrationAtLogin: @escaping RegistrationAtLogin = { _ in nil },
+        registerApp: @escaping RegisterApp = { _ in },
+        endExtensions: @escaping EndExtensions = { _ in },
+        ownMoves: OwnTrashMoves = OwnTrashMoves(),
+        journal: RemovalJournal? = nil,
+        makingTheGuard: (@Sendable () -> RemovalGuard)? = nil,
+        moveToTrash: @escaping @Sendable (URL) throws -> URL
+    ) {
+        self.init(
+            environment: environment,
+            exclusions: exclusions,
+            makingTheGuard: makingTheGuard ?? { RemovalGuard(environment: environment, exclusions: exclusions) },
+            stopJobs: stopJobs,
+            startJob: startJob,
+            forgetDomains: forgetDomains,
+            moveThroughHelper: moveThroughHelper,
+            putBackDockTiles: putBackDockTiles,
+            runningInside: runningInside,
+            stopRunning: stopRunning,
+            runningJobs: runningJobs,
+            registrationAtLogin: registrationAtLogin,
+            registerApp: registerApp,
+            endExtensions: endExtensions,
+            movingJudgedBy: { _ in moveToTrash },
+            ownMoves: ownMoves,
+            journal: journal
+        )
+    }
+
+    private init(
+        environment: SearchEnvironment,
+        exclusions: Exclusions,
+        makingTheGuard: @escaping @Sendable () -> RemovalGuard,
+        stopJobs: @escaping StopJobs,
+        startJob: @escaping StartJob,
+        forgetDomains: @escaping ForgetDomains,
+        moveThroughHelper: @escaping MoveThroughHelper,
+        putBackDockTiles: @escaping PutBackDockTiles,
+        runningInside: @escaping RunningInside,
+        stopRunning: @escaping StopRunning,
+        runningJobs: @escaping RunningJobs,
+        registrationAtLogin: @escaping RegistrationAtLogin,
+        registerApp: @escaping RegisterApp,
+        endExtensions: @escaping EndExtensions,
+        movingJudgedBy: @escaping @Sendable (RemovalGuard) -> @Sendable (URL) throws -> URL,
+        ownMoves: OwnTrashMoves,
+        journal: RemovalJournal?
+    ) {
+        self.environment = environment
+        self.exclusions = exclusions
+        judging = Judging {
+            let removalGuard = makingTheGuard()
+            return (removalGuard, movingJudgedBy(removalGuard))
+        }
+        self.stopJobs = stopJobs
+        self.startJob = startJob
+        self.forgetDomains = forgetDomains
+        self.moveThroughHelper = moveThroughHelper
+        self.putBackDockTiles = putBackDockTiles
+        self.runningInside = runningInside
+        self.stopRunning = stopRunning
+        self.runningJobs = runningJobs
+        self.registrationAtLogin = registrationAtLogin
+        self.registerApp = registerApp
+        self.endExtensions = endExtensions
+        self.movingJudgedBy = movingJudgedBy
+        self.ownMoves = ownMoves
+        self.journal = journal
+    }
+
+    /// This service judging by `exclusions`: a command asks first, and what was excluded by the time the person
+    /// answers stays, as each move in the app makes a service of its own.
+    public func excluding(_ exclusions: Exclusions) -> TrashService {
+        let environment = environment
+        return TrashService(
+            environment: environment,
+            exclusions: exclusions,
+            makingTheGuard: { RemovalGuard(environment: environment, exclusions: exclusions) },
+            stopJobs: stopJobs,
+            startJob: startJob,
+            forgetDomains: forgetDomains,
+            moveThroughHelper: moveThroughHelper,
+            putBackDockTiles: putBackDockTiles,
+            runningInside: runningInside,
+            stopRunning: stopRunning,
+            runningJobs: runningJobs,
+            registrationAtLogin: registrationAtLogin,
+            registerApp: registerApp,
+            endExtensions: endExtensions,
+            movingJudgedBy: movingJudgedBy,
+            ownMoves: ownMoves,
+            journal: journal
+        )
+    }
+
+    /// False while the saved exclusions are not read yet or cannot be read, when nothing moves.
+    public var knowsTheExclusions: Bool { exclusions.isKnown }
+    public var whyExclusionsAreUnreadable: FileProblem? { exclusions.whyUnreadable }
+
+    private var removalGuard: RemovalGuard { judging.made.removalGuard }
+    private var moveToTrash: @Sendable (URL) throws -> URL { judging.made.move }
+
+    /// The guard and the move it judges, made the first time either is needed rather than with the service: the
+    /// moves run away from the main thread, and making a guard reads the disk for every place it keeps.
+    private final class Judging: Sendable {
+        typealias Made = (removalGuard: RemovalGuard, move: @Sendable (URL) throws -> URL)
+
+        private let make: @Sendable () -> Made
+        private let kept = Mutex<Made?>(nil)
+
+        init(_ make: @escaping @Sendable () -> Made) {
+            self.make = make
+        }
+
+        /// Made outside the lock. Two first uses at once both make one, and both get the one kept first.
+        var made: Made {
+            if let made = kept.withLock({ $0 }) { return made }
+            let made = make()
+            return kept.withLock { kept in
+                if let kept { return kept }
+                kept = made
+                return made
+            }
+        }
+    }
+
+    func excludes(_ app: InstalledApp) -> Bool { removalGuard.excludes(app) }
+    func excludes(ownerOf item: BackgroundItem) -> Bool { removalGuard.excludes(ownerOf: item) }
+
+    private func readingOfOpenFiles() async -> OpenFiles.Fresh {
+        OpenFiles.Fresh(attachedImages: await AttachedDiskImages.paths() ?? [], jobs: await runningJobs())
+    }
+
+    /// Why every move would be refused now, whatever it is asked to move, or nil when a move may go ahead.
+    public var refusalOfEveryMove: TrashFailure.Reason? {
+        guard knowsTheExclusions else { return .guarded(.exclusionsNotKnown) }
+        return historyRefusal
+    }
+
+    /// Why `url` would not move, or nil when it would. A plan can show this before anything moves, since the move
+    /// asks the same guard.
+    public func refusal(of url: URL) -> TrashFailure.Reason? {
+        if let refusal = removalGuard.refusal(of: url) { return .guarded(refusal) }
+        return historyRefusal
+    }
+
+    /// Why each of `apps` would not move now in an uninstall, by the checks its move makes: the guard, History, a lock
+    /// on the bundle, which nobody can rename, root included, and the programs holding it, unless only the app's own
+    /// background programs do, which the move stops first. An app missing from the answer would move.
+    package func refusalsNow(
+        ofApps apps: [URL],
+        lettingTheirProgramsRun running: Set<URL>
+    ) async -> [URL: TrashFailure.Reason] {
+        let openFiles = OpenFiles(jobs: await runningJobs())
+        var refusals: [URL: TrashFailure.Reason] = [:]
+        for app in apps {
+            if let refusal = refusal(of: app) {
+                refusals[app] = refusal
+                continue
+            }
+            if FileAccess.isLocked(app) {
+                refusals[app] = FileAccess.isLockedInFinder(app) ? .locked : .notPermitted
+                continue
+            }
+            let mayRun = running.contains(app)
+            guard let held = openFiles.refusal(of: app, lettingItsProgramsRun: mayRun) else { continue }
+            if held.isHeldByPrograms, await jobsHoldingOnly(app, in: openFiles, lettingItsProgramsRun: mayRun) != nil {
+                continue
+            }
+            refusals[app] = held
+        }
+        return refusals
+    }
+
+    /// Why nothing moves while the History this service's moves are recorded in can't be read or written, since what
+    /// moved could not be listed for Put Back.
+    private var historyRefusal: TrashFailure.Reason? {
+        guard let journal else { return nil }
+        if !journal.historyCanBeRead { return .historyUnreadable }
+        return journal.historyWriteProblem.map(TrashFailure.Reason.historyCannotBeWritten)
+    }
+
+    /// Every item of `urls` refused, while History can't be read or written. An item the guard refuses keeps that
+    /// reason, which outlasts this one.
+    private func refusingAllWhileHistoryCannotBeRead(_ urls: [URL]) -> TrashResult? {
+        guard let held = historyRefusal else { return nil }
+        let refused = urls.map { TrashFailure(url: $0, reason: refusal(of: $0) ?? held) }
+        return TrashResult(failures: refused)
+    }
+
+    /// Moves `urls` to the Trash as the current user, then stops the launchd jobs and forgets the preference
+    /// domains of what moved. `owner` is the bundle identifier of the app being reset: its own preference domain
+    /// is forgotten even when Apple wrote the app. `refusing` is asked about each item right before it moves, for a
+    /// check that reads the item as it is then, such as whether it changed since it was listed.
+    @concurrent
+    public func trash(
+        _ urls: [URL],
+        ownedBy owner: String? = nil,
+        refusing: (@Sendable (URL) -> TrashFailure.Reason?)? = nil
+    ) async -> TrashResult {
+        if let refused = refusingAllWhileHistoryCannotBeRead(urls) { return refused }
+        return await trash(urls, ownedBy: owner, removal: UUID(), lettingTheirProgramsRun: [], refusing: refusing)
+    }
+
+    /// Moves files Peel made for itself, which History never lists, such as a copy of settings it could not
+    /// finish: to the Trash like anything else, with nothing written down for History.
+    @concurrent
+    func trashOwnFiles(_ urls: [URL]) async -> TrashResult {
+        await trash(urls, ownedBy: nil, removal: nil, lettingTheirProgramsRun: [])
+    }
+
+    /// Moves `urls` as the current user, as part of `removal`, the move the journal groups them by, or of none.
+    private func trash(
+        _ urls: [URL],
+        ownedBy owner: String?,
+        removal: UUID?,
+        lettingTheirProgramsRun apps: Set<URL>,
+        refusing: (@Sendable (URL) -> TrashFailure.Reason?)? = nil
+    ) async -> TrashResult {
+        // The guard reads the disk, so it is asked once for each item.
+        let refusals = urls.reduce(into: [URL: GuardRefusal]()) { $0[$1] = removalGuard.refusal(of: $1) }
+        let allowed = urls.filter { refusals[$0] == nil }
+        var openFiles = await readingOfOpenFiles()
+        // Read before the move, while the files are still there to say which jobs they declare.
+        let jobs = LaunchdCleanup.jobs(for: allowed, environment: environment)
+
+        var result = TrashResult()
+        var moved = Folders()
+        // Set once the line written before a move can't be: nothing moves after it, since nothing would remember it.
+        var unrecorded: TrashFailure.Reason?
+        // What a line was written for, ahead of a move that then didn't happen.
+        var stayed: [URL] = []
+        ownMoves.began()
+        func move(_ url: URL) {
+            if let refusal = refusals[url] {
+                result.failures.append(TrashFailure(url: url, reason: .guarded(refusal)))
+                return
+            }
+            // An item inside a folder that just moved went with it: it is neither moved again nor a failure.
+            let path = PathPattern.comparablePath(of: url)
+            guard !moved.hold(path) else { return }
+            if let unrecorded {
+                result.failures.append(TrashFailure(url: url, reason: unrecorded))
+                return
+            }
+            if let refusal = refusing?(url) {
+                result.failures.append(TrashFailure(url: url, reason: refusal))
+                return
+            }
+            if let held = openFiles.refusal(of: url, lettingItsProgramsRun: apps.contains(url)) {
+                result.failures.append(TrashFailure(url: url, reason: held))
+                return
+            }
+            if let removal, let journal, !journal.note([departing(url)], batch: removal, beforeTheMove: true) {
+                let reason = TrashFailure.Reason.historyCannotBeWritten(journal.historyWriteProblem)
+                unrecorded = reason
+                result.failures.append(TrashFailure(url: url, reason: reason))
+                stayed.append(url)
+                return
+            }
+            do {
+                let trashedURL = try moveToTrash(url)
+                let item = TrashedItem(
+                    originalURL: url,
+                    trashedURL: trashedURL,
+                    date: .now,
+                    identity: .init(ofItemAt: trashedURL)
+                )
+                if let removal {
+                    journal?.note([item], batch: removal)
+                }
+                result.trashed.append(item)
+                moved.add(path)
+                MoveCount.current?.add(1)
+            } catch {
+                stayed.append(url)
+                // Nothing was there to move: like an item inside a folder that moved, neither moved nor a failure.
+                if Self.foundNothing(error), url.isMissing { return }
+                let reason = Self.reason(for: error)
+                let isLocked = reason == .notPermitted && FileAccess.isLockedInFinder(url)
+                let code: SystemError? = if case .failed = reason { SystemError(error) } else { nil }
+                result.failures.append(TrashFailure(url: url, reason: isLocked ? .locked : reason, error: code))
+            }
+        }
+        // A job's file goes first, and the job stops with it, so a program only that job runs moves in this pass too.
+        let jobFiles = Set(jobs.map(\.plist))
+        urls.filter(jobFiles.contains).forEach(move)
+        let stopped = await stop(jobs, thatMoved: result, canUseHelper: false)
+        if !stopped.isEmpty {
+            openFiles = await readingOfOpenFiles()
+        }
+        urls.filter { !jobFiles.contains($0) }.forEach(move)
+        if let removal {
+            journal?.takeBack(linesBefore: stayed, batch: removal)
+        }
+        ownMoves.ended(landedAt: result.trashed.map(\.trashedURL))
+        FileSize.forgetAnswers(holding: result.trashed.map(\.originalURL))
+        await forgetDomains(result.trashed.map(\.originalURL), owner)
+        result.note(stopped)
+        return result
+    }
+
+    /// Moves `privilegedURLs` through the privileged helper and everything else as the current user.
+    @concurrent
+    public func trash(
+        _ urls: [URL], usingHelperFor privilegedURLs: Set<URL>, lettingTheirProgramsRun running: Set<URL> = []
+    ) async -> TrashResult {
+        await PrivilegedHelper.withOneConsent {
+            await trash(urls, usingHelperFor: privilegedURLs, removal: UUID(), lettingTheirProgramsRun: running)
+        }
+    }
+
+    /// Moves `apps` first, then what `files` returns for the apps that stayed, as one removal. An app's files wait
+    /// for it, so an app that stays keeps everything of its own. A program running from inside one of
+    /// `lettingTheirProgramsRun` doesn't keep it, since that app uninstalls itself once it has moved. A folder
+    /// named in `emptiedFoldersNamed` (`MakersFolders.names`) that the files leave empty goes too.
+    @concurrent
+    public func trash(
+        apps: [URL],
+        thenFiles files: @Sendable (_ appsThatStayed: Set<URL>) -> [URL],
+        usingHelperFor privilegedURLs: Set<URL>,
+        lettingTheirProgramsRun running: Set<URL>,
+        emptiedFoldersNamed names: Set<String> = []
+    ) async -> TrashResult {
+        await PrivilegedHelper.withOneConsent {
+            await trash(
+                apps: apps, thenFiles: files, usingHelperFor: privilegedURLs, lettingTheirProgramsRun: running,
+                emptiedFoldersNamed: names, removal: UUID()
+            )
+        }
+    }
+
+    private func trash(
+        apps: [URL],
+        thenFiles files: @Sendable (_ appsThatStayed: Set<URL>) -> [URL],
+        usingHelperFor privilegedURLs: Set<URL>,
+        lettingTheirProgramsRun running: Set<URL>,
+        emptiedFoldersNamed names: Set<String>,
+        removal: UUID
+    ) async -> TrashResult {
+        // Asked before anything moves: a job stopped so its app could move is no longer named by launchd.
+        var registrations: [URL: StartsAtLogin.Registration] = [:]
+        for app in apps {
+            registrations[app] = await registrationAtLogin(app)
+        }
+        var result = apps.isEmpty
+            ? TrashResult()
+            : await trash(apps, usingHelperFor: privilegedURLs, removal: removal, lettingTheirProgramsRun: running)
+        let stopped = await moveAgain(
+            &result, onceTheirJobsStop: apps, usingHelperFor: privilegedURLs, removal: removal,
+            lettingTheirProgramsRun: running
+        )
+        let moved = Set(result.trashed.map(\.originalURL))
+        // An app's extensions run on from the Trash, where nobody can quit them, and its files wait for them to end.
+        let trashedApps = result.trashed.filter { apps.contains($0.originalURL) }.map(\.trashedURL)
+        if !trashedApps.isEmpty {
+            await endExtensions(trashedApps)
+        }
+        // With another copy installed, macOS may start the items from that copy.
+        result.startsFromTheTrash = apps.filter { app in
+            guard moved.contains(app), let registration = registrations[app] else { return false }
+            return AppInspector.applicationURLs(forBundleIdentifier: registration.identifier).isEmpty
+        }
+        let rest = files(Set(apps.filter { !moved.contains($0) }))
+        guard !rest.isEmpty else {
+            await startAgain(stopped, unlessMoved: [])
+            return result
+        }
+        let more = await trash(rest, usingHelperFor: privilegedURLs, removal: removal, lettingTheirProgramsRun: [])
+        result.trashed += more.trashed
+        result.failures += more.failures
+        let filesMoved = Set(more.trashed.map(\.originalURL))
+        result.note(stopped.compactMap(\.job).filter { filesMoved.contains($0.plist) })
+        await startAgain(stopped, unlessMoved: filesMoved)
+        // Nobody asked for these folders, so one that stays is no failure, and they are not counted with the rest. A
+        // folder goes through the helper when what left it did.
+        let privileged = Set(privilegedURLs.map(PathPattern.comparablePath(of:)))
+        var throughHelper = more.trashed.map { PathPattern.comparablePath(of: $0.originalURL) }
+            .filter(privileged.contains)
+        for folder in MakersFolders(environment: environment, names: names).above(more.trashed.map(\.originalURL))
+        where MakersFolders.isEmpty(folder) {
+            let path = PathPattern.comparablePath(of: folder)
+            let helper: Set<URL> = throughHelper.contains { PathComponents.isPath($0, inside: path) } ? [folder] : []
+            // What the files leave empty frees nothing, as History records it.
+            let moved = await MoveCount.$current.withValue(nil) {
+                await RecordedRemoval.$current.withValue(RecordedRemoval.current?.measuring([folder: 0])) {
+                    await trash([folder], usingHelperFor: helper, removal: removal, lettingTheirProgramsRun: []).trashed
+                }
+            }
+            if !helper.isEmpty, !moved.isEmpty { throughHelper.append(path) }
+            result.trashed += moved
+            result.emptied.formUnion(moved.map(\.originalURL))
+        }
+        return result
+    }
+
+    /// Moves again each of `apps` that only its own background programs kept from moving, once their jobs are stopped,
+    /// and answers the jobs stopped for an app that then moved. Nothing is stopped while anything else holds the app.
+    private func moveAgain(
+        _ result: inout TrashResult,
+        onceTheirJobsStop apps: [URL],
+        usingHelperFor privilegedURLs: Set<URL>,
+        removal: UUID,
+        lettingTheirProgramsRun running: Set<URL>
+    ) async -> [LaunchdCleanup.Running] {
+        var stoppedForMovedApps: [LaunchdCleanup.Running] = []
+        for app in apps {
+            guard let index = result.failures.firstIndex(where: { $0.url == app }),
+                  result.failures[index].reason.isHeldByPrograms,
+                  let jobs = await jobsHoldingOnly(app, in: OpenFiles(), lettingItsProgramsRun: running.contains(app))
+            else { continue }
+            let stopped = await stopRunning(jobs, true)
+            let again = await trash(
+                [app], usingHelperFor: privilegedURLs, removal: removal, lettingTheirProgramsRun: running
+            )
+            if again.trashed.contains(where: { $0.originalURL == app }) {
+                result.failures.remove(at: index)
+                result.trashed += again.trashed
+                stoppedForMovedApps += stopped
+            } else {
+                result.failures[index] = again.failures.first { $0.url == app } ?? result.failures[index]
+                await startAgain(stopped, unlessMoved: [])
+            }
+        }
+        return stoppedForMovedApps
+    }
+
+    /// The background programs running from inside `app` when nothing else holds it, or nil when anything else holds it
+    /// too, or nothing does.
+    private func jobsHoldingOnly(
+        _ app: URL,
+        in openFiles: OpenFiles,
+        lettingItsProgramsRun: Bool
+    ) async -> [LaunchdCleanup.Running]? {
+        let holders = openFiles.processes(holding: app, lettingItsProgramsRun: lettingItsProgramsRun)
+        guard !holders.isEmpty else { return nil }
+        let jobs = await runningInside(app).filter { holders.contains($0.pid) }
+        return holders.isSubset(of: Set(jobs.map(\.pid))) ? jobs : nil
+    }
+
+    /// Starts again each of `jobs` launchd reads from a file that did not move: stopped so their app could move, they
+    /// must not stay stopped while their file stays in place.
+    private func startAgain(_ jobs: [LaunchdCleanup.Running], unlessMoved moved: Set<URL>) async {
+        for job in jobs.compactMap(\.job) where !moved.contains(job.plist) && !job.isKeptOffBySystemSettings {
+            await startJob(job, true)
+        }
+    }
+
+    private func trash(
+        _ urls: [URL],
+        usingHelperFor privilegedURLs: Set<URL>,
+        removal: UUID,
+        lettingTheirProgramsRun apps: Set<URL>
+    ) async -> TrashResult {
+        if let refused = refusingAllWhileHistoryCannotBeRead(urls) { return refused }
+        var result = await trash(
+            urls.filter { !privilegedURLs.contains($0) },
+            ownedBy: nil,
+            removal: removal,
+            lettingTheirProgramsRun: apps
+        )
+        let helperURLs = urls.filter(privilegedURLs.contains)
+        guard !helperURLs.isEmpty else { return result }
+
+        var permitted: [URL] = []
+        for url in helperURLs {
+            if let refusal = removalGuard.refusal(of: url) {
+                result.failures.append(TrashFailure(url: url, reason: .guarded(refusal)))
+            } else {
+                permitted.append(url)
+            }
+        }
+        // An item inside another folder of this request goes with that folder. Sent on its own, the helper would
+        // find it gone and report a failure.
+        var paths = Folders()
+        permitted.forEach { paths.add(PathPattern.comparablePath(of: $0)) }
+        let allowed = permitted.filter { !paths.hold(PathPattern.comparablePath(of: $0)) }
+        let jobs = LaunchdCleanup.jobs(for: allowed, environment: environment)
+        // A command-line tool's link leads into its app until the app has moved, and the helper takes such a link
+        // only once it leads nowhere, so the links go after everything else.
+        let reach = HelperReach(environment: environment)
+        let links = Set(allowed.filter(reach.takesOnlyALink))
+        ownMoves.began()
+        var helperResult = TrashResult()
+        var stayed: [URL] = []
+        // One request at a time, each answer written down before the next request goes, so a stop while the helper
+        // works loses no more than the request under way. The helper's own limit also bounds how many items an
+        // answer that never comes can affect. The helper reads no open files, so they are read right before each
+        // request, and again once the last reading is older than `OpenFiles.lifetime`.
+        let limit = HelperRequest.maximumItems
+        var openFiles = await readingOfOpenFiles()
+        // A job's file goes first, and the job stops with it, so a program only that job runs moves in this pass too.
+        let jobFiles = Set(jobs.map(\.plist))
+        var stopped: [LaunchdCleanup.Job] = []
+        // Nothing goes to the helper once a line written before a move can't be, here or in the moves above.
+        var unrecorded = result.failures.lazy.map(\.reason).first { reason in
+            if case .historyCannotBeWritten = reason { true } else { false }
+        }
+        for (index, batch) in [
+            allowed.filter(jobFiles.contains),
+            allowed.filter { !links.contains($0) && !jobFiles.contains($0) },
+            allowed.filter(links.contains),
+        ].enumerated() {
+            if index == 1 {
+                stopped = await stop(jobs, thatMoved: helperResult, canUseHelper: true)
+                if !stopped.isEmpty {
+                    openFiles = await readingOfOpenFiles()
+                }
+            }
+            for start in stride(from: 0, to: batch.count, by: limit) {
+                var request: [URL] = []
+                for url in batch[start..<min(start + limit, batch.count)] {
+                    if let held = openFiles.refusal(of: url, lettingItsProgramsRun: apps.contains(url)) {
+                        result.failures.append(TrashFailure(url: url, reason: held))
+                    } else {
+                        request.append(url)
+                    }
+                }
+                guard !request.isEmpty else { continue }
+                if unrecorded == nil, let journal,
+                   !journal.note(request.map(departing), batch: removal, beforeTheMove: true) {
+                    unrecorded = .historyCannotBeWritten(journal.historyWriteProblem)
+                    stayed += request
+                }
+                if let unrecorded {
+                    result.failures += request.map { TrashFailure(url: $0, reason: unrecorded) }
+                    continue
+                }
+                let moved = await moveThroughHelper(request)
+                journal?.note(moved.trashed, batch: removal)
+                MoveCount.current?.add(moved.trashed.count)
+                helperResult.trashed += moved.trashed
+                helperResult.failures += moved.failures.map(explained)
+                // A helper that never answered may move an item yet, and its line is how History would learn of it.
+                let unanswered = moved.failures.filter { $0.reason == .failed(PrivilegedHelper.mayStillMove) }
+                let leftOrMayLeave = Set(moved.trashed.map(\.originalURL) + unanswered.map(\.url))
+                stayed += request.filter { !leftOrMayLeave.contains($0) }
+            }
+        }
+        journal?.takeBack(linesBefore: stayed, batch: removal)
+        ownMoves.ended(landedAt: helperResult.trashed.map(\.trashedURL))
+        FileSize.forgetAnswers(holding: helperResult.trashed.map(\.originalURL))
+        result.trashed += helperResult.trashed
+        result.failures += helperResult.failures
+        await forgetDomains(helperResult.trashed.map(\.originalURL), nil)
+        result.note(stopped)
+        return result
+    }
+
+    /// Stops the jobs whose files really moved, and answers those it stopped. It runs after the move: a job stopped
+    /// before a move that fails would stay stopped with its file in place. The preference domains of what moved are
+    /// forgotten after it too, since cfprefsd would otherwise forget settings that are still on disk.
+    private func stop(
+        _ jobs: [LaunchdCleanup.Job], thatMoved result: TrashResult, canUseHelper: Bool
+    ) async -> [LaunchdCleanup.Job] {
+        let moved = Set(result.trashed.map(\.originalURL))
+        return await stopJobs(jobs.filter { moved.contains($0.plist) }, canUseHelper)
+    }
+
+    /// A helper's refusal with what Peel can tell of the item from here, since the helper sends only its fixed
+    /// sentence: the guard's own reason for something it holds, or where a link still leads.
+    private func explained(_ failure: TrashFailure) -> TrashFailure {
+        guard case .failed(let message) = failure.reason, let sentence = FixedSentence(message) else { return failure }
+        let reason: TrashFailure.Reason? = switch sentence {
+        case .irreplaceable: removalGuard.refusal(of: failure.url).map { .guarded($0) }
+        case .leadsSomewhere:
+            (try? FileManager.default.destinationOfSymbolicLink(atPath: failure.url.path(percentEncoded: false)))
+                .map { destination in
+                    let target = URL(filePath: destination, relativeTo: failure.url.deletingLastPathComponent())
+                    return .stillLeadsTo(target.standardizedFileURL.path(percentEncoded: false))
+                }
+        default: nil
+        }
+        return reason.map { TrashFailure(url: failure.url, reason: $0, error: failure.error) } ?? failure
+    }
+
+    /// Moves `urls` through the helper. When the helper is not enabled, nothing moves and every item fails with
+    /// `.needsHelper`.
+    private static func moveThroughTheHelper(_ urls: [URL]) async -> TrashResult {
+        guard PrivilegedHelper.status == .enabled else { return await asIfThereWereNoHelper(urls) }
+        return await PrivilegedHelper.moveToTrash(urls)
+    }
+
+    private static func asIfThereWereNoHelper(_ urls: [URL]) async -> TrashResult {
+        TrashResult(failures: urls.map { TrashFailure(url: $0, reason: .needsHelper) })
+    }
+
+    /// What putting items back did.
+    public struct Restored: Sendable {
+        /// Why each item stayed, in the order given, or nil for one that went back.
+        public internal(set) var failures: [RestoreFailure?] = []
+        /// For each item, the version that stood in its place and moved to the Trash to make room, or nil. Each is
+        /// written down like any removal, so it can be put back too.
+        public internal(set) var movedAside: [TrashedItem?] = []
+    }
+
+    /// Puts `items` back in the order given, each as `restore(_:canUseHelper:)` does. The Dock tiles an uninstall took
+    /// out for them go back then, all at once. Launch Services leaves out an app in the Trash and isn't told it moved
+    /// back, so the apps among them are registered again, but only once every item is back: a registered app starts
+    /// its extensions, which would make their containers again before the ones in the Trash went back.
+    @concurrent
+    public func restore(_ items: [TrashedItem], canUseHelper: Bool = false) async -> Restored {
+        await PrivilegedHelper.withOneConsent { await putBack(items, canUseHelper: canUseHelper) }
+    }
+
+    private func putBack(_ items: [TrashedItem], canUseHelper: Bool) async -> Restored {
+        var restored = Restored()
+        for item in items {
+            let answer = await putBack(item, canUseHelper: canUseHelper)
+            restored.failures.append(answer.failure)
+            restored.movedAside.append(answer.movedAside)
+        }
+        let back = zip(items, restored.failures).filter { $0.1 == nil }.map(\.0.originalURL)
+        FileSize.forgetAnswers(holding: back)
+        if !back.isEmpty {
+            await putBackDockTiles(back)
+        }
+        for (item, answer) in zip(items, restored.failures)
+        where answer == nil && AppBundleLayout.isAnApp(item.originalURL) {
+            await registerApp(item.originalURL)
+        }
+        return restored
+    }
+
+    /// Moves an item from the Trash back where it came from, through the helper when the folder needs
+    /// administrator rights.
+    @concurrent
+    func restore(_ item: TrashedItem, canUseHelper: Bool = false) async -> RestoreFailure? {
+        await putBack(item, canUseHelper: canUseHelper).failure
+    }
+
+    /// Puts `item` back, first moving to the Trash the version in its place, which comes back as the item moved
+    /// aside. Should `item` not go back after all, that version goes back to its place.
+    private func putBack(
+        _ item: TrashedItem, canUseHelper: Bool
+    ) async -> (failure: RestoreFailure?, movedAside: TrashedItem?) {
+        var movedAside: TrashedItem?
+        if item.replacementStandsInItsPlace {
+            if let refusal = refusal(ofPuttingBack: item, canUseHelper: canUseHelper) { return (refusal, nil) }
+            let moved = await trash([item.originalURL])
+            guard var replacement = moved.trashed.first else {
+                return (.replacementStays(moved.failures.first?.reason ?? .changedSinceScan), nil)
+            }
+            replacement.replacedBy = item.identity
+            movedAside = replacement
+        }
+        let failure = await moveBack(item, canUseHelper: canUseHelper)
+        guard failure == nil else {
+            guard let movedAside else { return (failure, nil) }
+            let replacementBack = await putBack(movedAside, canUseHelper: canUseHelper)
+            return (failure, replacementBack.failure == nil ? nil : movedAside)
+        }
+        journal?.forget([item])
+        // The label comes from History, which any process of the user can rewrite, so the job starts only as the
+        // file now back in place declares it.
+        if let label = item.stoppedJob,
+           let job = LaunchdCleanup.jobs(for: [item.originalURL], environment: environment).first,
+           job.label == label, !job.isKeptOffBySystemSettings {
+            await startJob(job, canUseHelper)
+        }
+        return (nil, movedAside)
+    }
+
+    /// Why `item` cannot go back as things stand, or nil when it can. A way back only the helper can take stays when
+    /// the helper can't be used.
+    public func refusal(ofPuttingBack item: TrashedItem, canUseHelper: Bool) -> RestoreFailure? {
+        // The record comes from a file any process of the user can rewrite, so it is a request, not a fact.
+        // Putting an item back must not move a file that is not in a Trash, or write where removal is refused.
+        guard isInATrash(item.trashedURL) else { return .notInATrash }
+        if let refusal = removalGuard.refusal(ofPuttingBack: item.trashedURL, at: item.originalURL) {
+            return .notAllowed(refusal)
+        }
+        guard item.isInTheTrash else { return .missingFromTrash }
+        if item.originalURL.isThere {
+            guard item.replacementStandsInItsPlace else { return .alreadyThere }
+            if FileAccess.isLockedInFinder(item.originalURL) { return .replacementStays(.locked) }
+            if let refusal = refusal(of: item.originalURL) { return .replacementStays(refusal) }
+        }
+        if FileAccess.isLockedInFinder(item.trashedURL) { return .locked }
+        let folder = URL(filePath: Self.folder(puttingBack: item))
+        let privacy = FileAccess.isProtectedByPrivacy(folder)
+        if let refusal = Self.refusal(ofPuttingBackInto: folder, isProtectedByPrivacy: privacy) { return refusal }
+        if Self.needsTheHelper(toPutBack: item) {
+            if Self.isFolderGone(puttingBack: item) { return .folderGone }
+            let reach = HelperReach(environment: environment)
+            if let rejection = reach.refusal(ofPuttingBack: item.trashedURL, at: item.originalURL) {
+                return .notAllowedByTheHelper(rejection.explanation)
+            }
+            if !canUseHelper { return .needsHelper }
+        }
+        return nil
+    }
+
+    /// What keeps an item out of `folder` whoever puts it back, the helper included: Finder's lock, or macOS's
+    /// privacy protection. Only the permissions are the helper's to pass.
+    static func refusal(ofPuttingBackInto folder: URL, isProtectedByPrivacy: Bool) -> RestoreFailure? {
+        if FileAccess.isLockedInFinder(folder) { return .folderLocked }
+        return isProtectedByPrivacy ? .notPermitted : nil
+    }
+
+    /// The nearest folder on `item`'s way back that exists, as the kernel names it, which its Put Back writes into:
+    /// missing folders are made again.
+    static func folder(puttingBack item: TrashedItem) -> String {
+        var nearest = item.originalURL.deletingLastPathComponent().path(percentEncoded: false)
+        while nearest != "/", !nearest.isEmpty {
+            if let resolved = PrivilegedPathPolicy.resolvedPath(nearest) { return resolved }
+            nearest = (nearest as NSString).deletingLastPathComponent
+        }
+        return "/"
+    }
+
+    /// Whether the folder `item` goes back into is gone, which the helper doesn't make again. A folder this process
+    /// can't look into isn't known to be gone.
+    static func isFolderGone(puttingBack item: TrashedItem) -> Bool {
+        var info = stat()
+        guard lstat(item.originalURL.deletingLastPathComponent().path(percentEncoded: false), &info) != 0 else {
+            return false
+        }
+        return errno == ENOENT || errno == ENOTDIR
+    }
+
+    /// Whether putting `item` back is the helper's to do: the person can't write to the folder it goes back into.
+    static func needsTheHelper(toPutBack item: TrashedItem) -> Bool {
+        !FileManager.default.isWritableFile(atPath: folder(puttingBack: item))
+    }
+
+    private func moveBack(_ item: TrashedItem, canUseHelper: Bool) async -> RestoreFailure? {
+        if let refusal = refusal(ofPuttingBack: item, canUseHelper: canUseHelper) { return refusal }
+
+        if !Self.needsTheHelper(toPutBack: item) {
+            do {
+                try Self.putBack(item) { removalGuard.refusal(ofPuttingBack: item.trashedURL, at: $0) }
+                return nil
+            } catch let refused as RefusedOnceHeld {
+                return .notAllowed(refused.refusal)
+            } catch is NotTheItemThatMoved {
+                return .missingFromTrash
+            } catch POSIXError.EEXIST {
+                return .alreadyThere
+            } catch {
+                guard Self.reason(for: error) == .notPermitted else { return .failed(error.localizedDescription) }
+                // Refused by macOS rather than by the permissions, the helper couldn't do it either.
+                if FileAccess.isProtectedByPrivacy(item.trashedURL) {
+                    return AppBundleLayout.isAnApp(item.trashedURL) ? .needsAppManagement : .notPermitted
+                }
+            }
+        }
+        guard canUseHelper, PrivilegedHelper.status == .enabled else { return .needsHelper }
+        guard let failure = await PrivilegedHelper.restore(item) else { return nil }
+        return .failed(failure)
+    }
+
+    /// Moves `item` back from the Trash through a descriptor for its folder, making the folders gone on the way
+    /// through descriptors too, never through a link. The guard judges the place as the kernel names it before any
+    /// folder is made and again before the move, which never replaces an item there; a refused Put Back's go again.
+    static func putBack(_ item: TrashedItem, refusal: (URL) -> GuardRefusal?) throws {
+        let trashed = try OpenItem.at(item.trashedURL.path(percentEncoded: false)).get()
+        if let identity = item.identity {
+            guard let now = trashed.identity, let mode = trashed.mode, let size = trashed.size,
+                  identity.isTheItem(now, shape: .init(mode: mode, size: size))
+            else { throw NotTheItemThatMoved() }
+        }
+        let name = item.originalURL.lastPathComponent
+        var nearest = item.originalURL.deletingLastPathComponent().path(percentEncoded: false)
+        var missing: [String] = []
+        while PrivilegedPathPolicy.resolvedPath(nearest) == nil {
+            guard nearest != "/", !nearest.isEmpty else { throw POSIXError(.ENOENT) }
+            missing.insert((nearest as NSString).lastPathComponent, at: 0)
+            nearest = (nearest as NSString).deletingLastPathComponent
+        }
+        guard !missing.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." }) else { throw POSIXError(.EINVAL) }
+
+        var folder = try DirectoryHandle.at(nearest).get()
+        var made: [(parent: DirectoryHandle, name: String, identity: ItemIdentity)] = []
+        func takeBack() {
+            for folder in made.reversed() {
+                folder.parent.removeFolder(folder.name, if: folder.identity)
+            }
+        }
+        func refused(below rest: [String]) throws -> GuardRefusal? {
+            guard let held = folder.currentPath else { throw POSIXError(.ENOENT) }
+            var destination = URL(filePath: held, directoryHint: .isDirectory)
+            for part in rest {
+                destination.append(path: part, directoryHint: .isDirectory)
+            }
+            return refusal(destination.appending(path: name))
+        }
+        if !missing.isEmpty, let refusal = try refused(below: missing) { throw RefusedOnceHeld(refusal: refusal) }
+        do {
+            for part in missing {
+                let next = try folder.child(part, makingIfMissing: true).get()
+                if let identity = next.made {
+                    made.append((folder, part, identity))
+                }
+                folder = next.folder
+            }
+            if let refusal = try refused(below: []) { throw RefusedOnceHeld(refusal: refusal) }
+            try TrashMover.rename(trashed, to: name, in: folder).get()
+        } catch {
+            takeBack()
+            throw error
+        }
+    }
+
+    /// Whether `url` sits directly in a Trash: `~/.Trash`, or `.Trashes/<uid>` at the root of its volume. The
+    /// folder is compared with links resolved, since one that is only called `.Trash` can be a link into
+    /// Messages. `FileManager` is not asked: for a folder in iCloud Drive it names iCloud's Trash, not Peel's.
+    public func isInATrash(_ url: URL) -> Bool {
+        guard let folder = Self.resolvedFolder(of: url) else { return false }
+        return trashes(forItemsIn: folder).contains(folder)
+    }
+
+    /// Whether `url` is in a Trash, directly or in a folder there, where nothing can be moved again.
+    public func isInsideATrash(_ url: URL) -> Bool {
+        Self.isInsideATrash(url, home: environment.homeDirectory)
+    }
+
+    /// `isInsideATrash(_:)` for `home`, without the `RemovalGuard` a service builds, for code that only asks this.
+    public static func isInsideATrash(_ url: URL, home: URL = .homeDirectory) -> Bool {
+        guard let folder = resolvedFolder(of: url) else { return false }
+        return trashes(forItemsIn: folder, homes: [.homeDirectory, home]).contains {
+            PathComponents.isPath(folder, atOrInside: $0)
+        }
+    }
+
+    private static func resolvedFolder(of url: URL) -> String? {
+        guard !url.pathComponents.contains(where: { $0 == "." || $0 == ".." }) else { return nil }
+        return PrivilegedPathPolicy.resolvedPath(url.deletingLastPathComponent().path(percentEncoded: false))
+    }
+
+    /// The Trashes an item in `folder` could be in, with links resolved: the home's, and its volume's.
+    private func trashes(forItemsIn folder: String) -> [String] {
+        Self.trashes(forItemsIn: folder, homes: [.homeDirectory, environment.homeDirectory])
+    }
+
+    private static func trashes(forItemsIn folder: String, homes: [URL]) -> [String] {
+        var trashes = homes.map { $0.appending(path: ".Trash", directoryHint: .isDirectory) }
+        if let volume = try? URL(filePath: folder).resourceValues(forKeys: [.volumeURLKey]).volume {
+            trashes.append(volume.appending(path: ".Trashes/\(getuid())", directoryHint: .isDirectory))
+        }
+        return trashes.compactMap { PrivilegedPathPolicy.resolvedPath($0.path(percentEncoded: false)) }
+    }
+
+    /// Whether `url` is a Trash or inside one, links resolved: `home`'s, or its volume's. What isn't there is in none.
+    public static func isAtOrInsideATrash(_ url: URL, home: URL = .homeDirectory) -> Bool {
+        guard !url.pathComponents.contains(where: { $0 == "." || $0 == ".." }),
+              let resolved = PrivilegedPathPolicy.resolvedPath(url.path(percentEncoded: false))
+        else { return false }
+        return trashes(forItemsIn: resolved, homes: [.homeDirectory, home]).contains {
+            PathComponents.isPath(resolved, atOrInside: $0)
+        }
+    }
+
+    /// The failure reason for an error a move threw. macOS does not say which permission is missing, so any
+    /// refusal is `.notPermitted`, and the caller decides what it means.
+    static func reason(for error: any Error) -> TrashFailure.Reason {
+        if let refused = error as? RefusedOnceHeld { return .guarded(refused.refusal) }
+        if error is MovedWithoutATrace { return .movedWithoutATrace }
+        if let moved = error as? SomethingElseMoved {
+            return .somethingElseMoved(named: moved.trashedURL.lastPathComponent)
+        }
+        let error = error as NSError
+        if error.domain == NSCocoaErrorDomain,
+           [NSFileWriteNoPermissionError, NSFileReadNoPermissionError].contains(error.code) {
+            return .notPermitted
+        }
+        let codes = ([error] + error.underlyingErrors.map { $0 as NSError }).filter { $0.domain == NSPOSIXErrorDomain }
+            .map(\.code)
+        if codes.contains(Int(EPERM)) || codes.contains(Int(EACCES)) { return .notPermitted }
+        return .failed(error.localizedDescription)
+    }
+
+    /// Whether a move failed because nothing was at the item's path.
+    static func foundNothing(_ error: any Error) -> Bool {
+        let error = error as NSError
+        return ([error] + error.underlyingErrors.map { $0 as NSError }).contains {
+            ($0.domain == NSPOSIXErrorDomain && $0.code == Int(ENOENT))
+                || ($0.domain == NSCocoaErrorDomain && $0.code == NSFileNoSuchFileError)
+        }
+    }
+
+    /// The item moved, but macOS did not say where and Peel could not find it.
+    struct MovedWithoutATrace: Error {}
+
+    /// The guard refused the item once its folder was held open and named by the kernel.
+    struct RefusedOnceHeld: Error {
+        let refusal: GuardRefusal
+    }
+
+    /// What sits where an item went in the Trash is another item: the Trash was emptied, and something of the same
+    /// name landed there since.
+    struct NotTheItemThatMoved: Error {}
+
+    /// A move by name put something other than the checked item in the Trash.
+    struct SomethingElseMoved: Error {
+        let trashedURL: URL
+    }
+
+    /// Moves `url` to the Trash, making sure the item that moves is the one the guard allowed. Checked by name and
+    /// then moved by name, its folder could be swapped for a link into Messages between the two steps. So the
+    /// folder is held open, the guard is asked about the kernel's own path for it, and the move goes through the
+    /// descriptor, as the helper's does.
+    static func moveToSystemTrash(
+        _ url: URL,
+        trash: (URL) throws -> URL = Self.trashMacOSNames,
+        byName: (URL) throws -> URL = Self.moveByName,
+        refusal: (URL) -> GuardRefusal?
+    ) throws -> URL {
+        let item = try OpenItem.at(url.path(percentEncoded: false)).get()
+        guard let folder = item.parent.currentPath else { throw POSIXError(.ENOENT) }
+        let held = URL(filePath: folder, directoryHint: .isDirectory).appending(path: item.name)
+        if let refused = refusal(held) { throw RefusedOnceHeld(refusal: refused) }
+
+        guard let named = try? trash(held) else {
+            // A volume where nothing was ever trashed has no Trash yet, and only `FileManager.trashItem` creates
+            // one. That call moves by name, so the item it moved is checked against the one the guard allowed.
+            let judged = TrashedItem.Identity(item, at: held)
+            let trashedURL = try byName(held)
+            var info = stat()
+            guard let judged, lstat(trashedURL.path(percentEncoded: false), &info) == 0,
+                  Int64(info.st_dev) == item.identity?.device, judged.isTheItem(info)
+            else { throw SomethingElseMoved(trashedURL: trashedURL) }
+            return trashedURL
+        }
+        // Another account can make `.Trashes/<uid>` on a shared disk before its owner does, and read what lands there.
+        let bin = try DirectoryHandle.at(named.path(percentEncoded: false)).get()
+        guard bin.ownerIdentifier() == getuid() else { throw POSIXError(.EACCES) }
+        return URL(filePath: try TrashMover.move(item, into: bin).get())
+    }
+
+    private static func trashMacOSNames(for url: URL) throws -> URL {
+        try FileManager.default.url(for: .trashDirectory, in: .userDomainMask, appropriateFor: url, create: true)
+    }
+
+    private static func moveByName(_ url: URL) throws -> URL {
+        // Taken before the move, in case macOS does not say where the item went.
+        let link = FileIdentity.Link.of(url)
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        if let trashedURL = resultingURL as URL? { return trashedURL }
+        // The item has already moved, and History needs to know where to. The folder it left is still there
+        // to say which volume's Trash took it; the item itself is not.
+        let folder = url.deletingLastPathComponent()
+        guard
+            let link,
+            let trash = try? FileManager.default.url(
+                for: .trashDirectory,
+                in: .userDomainMask,
+                appropriateFor: folder,
+                create: false
+            ),
+            let trashedURL = item(link, in: trash)
+        else { throw MovedWithoutATrace() }
+        return trashedURL
+    }
+
+    /// What the line written before `url` moves records: where it is, what it is there, and the place in its Trash
+    /// under its own name. The helper puts what it moves in the home's Trash, as a move puts an item on the home's
+    /// disk.
+    private func departing(_ url: URL) -> TrashedItem {
+        let trash = VolumeTrashes.trash(forItemAt: url, home: environment.homeDirectory)
+        return TrashedItem(
+            originalURL: url, trashedURL: trash.appending(path: url.lastPathComponent), date: .now,
+            identity: .init(ofItemAt: url)
+        )
+    }
+
+    /// The item in `trash` with the device and inode in `link`. A move within a volume keeps the inode, while the
+    /// name proves nothing: macOS renames an item whose name is taken, so an older item of the same name could be
+    /// found instead.
+    static func item(_ link: FileIdentity.Link, in trash: URL) -> URL? {
+        let contents = (try? FileManager.default.contentsOfDirectory(at: trash, includingPropertiesForKeys: nil)) ?? []
+        return contents.first { FileIdentity.Link.of($0) == link }
+    }
+
+    /// The item in `trash` with the device and inode in `link`, under `name` or a name the helper gives when that one
+    /// is taken.
+    static func item(_ link: FileIdentity.Link, named name: String, in trash: URL) -> URL? {
+        item(named: name, inode: UInt64(link.inode), in: trash) {
+            FileIdentity.Link(device: $0.st_dev, inode: $0.st_ino) == link
+        }
+    }
+
+    /// The item in `trash` that `isTheItem` knows, under `name` or a name a move gives an item with `inode` when that
+    /// one is taken. Nothing is listed: without Full Disk Access macOS lets Peel search a Trash but not read it.
+    static func item(named name: String, inode: UInt64, in trash: URL, where isTheItem: (stat) -> Bool) -> URL? {
+        guard let folder = try? DirectoryHandle.at(trash.path(percentEncoded: false)).get() else { return nil }
+        for candidate in TrashMover.names(for: name, inode: inode) {
+            if let info = folder.status(of: candidate), isTheItem(info) { return trash.appending(path: candidate) }
+        }
+        return nil
+    }
+}
+
+/// Folders a request takes, looked up by a path's own names, one level at a time, rather than compared one by one
+/// with every folder: a request of thousands of items would otherwise compare each with all the others.
+private struct Folders {
+    private var names: Set<[String]> = []
+
+    mutating func add(_ path: String) {
+        names.insert(PathComponents.of(path))
+    }
+
+    /// Whether `path` sits inside one of the folders, as `PathComponents.isPath(_:inside:)` asks.
+    func hold(_ path: String) -> Bool {
+        let parts = PathComponents.of(path)
+        return (0..<parts.count).contains { names.contains(Array(parts[..<$0])) }
+    }
+}

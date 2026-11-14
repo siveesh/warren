@@ -1,0 +1,162 @@
+public import Foundation
+
+/// How sure Peel is that nothing uses a group of orphaned files anymore, and why.
+///
+/// It never changes what Peel offers: orphaned files are never selected for the user, whatever this says. It
+/// decides how a row reads, which rows are listed first, and that Peel recommends nothing in a group it is unsure of.
+public struct OrphanConfidence: Sendable, Hashable {
+    public enum Level: Int, Sendable, Hashable, Comparable {
+        /// Something may still use the files: it is running, it wrote here recently or after the app was gone, or
+        /// another app by the same maker is installed.
+        case unsure
+        /// Nothing installed claims it.
+        case likely
+        /// Nothing claims it, and Peel knows why: it saw the app go and nothing wrote here after, nothing has
+        /// written here in months, the files are links into an app that is gone or browser manifests that start a
+        /// program that is gone, or they are system extension copies of an app that is gone, which macOS removes at
+        /// the next restart.
+        case certain
+
+        public static func < (one: Level, other: Level) -> Bool { one.rawValue < other.rawValue }
+    }
+
+    public enum Reason: Sendable, Hashable {
+        /// Peel saw the app installed, and then saw it gone.
+        case appLeft(name: String, lastSeen: Date)
+        /// Nothing has written here in this many whole months.
+        case untouched(months: Int)
+        /// Something wrote here within the last week, so something may still be running.
+        case writtenRecently(Date)
+        /// Something wrote here after Peel last saw the app, later than its removal takes, so something may still
+        /// use the files: the app itself from another disk, or another program.
+        case writtenAfterItLeft(name: String, written: Date)
+        /// An app by the same maker is still installed, and apps by one maker can share group folders.
+        case sameMakerStillInstalled
+        /// Something with this identifier, by this name, is running right now.
+        case running(String)
+        /// Links into an app that is gone, so they lead nowhere.
+        case leadsIntoAnAppThatIsGone
+        /// Only the name of an app Peel saw installed ties these files to it.
+        case onlyTheName(of: String)
+        /// Nothing installed claims the identifier, which is all Peel can say.
+        case nothingClaimsIt
+        /// macOS's record of these system extension copies names the app they were installed for, which is gone.
+        case installedForAnAppThatIsGone(name: String)
+        /// Browser manifests whose program is gone, so they start nothing.
+        case startsAProgramThatIsGone
+        /// Music apps and other hosts load these plug-ins on their own, whatever became of the app they came with.
+        case loadedByOtherApps
+    }
+
+    /// A write this recent means something may still be running. A week covers a Mac left unused over a weekend.
+    public static let recentlyWritten: TimeInterval = 7 * 24 * 60 * 60
+    /// How long after Peel last saw an app a write still counts as part of its removal.
+    public static let settling: TimeInterval = 24 * 60 * 60
+    /// Months without a write after which Peel is sure the files are abandoned.
+    public static let longUntouched = 6
+
+    public let level: Level
+    public let reasons: [Reason]
+
+    /// Judges how sure Peel can be that nothing uses `group`, from the signals the scan already gathered.
+    ///
+    /// A sign that something still uses the files outranks a sign that nothing does. Helpers, agents, and
+    /// command-line tools keep folders that no app bundle claims, and another app by the same maker may still
+    /// read what the two apps shared.
+    public static func judge(
+        _ group: OrphanGroup,
+        installedTeams: Set<String> = [],
+        running: [String: RunningCopies.Process] = [:],
+        now: Date = .now
+    ) -> OrphanConfidence {
+        let declared = group.rememberedApp?.bundleIdentifier.lowercased()
+        let isTheGroups = { (identifier: String) in
+            isOneApp(identifier.lowercased(), group.identifier.lowercased(), declared: declared)
+        }
+        if let match = running.keys.filter(isTheGroups).min() {
+            return OrphanConfidence(level: .unsure, reasons: [.running(running[match]?.name ?? match)])
+        }
+        // A plug-in's row says so and isn't recommended, while what else the app left is judged by the signs below.
+        if group.items.allSatisfy({ $0.heldBack == .loadedByOtherApps }) {
+            return OrphanConfidence(level: .unsure, reasons: [.loadedByOtherApps])
+        }
+        // Links into an app that is gone lead nowhere, whatever their dates or the maker's other apps suggest.
+        if group.items.allSatisfy(\.kind.isForLinks) {
+            return OrphanConfidence(level: .certain, reasons: [.leadsIntoAnAppThatIsGone])
+        }
+        // Only a browser's manifest that starts nothing is listed from the folders browsers read them from.
+        if group.items.allSatisfy({ $0.kind == .nativeMessagingHosts }) {
+            return OrphanConfidence(level: .certain, reasons: [.startsAProgramThatIsGone])
+        }
+        // macOS's own record of a system extension says which app it was installed for. macOS may still run a copy
+        // it keeps turned on, so only copies it removes at the next restart are surely unused.
+        if let app = group.installedFor {
+            let name = URL(filePath: app).deletingPathExtension().lastPathComponent
+            let removing = group.items.allSatisfy { $0.heldBack == .systemExtensionGoingAtRestart }
+            return OrphanConfidence(
+                level: removing ? .certain : .likely,
+                reasons: [.installedForAnAppThatIsGone(name: name)]
+            )
+        }
+        if group.items.allSatisfy({ $0.namedAfter != nil }) {
+            let name = group.rememberedApp?.name ?? group.identifier.split(separator: ".").last.map(String.init)
+            return OrphanConfidence(level: .unsure, reasons: [.onlyTheName(of: name ?? group.identifier)])
+        }
+        let makerIsStillHere = group.rememberedApp?.teamIdentifier.map(installedTeams.contains) ?? false
+        // A folder's own date changes when files are taken out of it, so the last write on a leftover is often
+        // the uninstall itself. If nothing was written later than `settling` after Peel saw the app go, or else after
+        // it last saw the app, a recent date is the removal, not a sign that something still uses the folder.
+        if !makerIsStillHere, let app = group.rememberedApp, let written = lastWrite(in: group),
+           written <= (app.goneSince ?? app.lastSeen).addingTimeInterval(settling) {
+            return OrphanConfidence(level: .certain, reasons: [.appLeft(name: app.name, lastSeen: app.lastSeen)])
+        }
+        if let written = group.lastModified, now.timeIntervalSince(written) < recentlyWritten, written <= now {
+            return OrphanConfidence(level: .unsure, reasons: [.writtenRecently(written)])
+        }
+        if makerIsStillHere {
+            return OrphanConfidence(level: .unsure, reasons: [.sameMakerStillInstalled])
+        }
+
+        if let months = monthsUntouched(group, now: now), months >= longUntouched {
+            return OrphanConfidence(level: .certain, reasons: [.untouched(months: months)])
+        }
+        guard let app = group.rememberedApp else {
+            return OrphanConfidence(level: .likely, reasons: [.nothingClaimsIt])
+        }
+        // Peel saw the app go, and something wrote here later than its removal takes, or when is not known.
+        if let written = lastWrite(in: group), written <= now {
+            return OrphanConfidence(level: .unsure, reasons: [.writtenAfterItLeft(name: app.name, written: written)])
+        }
+        return OrphanConfidence(level: .likely, reasons: [.appLeft(name: app.name, lastSeen: app.lastSeen)])
+    }
+
+    /// Whether two identifiers belong to one app. A helper runs under its app's identifier or a longer one. A
+    /// prefix counts only with three components or more, since two name a maker, not an app, unless it is what the
+    /// app declared. A Safari web app's identifier begins with Safari's, and is still an app of its own.
+    static func isOneApp(_ one: String, _ other: String, declared: String? = nil) -> Bool {
+        if one == other { return true }
+        guard !SafariWebApp.isIdentifier(one), !SafariWebApp.isIdentifier(other) else { return false }
+        let (short, long) = one.count < other.count ? (one, other) : (other, one)
+        return (Identifier.componentCount(of: short) >= 3 || short == declared) && long.hasPrefix(short + ".")
+    }
+
+    /// The group's last write, or nil when an item was not measured in time: what is inside it was not read.
+    static func lastWrite(in group: OrphanGroup) -> Date? {
+        group.total.isComplete ? group.lastModified : nil
+    }
+
+    /// Whole months since the group's last write, from the items whose date moves when they are used: code macOS
+    /// loads keeps its date, so a group of plug-ins alone says nothing this way.
+    static func monthsUntouched(_ group: OrphanGroup, now: Date) -> Int? {
+        let used = group.items.filter { !$0.kind.isLoadedCode }
+        guard group.total.isComplete, let written = used.compactMap(\.modificationDate).max(), written <= now else {
+            return nil
+        }
+        // Counts Gregorian months, whatever calendar the user has set. In a lunar calendar, the default in Saudi
+        // Arabia, six months end several days sooner.
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        let months = calendar.dateComponents([.month], from: written, to: now).month
+        return months.map { max(0, $0) }
+    }
+}

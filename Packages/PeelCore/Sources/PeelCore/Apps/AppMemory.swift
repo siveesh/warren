@@ -1,0 +1,181 @@
+public import Foundation
+internal import PeelPrivileged
+
+/// An app Peel has seen installed, kept after the app is gone. An app dragged to the Trash leaves its files
+/// behind with nothing to name them, so Peel shows them under the remembered name instead of an identifier.
+public struct RememberedApp: Sendable, Hashable, Codable, Identifiable {
+    public let bundleIdentifier: String
+    public let name: String
+    public let teamIdentifier: String?
+    public let lastSeen: Date
+    /// Where it was the last time Peel saw it, which is worth showing when its files turn up later.
+    public let lastPath: String
+    /// The other places Peel has seen it, such as a copy on another disk, each of which keeps it installed.
+    public var otherPaths: [String]? = nil
+    /// The folders its own product file named for its data (`InstalledApp.productFolders`).
+    public var productFolders: [ProductFolder]? = nil
+    /// When Peel, running, read the apps again and found it gone from where it was. Nil when it left while Peel was
+    /// closed, since a launch weeks later can't say when.
+    public var goneSince: Date? = nil
+    /// Whether the App Store signed it under its identifier (`InstalledApp.isSignedByTheAppStore`).
+    public var isSignedByTheAppStore: Bool? = nil
+    /// Where each of its places on a disk other than the startup disk is, by that disk's volume.
+    public var disks: [String: DiskPlace]? = nil
+
+    public var id: String { bundleIdentifier }
+}
+
+extension RememberedApp {
+    /// The app as it is now, when Peel cannot tell that it left: its bundle is still where Peel last saw it, the disk
+    /// it was on is not connected, or macOS will not let Peel read its Info.plist. Nil once the place can be looked at
+    /// and the app is not there.
+    /// A place on another disk is known by that disk's volume: while no disk mounted has it, or more than one does, the
+    /// app is out of sight, and once one has it, the app is looked for there, wherever that disk is mounted now.
+    func stillInstalled(on mounted: MountedDisks = .now()) -> InstalledApp? {
+        let places = ([lastPath] + (otherPaths ?? [])).map { path in
+            let url = URL(filePath: path, directoryHint: .isDirectory)
+            guard let disk = disks?[path] else { return (url: url, isOutOfSight: url.isOnADiskNotConnected) }
+            return disk.url(on: mounted, directoryHint: .isDirectory).map { (url: $0, isOutOfSight: false) }
+                ?? (url: url, isOutOfSight: true)
+        }
+        for place in places where !place.isOutOfSight {
+            if let app = AppInspector.inspect(place.url), app.bundleIdentifier == bundleIdentifier { return app }
+        }
+        return places.first { $0.isOutOfSight || AppInspector.isClosed($0.url) }.map(\.url).map {
+            InstalledApp(
+                url: $0, bundleIdentifier: bundleIdentifier, name: name, teamIdentifier: teamIdentifier,
+                isSignedByTheAppStore: isSignedByTheAppStore == true
+            )
+        }
+    }
+}
+
+public struct AppMemory: Sendable {
+    /// The most apps remembered, which is enough for any Mac. The least recently seen are dropped first.
+    public static let maximumApps = 2000
+    private static let mostOtherPaths = 8
+
+    public let url: URL
+
+    public init(url: URL = AppMemory.defaultURL) {
+        self.url = url
+    }
+
+    public static var defaultURL: URL { url(inHome: .homeDirectory) }
+
+    static func url(inHome home: URL) -> URL {
+        PeelFolder.url(inHome: home).appending(path: "apps.json")
+    }
+
+    @concurrent
+    public func load() async -> [RememberedApp] {
+        // Taking the lock makes its file and folder, and a read must leave a home as it found it.
+        guard !url.isMissing else { return [] }
+        return FileLock.whileHeld(beside: url) { read() } ?? []
+    }
+
+    /// Records the apps currently installed, keeping every app seen before. Reading, merging, and writing happen
+    /// under one lock, so two refreshes that overlap cannot lose each other's apps.
+    /// `gone` holds the identifiers a reading of the apps no longer found, against the reading before it while Peel
+    /// ran: each is noted as gone from then, once its place can be looked at and it isn't there.
+    @discardableResult
+    @concurrent
+    public func remember(_ apps: [InstalledApp], gone: Set<String> = [], now: Date = .now) async -> [RememberedApp] {
+        FileLock.whileHeld(beside: url) { remember(apps, gone: gone, now: now, onTopOf: read()) }
+    }
+
+    /// `known` is nil when the file cannot be read or reached. Its contents are then unknown, so it is never
+    /// written over, and the apps currently installed are still returned for this run.
+    private func remember(
+        _ apps: [InstalledApp], gone: Set<String>, now: Date, onTopOf known: [RememberedApp]?
+    ) -> [RememberedApp] {
+        var byIdentifier = Dictionary(
+            (known ?? []).map { ($0.bundleIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let mounted = MountedDisks.now()
+        for identifier in gone {
+            guard var app = byIdentifier[identifier], app.goneSince == nil, app.stillInstalled(on: mounted) == nil
+            else { continue }
+            app.goneSince = now
+            byIdentifier[identifier] = app
+        }
+        for app in apps where !app.isSystemProtected {
+            guard let identifier = app.bundleIdentifier else { continue }
+            let path = PathPattern.comparablePath(of: app.url)
+            let earlier = byIdentifier[identifier].map { [$0.lastPath] + ($0.otherPaths ?? []) } ?? []
+            let others = earlier.filter { $0 != path }.prefix(Self.mostOtherPaths)
+            var disks = (byIdentifier[identifier]?.disks ?? [:]).filter { others.contains($0.key) }
+            disks[path] = DiskPlace(of: app.url)
+            byIdentifier[identifier] = RememberedApp(
+                bundleIdentifier: identifier,
+                name: app.name,
+                teamIdentifier: app.teamIdentifier,
+                lastSeen: now,
+                lastPath: path,
+                otherPaths: others.isEmpty ? nil : Array(others),
+                productFolders: app.productFolders.isEmpty ? nil : app.productFolders,
+                isSignedByTheAppStore: app.isSignedByTheAppStore ? true : nil,
+                disks: disks.isEmpty ? nil : disks
+            )
+        }
+
+        let kept = byIdentifier.values
+            .sorted {
+                $0.lastSeen != $1.lastSeen ? $0.lastSeen > $1.lastSeen : $0.bundleIdentifier < $1.bundleIdentifier
+            }
+            .prefix(Self.maximumApps)
+            .map { $0 }
+        if known != nil { write(kept) }
+        return kept
+    }
+
+    /// Returns nil when the file cannot be read or reached. The file is the only record of apps that are gone,
+    /// so a row that cannot be decoded costs only that row. The damaged file is first kept under another name,
+    /// and when that fails, this returns nil so the file is left alone.
+    private func read() -> [RememberedApp]? {
+        guard !url.isMissing else { return [] }
+        guard let data = BoundedRead.data(at: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let apps = try? decoder.decode([RememberedApp].self, from: data) { return apps }
+        let readable = (try? decoder.decode([Row].self, from: data))?.compactMap(\.app) ?? []
+        guard DamagedFile.setAside(url) != nil else { return nil }
+        write(readable)
+        return readable
+    }
+
+    /// One row of the file, decoded on its own. `app` is nil when the row is not a valid app.
+    private struct Row: Decodable {
+        let app: RememberedApp?
+
+        init(from decoder: any Decoder) {
+            app = try? RememberedApp(from: decoder)
+        }
+    }
+
+    /// Returns the remembered app a leftover identifier belongs to: the same identifier, or else the longest one
+    /// it starts with, so `com.example.app.helper` belongs to `com.example.app`. A two-part identifier
+    /// (`md.obsidian`) is shaped like a maker's domain, which everything that maker ships starts with, so it never
+    /// counts as a prefix. `LeftoverMatcher` follows the same rule.
+    public static func app(for identifier: String, in remembered: [RememberedApp]) -> RememberedApp? {
+        let lowercased = identifier.lowercased()
+        if let exact = remembered.first(where: { $0.bundleIdentifier.lowercased() == lowercased }) {
+            return exact
+        }
+        return remembered
+            .filter {
+                Identifier.componentCount(of: $0.bundleIdentifier) >= 3
+                    && lowercased.hasPrefix($0.bundleIdentifier.lowercased() + ".")
+            }
+            .max { $0.bundleIdentifier.count < $1.bundleIdentifier.count }
+    }
+
+    private func write(_ apps: [RememberedApp]) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(apps) else { return }
+        try? PeelFolder.write(data, to: url)
+    }
+}

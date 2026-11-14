@@ -1,0 +1,471 @@
+public import Darwin
+import Foundation
+
+public struct PrivilegedPathPolicy: Sendable {
+    public enum Rejection: Error, Equatable, Sendable, CaseIterable {
+        case notAbsolute
+        case relativeComponent
+        case controlCharacter
+        case unresolvableParent
+        /// The folder it is in is there, but the helper had no descriptor left to open it with.
+        case tooManyOpenFolders
+        case outsideAllowedLocations
+        case notAnApplication
+        case partOfAnotherApp
+        case missing
+        case alreadyExists
+        case protectedByFlags
+        case irreplaceable
+        case loadsCode
+        case notALink
+        case leadsSomewhere
+        case startsAProgram
+
+        /// What the helper sends back when it refuses. The app recognizes it and says it in the reader's language.
+        public var explanation: String {
+            switch self {
+            case .notAbsolute: "That isn’t a full path."
+            case .relativeComponent: "The path has a . or .. in it."
+            case .controlCharacter: "The path holds a character no real name has."
+            case .unresolvableParent: "The folder it’s in couldn’t be found."
+            case .tooManyOpenFolders: "Peel’s helper had too many folders open at once. Try again."
+            case .outsideAllowedLocations: "It is outside the folders Peel’s helper may touch."
+            case .notAnApplication: "Peel removes only apps from that folder."
+            case .partOfAnotherApp: "It is part of another app, and Peel removes only whole apps from that folder."
+            case .missing: "It isn’t there anymore."
+            case .alreadyExists: "Something is there already."
+            case .protectedByFlags: "macOS marks it as protected."
+            case .irreplaceable: "It holds something nothing could bring back, so Peel never moves it."
+            case .loadsCode: "It could have changed while it was in the Trash, and code is loaded from that folder, so Peel’s helper puts back only what is root’s alone. You can drag it back out in Finder."
+            case .notALink: "Peel removes only links from that folder."
+            case .leadsSomewhere: "It is a link that still leads to something on this Mac, and from that folder Peel’s helper removes only links that lead nowhere."
+            case .startsAProgram: "From that folder, Peel removes only what starts a program that is no longer there."
+            }
+        }
+
+        /// Why a folder would not open: it is gone, or the helper had no descriptor left to open it with.
+        init(openingFolderFailedWith error: POSIXError) {
+            self = [.EMFILE, .ENFILE].contains(error.code) ? .tooManyOpenFolders : .unresolvableParent
+        }
+    }
+
+    public static let systemLocations = ["/Applications"]
+        + (LibraryFolder.local + LibraryFolder.plugIns).map { "/Library/" + $0.rawValue }
+        + ["/private/var/db/receipts"]
+
+    /// The served folders where anything the helper moved may be put back (`init` adds the user's Library), but for
+    /// the plug-in folders inside them. The others are folders that code is loaded from, and take back only what
+    /// belongs to root alone (see `openDestination`). `HelperLedger`, never the caller, decides which item may go
+    /// back, and where to.
+    public static let restoreLocations = [
+        "/Applications",
+        "/Library/Application Support",
+        "/Library/Caches",
+        "/Library/Logs",
+        "/Library/Preferences",
+        "/private/var/db/receipts",
+    ]
+
+    /// The folders command-line tools and their shell completions are linked into. The helper takes only a link from
+    /// them, and only one that leads nowhere: what an app's tool leaves there once the app is gone. The one exception
+    /// is a link to Peel's own tool, which Remove Peel hands over while Peel is still in place (`ownTool`).
+    public static let linkLocations = (CommandFolders.usrLocal + CommandFolders.macPorts).map { "/" + $0 }
+        + shellCompletionFolders.map { "/usr/local/" + $0 }
+
+    /// Where shell completions are linked under a prefix: Homebrew's four for a cask (`Cask::Config`), the first of
+    /// which also begins zsh's own function path, `/usr/local/share/zsh/site-functions`.
+    public static let shellCompletionFolders = [
+        "share/zsh/site-functions", "share/fish/vendor_completions.d", "etc/bash_completion.d", "share/pwsh/completions",
+    ]
+
+    /// The folders of `/Library` plug-ins are loaded from, which load code wherever they sit: AAX plug-ins are in
+    /// Application Support.
+    public static let plugInLocations = LibraryFolder.plugIns.map { "/Library/" + $0.rawValue }
+
+    /// The folders of `/Library` browsers read native messaging manifests from. The helper takes from them only a
+    /// manifest that starts nothing, as it judges the item it opened.
+    public static let manifestLocations = NativeMessagingFolder.inTheMacsLibrary.map { "/Library/" + $0.path }
+
+    private static let protectedFlags = UInt32(SF_RESTRICTED) | UInt32(SF_IMMUTABLE) | UInt32(SF_NOUNLINK)
+
+    static func isProtected(flags: UInt32) -> Bool {
+        flags & protectedFlags != 0
+    }
+
+    private let locations: [String]
+    /// The served folders alone, without those the helper takes only a link or a manifest from, lowercased, as
+    /// names from the root.
+    private let servedFolders: Set<[String]>
+    private let restorable: [String]
+    private let applicationLocations: [String]
+    private let links: [String]
+    private let manifests: [String]
+    private let plugIns: [String]
+    /// The device and inode of the `peel` tool inside the app the helper runs from.
+    private let ownTool: (device: dev_t, inode: ino_t)?
+    /// The folders of the home's Library that Peel searches, lowercased, as names from the root.
+    private let searchedFolders: Set<[String]>
+    private let homeDirectory: String
+    private let trustedOwner: uid_t
+
+    public init(
+        homeDirectory: String,
+        systemLocations: [String] = Self.systemLocations,
+        applicationLocations: [String] = ["/Applications"],
+        restoreLocations: [String] = Self.restoreLocations,
+        linkLocations: [String] = Self.linkLocations,
+        manifestLocations: [String] = Self.manifestLocations,
+        plugInLocations: [String] = Self.plugInLocations,
+        ownTool: String? = nil,
+        trustedOwner: uid_t = 0
+    ) {
+        self.homeDirectory = homeDirectory
+        self.trustedOwner = trustedOwner
+        links = linkLocations.compactMap(Self.realPath)
+        manifests = manifestLocations.compactMap(Self.realPath)
+        plugIns = plugInLocations.compactMap(Self.realPath)
+        self.ownTool = ownTool.flatMap { path in
+            var info = stat()
+            guard stat(path, &info) == 0 else { return nil }
+            return (info.st_dev, info.st_ino)
+        }
+        let served = (systemLocations + [homeDirectory + "/Library"]).compactMap(Self.realPath)
+        servedFolders = Set(served.map { PathComponents.of($0.lowercased()) })
+        locations = served + links + manifests
+        restorable = (restoreLocations + [homeDirectory + "/Library"]).compactMap(Self.realPath)
+        self.applicationLocations = applicationLocations.compactMap(Self.realPath)
+        let library = Self.realPath(homeDirectory + "/Library") ?? homeDirectory + "/Library"
+        searchedFolders = Set(LibraryFolder.inTheUsersLibrary.map { folder in
+            PathComponents.of((library + "/" + folder.rawValue).lowercased())
+        })
+    }
+
+    /// The `peel` tool of the app whose `Contents/MacOS` holds `executable`, where launchd starts the helper
+    /// (`BundleProgram`), or nil for an executable anywhere else.
+    public static func peelTool(besideHelperAt executable: String) -> String? {
+        let names = PathComponents.of(executable)
+        guard names.count >= 4, Array(names.suffix(3).dropLast()) == ["Contents", "MacOS"],
+              PathComponents.isNamedAsAnApp(names[names.count - 4])
+        else { return nil }
+        return "/" + (names.dropLast(2) + ["Helpers", "peel"]).joined(separator: "/")
+    }
+
+    /// True for a path directly in one of the folders the helper takes only a link from.
+    public func takesOnlyALink(at path: String) -> Bool {
+        guard let parent = Self.realPath((path as NSString).deletingLastPathComponent) else { return false }
+        return links.contains(parent)
+    }
+
+    private struct Resolved {
+        let parent: String
+        let name: String
+        let path: String
+    }
+
+    /// Checks `path` by name alone, before anything is opened. The parent is resolved once, the result must
+    /// sit inside one of `locations`, and it must neither be nor hold anything protected.
+    private func resolve(
+        _ path: String,
+        in locations: [String],
+        puttingBackAFolder: Bool = false
+    ) -> Result<Resolved, Rejection> {
+        guard path.hasPrefix("/") else { return .failure(.notAbsolute) }
+        guard Self.isPlainlyReadable(path) else { return .failure(.controlCharacter) }
+        guard !ProtectedData.refuses(path, home: homeDirectory) else { return .failure(.irreplaceable) }
+        let components = PathComponents.of(path)
+        guard let name = components.last, !components.contains(where: { $0 == "." || $0 == ".." }) else {
+            return .failure(.relativeComponent)
+        }
+
+        let parent = "/" + components.dropLast().joined(separator: "/")
+        guard let resolvedParent = Self.realPath(parent) else { return .failure(.unresolvableParent) }
+        let onDisk = Self.spelledOnDisk((resolvedParent == "/" ? "" : resolvedParent) + "/" + name, in: AT_FDCWD)
+        return judge(
+            name, spelledOnDisk: onDisk?.name, in: resolvedParent, locations: locations,
+            puttingBackAFolder: puttingBackAFolder
+        )
+    }
+
+    /// The checks on `name` in a folder named with no link left in its path, as `realpath` or the kernel names it.
+    /// They read the name the disk keeps for what is there, since a disk that folds case and letters opens `Logſ` as
+    /// `Logs`, while the item keeps the name it was asked by, which the ledger records and History asks to put back.
+    private func judge(
+        _ name: String,
+        spelledOnDisk diskName: String?,
+        in resolvedParent: String,
+        locations: [String],
+        puttingBackAFolder: Bool = false
+    ) -> Result<Resolved, Rejection> {
+        let folder = resolvedParent == "/" ? "" : resolvedParent
+        let resolved = folder + "/" + (diskName ?? name)
+        guard
+            !ProtectedData.refuses(resolved, home: homeDirectory),
+            !searchedFolders.contains(PathComponents.of(resolved.lowercased())),
+            !ProtectedData.spellings(of: resolved).contains(where: ProtectedData.isInAContainersDocuments)
+        else { return .failure(.irreplaceable) }
+        // Refused as well when moving it would take something protected along with it. The helper runs as
+        // root, so it asks this itself rather than trusting the app to.
+        guard
+            !ProtectedData.holds(resolved, home: homeDirectory),
+            !ProtectedData.holdsAContainersDocuments(resolved),
+            ProtectedData.holdsWorkKeptInACache(resolved) == .nothing,
+            ProtectedData.holdsALibrary(resolved) == .nothing,
+            ProtectedData.holdsABrowserWallet(resolved) == .nothing
+        else { return .failure(.irreplaceable) }
+
+        guard let location = locations.first(where: { PathComponents.isPath(resolved, inside: $0) }) else {
+            return .failure(.outsideAllowedLocations)
+        }
+        // A folder Peel looks inside stays too, and so does one on the way to it, since moving it would take that
+        // one along. One that is gone may come back from the Trash, as a folder only.
+        let names = PathComponents.of(resolved.lowercased())
+        guard puttingBackAFolder
+            || (!searchedFolders.contains(where: { $0.count > names.count && $0.starts(with: names) })
+                && !servedFolders.contains(where: { $0.starts(with: names) }))
+        else { return .failure(.irreplaceable) }
+        // A tool's link sits directly in its folder, never deeper, and so does a browser's manifest.
+        if links.contains(location), resolvedParent != location {
+            return .failure(.outsideAllowedLocations)
+        }
+        if manifests.contains(resolved)
+            || manifests.contains(where: { PathComponents.isPath(resolved, inside: $0) && resolvedParent != $0 }) {
+            return .failure(.outsideAllowedLocations)
+        }
+        if applicationLocations.contains(location) {
+            guard PathComponents.isNamedAsAnApp(diskName ?? name) else { return .failure(.notAnApplication) }
+            // An app inside another is part of it: the helper takes none out, which would break the other's seal,
+            // and puts none back in.
+            let between = PathComponents.of(resolvedParent).dropFirst(PathComponents.of(location).count)
+            guard !between.contains(where: PathComponents.isNamedAsAnApp) else { return .failure(.partOfAnotherApp) }
+        }
+        return .success(Resolved(parent: resolvedParent, name: name, path: folder + "/" + name))
+    }
+
+    /// What the helper would answer before opening anything, nil when it would go on to open `path`.
+    public func refusal(of path: String) -> Rejection? {
+        if case .failure(let rejection) = resolve(path, in: locations) { return rejection }
+        return nil
+    }
+
+    /// Checks `path`, opens its folder, and checks the item again there, as the kernel names that folder. The move
+    /// goes through the same descriptor and moves only the item whose identity was read here.
+    public func open(_ path: String) -> Result<OpenItem, Rejection> {
+        open(path, beforeOpening: {})
+    }
+
+    func open(
+        _ path: String,
+        beforeOpening: () -> Void,
+        beforeReadingItsName: () -> Void = {}
+    ) -> Result<OpenItem, Rejection> {
+        openFolder(of: path, beforeOpening: beforeOpening).flatMap { name, parent in
+            var info = stat()
+            guard name.withCString({ fstatat(parent.descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) == 0 else {
+                return .failure(.missing)
+            }
+            beforeReadingItsName()
+            // The name the disk keeps is read with the item's identity in one call, so the rules judge the item
+            // that moves.
+            guard let onDisk = Self.spelledOnDisk(name, in: parent.descriptor),
+                  onDisk.device == info.st_dev, onDisk.file == UInt64(info.st_ino)
+            else { return .failure(.missing) }
+            return judged(name, spelledOnDisk: onDisk.name, in: parent).flatMap { item in
+                guard !Self.isProtected(flags: info.st_flags) else { return .failure(.protectedByFlags) }
+                if links.contains(item.parent) {
+                    guard info.st_mode & S_IFMT == S_IFLNK else { return .failure(.notALink) }
+                    // Followed this time: nothing there, or a chain that loops, is a link that leads nowhere.
+                    var target = stat()
+                    let leads = item.name.withCString { fstatat(parent.descriptor, $0, &target, 0) } == 0
+                    let error = errno
+                    let isOwnTool = leads && ownTool.map { $0 == (target.st_dev, target.st_ino) } == true
+                    guard isOwnTool || !leads && (error == ENOENT || error == ENOTDIR || error == ELOOP) else {
+                        return .failure(.leadsSomewhere)
+                    }
+                }
+                let opened = OpenItem(path: item.path, name: item.name, parent: parent, status: info)
+                if manifests.contains(item.parent), !Self.startsNothing(opened, status: info) {
+                    return .failure(.startsAProgram)
+                }
+                return .success(opened)
+            }
+        }
+    }
+
+    /// Whether `item`, in a folder browsers read native messaging manifests from, starts nothing: a link that leads
+    /// nowhere, or a manifest whose bytes, read from the file that was judged, name a program that is gone.
+    private static func startsNothing(_ item: OpenItem, status: stat) -> Bool {
+        if status.st_mode & S_IFMT == S_IFLNK {
+            var target = stat()
+            let leads = item.name.withCString { fstatat(item.parent.descriptor, $0, &target, 0) } == 0
+            let error = errno
+            return !leads && (error == ENOENT || error == ENOTDIR || error == ELOOP)
+        }
+        guard NativeMessagingManifest.isManifest(named: item.name),
+              let contents = item.contents(ofAtMost: NativeMessagingManifest.maximumSize),
+              let program = NativeMessagingManifest.program(in: contents.data)
+        else { return false }
+        return NativeMessagingManifest.isGone(program)
+    }
+
+    /// Whether a folder that code is loaded from keeps out an item `owner` owns with `mode`, going back to `path` in
+    /// `parent`: such a folder takes back only what root owns and nobody else can write to, which is how anything the
+    /// helper took from there looks. Anything else could have been rewritten while it sat in the user's Trash. A
+    /// browser starts the program a manifest names, so a manifests folder is one that code is loaded from, and so is
+    /// a plug-in folder inside a folder that takes anything back.
+    private func keepsOut(owner: uid_t?, mode: mode_t?, at path: String, in parent: String) -> Bool {
+        let loadsCode = manifests.contains(parent) || plugIns.contains { PathComponents.isPath(path, inside: $0) }
+        let takesAnything = restorable.contains { PathComponents.isPath(path, inside: $0) }
+        guard !takesAnything || loadsCode else { return false }
+        return owner != trustedOwner || mode.map { $0 & 0o022 != 0 } ?? true
+    }
+
+    /// What `openDestination` would answer before it opens anything, for an item `owner` owns with `mode`, nil when it
+    /// would go on to open the folder.
+    public func refusal(ofPuttingBack path: String, owner: uid_t?, mode: mode_t?) -> Rejection? {
+        let aFolder = mode.map { $0 & S_IFMT == S_IFDIR } ?? false
+        switch resolve(path, in: locations, puttingBackAFolder: aFolder) {
+        case .failure(let rejection):
+            return rejection
+        case .success(let item):
+            if links.contains(item.parent), mode.map({ $0 & S_IFMT == S_IFLNK }) != true { return .notALink }
+            return keepsOut(owner: owner, mode: mode, at: item.path, in: item.parent) ? .loadsCode : nil
+        }
+    }
+
+    /// Like `open`, for a path where nothing exists yet. A folder that code is loaded from keeps out what `keepsOut`
+    /// says.
+    public func openDestination(_ path: String, for trashed: OpenItem) -> Result<OpenItem, Rejection> {
+        let aFolder = trashed.mode.map { $0 & S_IFMT == S_IFDIR } ?? false
+        return openFolder(of: path, beforeOpening: {}, puttingBackAFolder: aFolder).flatMap { name, parent in
+            judged(
+                name, spelledOnDisk: Self.spelledOnDisk(name, in: parent.descriptor)?.name, in: parent,
+                puttingBackAFolder: aFolder
+            ).flatMap { item in
+                if links.contains(item.parent) {
+                    guard let mode = trashed.mode, mode & S_IFMT == S_IFLNK else { return .failure(.notALink) }
+                }
+                if keepsOut(owner: trashed.owner, mode: trashed.mode, at: item.path, in: item.parent) {
+                    return .failure(.loadsCode)
+                }
+                var info = stat()
+                guard item.name.withCString({ fstatat(parent.descriptor, $0, &info, AT_SYMLINK_NOFOLLOW) }) != 0 else {
+                    return .failure(.alreadyExists)
+                }
+                return .success(OpenItem(path: item.path, name: item.name, parent: parent))
+            }
+        }
+    }
+
+    /// Checks `path` by name, so nothing is opened for a path refused anyway, then opens its folder.
+    private func openFolder(
+        of path: String,
+        beforeOpening: () -> Void,
+        puttingBackAFolder: Bool = false
+    ) -> Result<(name: String, parent: DirectoryHandle), Rejection> {
+        resolve(path, in: locations, puttingBackAFolder: puttingBackAFolder).flatMap { named in
+            beforeOpening()
+            switch DirectoryHandle.at(canonical: named.parent) {
+            case .success(let parent): return .success((named.name, parent))
+            case .failure(let error): return .failure(Rejection(openingFolderFailedWith: error))
+            }
+        }
+    }
+
+    /// Checks `name` again in the folder `parent` holds, as the kernel names it now.
+    private func judged(
+        _ name: String,
+        spelledOnDisk diskName: String?,
+        in parent: DirectoryHandle,
+        puttingBackAFolder: Bool = false
+    ) -> Result<Resolved, Rejection> {
+        guard let folder = parent.currentPath else { return .failure(.unresolvableParent) }
+        return judge(
+            name, spelledOnDisk: diskName, in: folder, locations: locations, puttingBackAFolder: puttingBackAFolder
+        )
+    }
+
+    /// Opens the user's own Trash. A link in place of `.Trash` is refused, and the folder must belong to
+    /// `user`, so the Trash cannot be used to drop a root-owned file somewhere else.
+    public func openTrash(ownedBy user: uid_t) -> DirectoryHandle? {
+        guard
+            let home = Self.realPath(homeDirectory),
+            let trash = (try? DirectoryHandle.at(canonical: home).get())?.child(".Trash"),
+            trash.ownerIdentifier() == user
+        else { return nil }
+        return trash
+    }
+
+    /// Opens the item at `path` when, with links resolved, it sits inside `trash`.
+    public func openInTrash(_ path: String, trash: DirectoryHandle) -> OpenItem? {
+        guard
+            let item = try? OpenItem.at(path).get(),
+            PathComponents.isPath(item.parent.path, atOrInside: trash.path)
+        else { return nil }
+        return item
+    }
+
+    /// False for a path holding a control character. The rules here read a Swift string, but the kernel
+    /// reads a C string, which ends at the first NUL, so a path holding a NUL would be checked as one thing
+    /// and moved as another. Every other control character is refused as well.
+    static func isPlainlyReadable(_ path: String) -> Bool {
+        !path.utf8.contains { $0 < 0x20 || $0 == 0x7F }
+    }
+
+    /// True for a launchd label the helper may pass to `launchctl`: letters, digits, `.`, `-`, `_`, and the `@` and
+    /// `+` of Homebrew's services named after a formula (`sh.brew.postgresql@16`); no shell or path characters, no
+    /// leading dot or hyphen, and no `com.apple.` prefix.
+    public static func isValidLabel(_ label: String) -> Bool {
+        guard (1...255).contains(label.utf8.count), !label.hasPrefix("com.apple.") else { return false }
+        return label.utf8.allSatisfy { byte in
+            (byte >= 0x30 && byte <= 0x39) || (byte >= 0x41 && byte <= 0x5A) || (byte >= 0x61 && byte <= 0x7A)
+                || byte == 0x2E || byte == 0x2D || byte == 0x5F || byte == 0x40 || byte == 0x2B
+        } && label.first != "." && label.first != "-"
+    }
+
+    /// True for a job the helper may act on. The `com.apple.` prefix is not enough, since macOS also ships
+    /// daemons such as `com.openssh.sshd`, `org.cups.cupsd`, and `com.vix.cron`, so every label macOS declares
+    /// is refused too, and every instance launchd runs of one. An empty list means the labels could not be read,
+    /// and then everything is refused. The helper never acts on itself: `bootout` would kill it before it answers,
+    /// and `disable` persists across boots (`man launchctl`), leaving nothing to undo it.
+    public static func allowsDaemon(_ label: String, shipped: Set<String> = SystemDaemons.shipped) -> Bool {
+        isValidLabel(label) && !shipped.isEmpty && !SystemDaemons.belongs(label, to: shipped)
+            && label != HelperIdentity.helperIdentifier
+    }
+
+    /// The path with every symlink resolved, or nil when it doesn't exist.
+    public static func resolvedPath(_ path: String) -> String? {
+        realPath(path)
+    }
+
+    static func realPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+
+    /// The name the disk keeps for `name` in the folder `descriptor` holds, with the device and file number of what
+    /// is there, read in one call without opening it or following a link; nil when nothing is there.
+    static func spelledOnDisk(_ name: String, in descriptor: Int32) -> (name: String, device: dev_t, file: UInt64)? {
+        var request = attrlist()
+        request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
+        request.commonattr = attrgroup_t(ATTR_CMN_NAME) | attrgroup_t(ATTR_CMN_DEVID) | attrgroup_t(ATTR_CMN_FILEID)
+        // Layout: UInt32 length, the name's reference, the device, the file number, then the name's bytes.
+        var buffer = [UInt8](repeating: 0, count: 32 + 4 * Int(NAME_MAX))
+        let status = buffer.withUnsafeMutableBytes { bytes in
+            name.withCString {
+                getattrlistat(descriptor, $0, &request, bytes.baseAddress, bytes.count, UInt(FSOPT_NOFOLLOW))
+            }
+        }
+        guard status == 0 else { return nil }
+        return buffer.withUnsafeBytes { bytes in
+            let reference = bytes.loadUnaligned(fromByteOffset: 4, as: attrreference_t.self)
+            let start = 4 + Int(reference.attr_dataoffset), length = Int(reference.attr_length)
+            guard length > 0, start + length <= bytes.count else { return nil }
+            return (
+                String(decoding: bytes[start..<(start + length - 1)], as: UTF8.self),
+                bytes.loadUnaligned(fromByteOffset: 12, as: dev_t.self),
+                bytes.loadUnaligned(fromByteOffset: 16, as: UInt64.self)
+            )
+        }
+    }
+}

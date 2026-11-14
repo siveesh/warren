@@ -1,0 +1,248 @@
+import Darwin
+public import Foundation
+internal import PeelPrivileged
+
+public enum AccessState: Sendable, Hashable {
+    case granted
+    case missing
+    case unknown
+}
+
+public enum FullDiskAccess {
+    /// Checks whether Peel has Full Disk Access. macOS has no API for it, so Peel tries to list folders that only
+    /// Full Disk Access opens, one after another, and the first clear answer decides.
+    @concurrent
+    public static func state(home: URL = .homeDirectory) async -> AccessState {
+        currentState(home: home)
+    }
+
+    /// The same, read on the caller's thread.
+    static func currentState(home: URL = .homeDirectory) -> AccessState {
+        let probes = [
+            home.appending(path: ".Trash", directoryHint: .isDirectory),
+            home.appending(path: "Library/Containers/com.apple.Safari", directoryHint: .isDirectory),
+            home.appending(path: "Library/Safari", directoryHint: .isDirectory),
+        ]
+        for probe in probes {
+            let state = canList(probe)
+            if state != .unknown { return state }
+        }
+        return .unknown
+    }
+
+    /// Why a folder can't be opened or listed: macOS's privacy (TCC) protection fails with `EPERM`, which Full Disk
+    /// Access lifts, and the folder's own permissions with `EACCES`, which it doesn't change, as for a `.Trash` that
+    /// `sudo` left owned by root.
+    public enum Refusal: Sendable, Hashable {
+        case privacy
+        case permissions
+        case other
+
+        public init(error: Int32) {
+            self = switch error {
+            case EPERM: .privacy
+            case EACCES: .permissions
+            default: .other
+            }
+        }
+    }
+
+    public static func whyUnlistable(_ url: URL) -> Refusal? {
+        guard let directory = opendir(url.path(percentEncoded: false)) else { return Refusal(error: errno) }
+        closedir(directory)
+        return nil
+    }
+
+    /// Whether `url` can be listed: missing only when macOS's privacy protection refused it, unknown for any other
+    /// refusal.
+    static func canList(_ url: URL) -> AccessState {
+        switch whyUnlistable(url) {
+        case nil: .granted
+        case .privacy: .missing
+        case .permissions, .other: .unknown
+        }
+    }
+
+    /// Whether Peel offers to reopen itself: Full Disk Access is still missing, and System Settings, where it is turned
+    /// on, has been in front since Peel started. Access given there reaches only a process started after it.
+    public static func offersReopen(_ state: AccessState, systemSettingsWasInFront: Bool) -> Bool {
+        state == .missing && systemSettingsWasInFront
+    }
+
+    public static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!
+}
+
+/// The link at `/usr/local/bin/peel` to the command line tool inside Peel: the command that creates it, and
+/// whether it leads to this copy of Peel.
+public enum CommandLineTool {
+    public static let path = "/usr/local/bin/peel"
+    /// Where Homebrew links the tool when it installs Peel on a Mac with Apple silicon. On an Intel Mac it links
+    /// it at `path` itself.
+    public static let homebrewPath = "/opt/homebrew/bin/peel"
+    /// Every place a `peel` command of this copy's can be: the link Peel offers to make, and Homebrew's.
+    public static let paths = [path, homebrewPath]
+
+    /// Whether a `peel` command leads to this copy's tool, from any of `paths`.
+    public static func isOnThePath(embedded: URL, at paths: [String] = paths) -> Bool {
+        paths.contains { standing(at: $0, embedded: embedded) == .installed }
+    }
+
+    /// The link's standing as Settings and Home show it: installed once any of `paths` leads to this copy's tool, as
+    /// Homebrew's does on a Mac with Apple silicon, and otherwise the standing of the link Peel offers to make.
+    public static func standingOnThePath(embedded: URL, at paths: [String] = paths) -> Standing {
+        isOnThePath(embedded: embedded, at: paths) ? .installed : standing(at: paths[0], embedded: embedded)
+    }
+
+    public enum Standing: Sendable, Hashable {
+        case installed
+        case missing
+        /// A link to the tool inside another copy of Peel, moved or gone, or to this copy's tool when it does not run.
+        /// Replacing it takes nothing but the link.
+        case otherPeel
+        /// A file that is not a link, or a link to anything but a Peel's tool. It may not be Peel's, so Peel never
+        /// offers a command that replaces it.
+        case somethingElse(Other)
+    }
+
+    public enum Other: Sendable, Hashable {
+        case file
+        /// A link, to where it leads.
+        case link(to: String)
+    }
+
+    /// Where Peel is running from. It decides whether a link to the tool inside Peel keeps working.
+    public enum Place: Sendable, Hashable {
+        /// `/Applications` or `~/Applications`, where an app stays put.
+        case applications
+        /// The temporary copy macOS runs an app from while it is still marked as downloaded (App Translocation).
+        /// Its path changes every time and it is gone when the app quits, so no link may point into it.
+        case temporaryCopy
+        /// A disk Peel can't write to, such as the disk image it came on, which is ejected sooner or later.
+        case readOnlyVolume
+        /// Anywhere else, such as Downloads, a disk image, or a build folder. An app there may still be moved.
+        case elsewhere
+    }
+
+    public static func place(
+        of bundle: URL = Bundle.main.bundleURL, home: URL = .homeDirectory,
+        isReadOnly: (URL) -> Bool = SelfRemoval.isOnAReadOnlyVolume
+    ) -> Place {
+        let path = PathPattern.comparablePath(of: bundle)
+        guard !path.contains("/AppTranslocation/") else { return .temporaryCopy }
+        let applications = ["/Applications", PathPattern.comparablePath(of: home) + "/Applications"]
+        guard !applications.contains(where: { PathComponents.isPath(path, inside: $0) }) else { return .applications }
+        return isReadOnly(bundle) ? .readOnlyVolume : .elsewhere
+    }
+
+    /// The shell command that links the tool, built from where Peel really is rather than a fixed path, or nil once the
+    /// link leads to this copy's tool, where something that may not be Peel's is in the link's place, and from a
+    /// temporary copy or a read-only disk, whose link would lead nowhere once Peel quits or the disk is ejected.
+    /// `ln -f` deletes what is there, so only a link to another Peel's tool is replaced.
+    public static func installCommand(embedded: URL, standing: Standing) -> String? {
+        guard let path = lastingPath(of: embedded) else { return nil }
+        let link = switch standing {
+        case .missing: "ln -s"
+        case .otherPeel: "ln -sf"
+        case .installed, .somethingElse: nil as String?
+        }
+        return link.map { "sudo mkdir -p /usr/local/bin && sudo \($0) '\(path)' \(CommandLineTool.path)" }
+    }
+
+    public struct ShellLine: Sendable, Equatable {
+        public let file: String
+        public let line: String
+    }
+
+    /// What an account that is not an administrator adds to its shell's startup file to run `peel` from anywhere, since
+    /// the link takes `sudo`. A function, since the shell reads an alias's text again and would split a path at a
+    /// space. Terminal starts a login shell, which is the one bash reads `~/.bash_profile` in.
+    public static func shellLine(embedded: URL, shell: String? = ShellSessions.loginShell()) -> ShellLine? {
+        guard let path = lastingPath(of: embedded) else { return nil }
+        return switch shell.map({ URL(filePath: $0).lastPathComponent }) {
+        case "fish": ShellLine(file: "~/.config/fish/config.fish", line: "function peel; '\(path)' $argv; end")
+        case "bash": ShellLine(file: "~/.bash_profile", line: "peel() { '\(path)' \"$@\"; }")
+        default: ShellLine(file: "~/.zshrc", line: "peel() { '\(path)' \"$@\"; }")
+        }
+    }
+
+    /// The tool's path with each single quote closed, escaped, and reopened, or nil from a temporary copy or a
+    /// read-only disk, whose tool goes away once Peel quits or the disk is ejected.
+    private static func lastingPath(of embedded: URL) -> String? {
+        let bundle = embedded.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard ![.temporaryCopy, .readOnlyVolume].contains(place(of: bundle)) else { return nil }
+        return embedded.path(percentEncoded: false).replacingOccurrences(of: "'", with: "'\\''")
+    }
+
+    public static func standing(at path: String = CommandLineTool.path, embedded: URL) -> Standing {
+        let manager = FileManager.default
+        guard let destination = try? manager.destinationOfSymbolicLink(atPath: path) else {
+            var info = stat()
+            guard lstat(path, &info) == 0 else { return .missing }
+            // A file that is not a link: something else named `peel`, not Peel's tool.
+            return .somethingElse(.file)
+        }
+        let target = URL(filePath: destination, relativeTo: URL(filePath: path).deletingLastPathComponent())
+            .standardizedFileURL
+        guard target.path(percentEncoded: false) == embedded.standardizedFileURL.path(percentEncoded: false) else {
+            return isAPeelsTool(target) ? .otherPeel : .somethingElse(.link(to: target.path(percentEncoded: false)))
+        }
+        return manager.isExecutableFile(atPath: target.path(percentEncoded: false)) ? .installed : .otherPeel
+    }
+
+    /// Whether `url` is where a copy of Peel keeps its tool: `<name>.app/Contents/Helpers/peel`.
+    private static func isAPeelsTool(_ url: URL) -> Bool {
+        let names = url.pathComponents
+        return names.count >= 4 && names.suffix(3) == ["Contents", "Helpers", "peel"]
+            && PathComponents.isNamedAsAnApp(names[names.count - 4])
+    }
+}
+
+/// App Management has no API, so only a removal shows whether Peel has it.
+public enum AppManagement {
+    public static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles")!
+
+    /// What a removal shows about App Management, or nil when it shows nothing. A bundle Peel moved means granted
+    /// only when it is signed by another team than Peel's: App Management keeps apps of one team from changing
+    /// another's (WWDC 2022, "What's new in privacy"), so an unsigned app, or one of Peel's own team, moves without
+    /// it. A bundle macOS refused to move from a folder the user can write to, when nothing locks it, means missing.
+    /// Bundles the root helper moved don't count, since the helper doesn't need Peel's permission. Reading a signature
+    /// asks `trustd`, so it never runs on the main thread.
+    @concurrent
+    public static func state(
+        after result: TrashResult,
+        appBundles: Set<URL>,
+        movedByTheHelper: Set<URL> = []
+    ) async -> AccessState? {
+        await state(
+            after: result, appBundles: appBundles, movedByTheHelper: movedByTheHelper, ownTeam: CodeSigning.currentTeam
+        )
+    }
+
+    @concurrent
+    static func state(
+        after result: TrashResult,
+        appBundles: Set<URL>,
+        movedByTheHelper: Set<URL> = [],
+        ownTeam: String?,
+        teamOf: @Sendable (URL) -> String? = CodeSignature.teamIdentifier(at:)
+    ) async -> AccessState? {
+        let asked = appBundles.subtracting(movedByTheHelper)
+        let guarded = result.trashed.contains { item in
+            asked.contains(item.originalURL) && teamOf(item.trashedURL).map { $0 != ownTeam } == true
+        }
+        if guarded {
+            return .granted
+        }
+        for failure in result.failures where asked.contains(failure.url) && failure.reason == .notPermitted {
+            if isRefusedForWantOfPermission(failure.url) { return .missing }
+        }
+        return nil
+    }
+
+    /// Whether a refused move of `url` points to App Management: the user can write to the bundle's folder, and
+    /// nothing locks the bundle. The removal alert uses the same test.
+    public static func isRefusedForWantOfPermission(_ url: URL) -> Bool {
+        let canBeMoved = !FileAccess.requiresPrivilegesToRemove(url) || FileAccess.isProtectedByPrivacy(url)
+        return canBeMoved && !FileAccess.isLocked(url)
+    }
+}

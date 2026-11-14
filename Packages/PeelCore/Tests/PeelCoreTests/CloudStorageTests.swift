@@ -1,0 +1,1051 @@
+import FileProvider
+import Foundation
+@testable import PeelCore
+import Synchronization
+import Testing
+
+struct CloudStorageTests {
+    /// Freeing a file that isn't safely in iCloud yet could remove its only copy.
+    @Test func freesOnlyWhatIsSafelyInTheCloud() {
+        #expect(CloudStorage.isSafeToFree(status: .current, isUploaded: true, isUploading: false, hasConflicts: false))
+        #expect(CloudStorage.isSafeToFree(status: .current, isUploaded: true, isUploading: nil, hasConflicts: nil))
+
+        #expect(
+            !CloudStorage.isSafeToFree(status: .current, isUploaded: false, isUploading: false, hasConflicts: false),
+            "it wasn't uploaded yet"
+        )
+        #expect(
+            !CloudStorage.isSafeToFree(status: .current, isUploaded: true, isUploading: true, hasConflicts: false),
+            "it was still uploading"
+        )
+        #expect(
+            !CloudStorage.isSafeToFree(status: .current, isUploaded: true, isUploading: false, hasConflicts: true),
+            "it has a conflict to settle"
+        )
+        #expect(
+            !CloudStorage.isSafeToFree(status: .downloaded, isUploaded: true, isUploading: false, hasConflicts: false),
+            "an older copy is on this Mac"
+        )
+        #expect(
+            !CloudStorage.isSafeToFree(
+                status: .notDownloaded,
+                isUploaded: true,
+                isUploading: false,
+                hasConflicts: false
+            ),
+            "there is nothing here to free"
+        )
+        #expect(!CloudStorage.isSafeToFree(status: nil, isUploaded: nil, isUploading: nil, hasConflicts: nil))
+    }
+
+    /// On macOS 26, syncing can be paused for an item. A paused item with local edits is not uploading, yet it
+    /// still reads as uploaded (`NSURL.h`: `NSURLUbiquitousItemIsSyncPausedKey`).
+    @Test func leavesAloneAFileWhoseSyncIsPaused() {
+        #expect(
+            !CloudStorage.isSafeToFree(
+                status: .current,
+                isUploaded: true,
+                isUploading: false,
+                hasConflicts: false,
+                isSyncPaused: true
+            )
+        )
+        #expect(
+            CloudStorage.isSafeToFree(
+                status: .current,
+                isUploaded: true,
+                isUploading: false,
+                hasConflicts: false,
+                isSyncPaused: false
+            )
+        )
+        #expect(!CloudStorage.isSafeToFree(
+            status: .current, isUploaded: true, isUploading: false, hasConflicts: false,
+            uploadingError: CocoaError(.fileWriteNoPermission)
+        ))
+    }
+
+    @Test func saysWhyAFileIsNotSafeToFree() {
+        func why(
+            _ status: URLUbiquitousItemDownloadingStatus? = .current, uploaded: Bool? = true, uploading: Bool? = false,
+            conflicts: Bool? = false, paused: Bool? = false, error: (any Error)? = nil
+        ) -> CloudRefusal.Reason? {
+            CloudStorage.notSafeToFree(
+                status: status, isUploaded: uploaded, isUploading: uploading, hasConflicts: conflicts,
+                isSyncPaused: paused, uploadingError: error
+            )
+        }
+        let failure = NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError)
+
+        #expect(why() == nil)
+        #expect(why(.downloaded) == .olderVersion)
+        #expect(why(.notDownloaded) == .notDownloaded)
+        #expect(why(uploaded: false) == .notUploaded)
+        #expect(why(uploading: true) == .notUploaded)
+        #expect(why(conflicts: true) == .inConflict)
+        #expect(why(paused: true) == .syncPaused)
+        #expect(why(error: failure) == .uploadFailed(failure.localizedDescription))
+    }
+
+    /// The list can stay on screen for hours, so each file is checked again at the moment it is freed. A file
+    /// that changed since the scan is not freed.
+    @Test func freesNothingThatChangedSinceTheScan() async throws {
+        let directory = try TemporaryDirectory()
+        let url = try directory.file("Library/Mobile Documents/com~apple~CloudDocs/file.bin", bytes: 2_000_000)
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+        let scanned = try #require(collector.collected.files.first)
+
+        let untouched = await CloudStorage.free([scanned], exclusions: .none, whyNotSafe: { _ in nil }).refused
+        let later: [FileAttributeKey: Any] = [.modificationDate: Date.now.addingTimeInterval(60)]
+        try FileManager.default.setAttributes(later, ofItemAtPath: url.path(percentEncoded: false))
+        let changed = await CloudStorage.free([scanned], exclusions: .none, whyNotSafe: { _ in nil }).refused
+
+        #expect(untouched.map(\.reason) != [.editedSinceScan], "only iCloud can remove a download, so a test's fails")
+        #expect(changed.map(\.reason) == [.editedSinceScan])
+        #expect(FileManager.default.fileExists(atPath: url.path(percentEncoded: false)))
+    }
+
+    /// The list on screen was filtered by the exclusions as they stood at the scan, so a file excluded since, or
+    /// any file while the exclusions are not known, stays downloaded.
+    @Test func leavesAloneWhatWasExcludedSinceTheScan() async throws {
+        let directory = try TemporaryDirectory()
+        let url = try directory.file("Offline/file.bin", bytes: 2_000_000)
+        let scanned = CloudFile(url: url, name: "file.bin", container: "iCloud Drive", size: 2_000_000, modified: .distantPast)
+        let offline = Exclusions(paths: [directory.url.appending(path: "Offline", directoryHint: .isDirectory)])
+
+        #expect(await CloudStorage.free([scanned], exclusions: offline).refused.map(\.reason) == [.excluded])
+        #expect(await CloudStorage.free([scanned], exclusions: .notYetRead).refused.map(\.reason) == [.excluded])
+        let unreadable = Exclusions.unreadable(because: nil)
+        #expect(await CloudStorage.free([scanned], exclusions: unreadable).refused.map(\.reason) == [.excluded])
+    }
+
+    @Test func callsEachFolderWhatTheUserCallsIt() {
+        let root = URL(filePath: "/Users/x/Library/Mobile Documents", directoryHint: .isDirectory)
+        func name(_ path: String) -> String {
+            CloudStorage.containerName(of: URL(filePath: "/Users/x/Library/Mobile Documents/" + path), under: root)
+        }
+
+        #expect(name("com~apple~CloudDocs/Photo.png") == "iCloud Drive")
+        #expect(name("com~apple~Pages/Letter.pages") == "Pages")
+        #expect(name("iCloud~com~facebook~Messenger/a.bin") == "Messenger")
+        #expect(name("F3LWYJ7GM7~com~apple~garageband10/Song") == "garageband10")
+        #expect(CloudStorage.containerName(of: URL(filePath: "/somewhere/else"), under: root) == "")
+    }
+
+    private static let mobileDocuments = URL.homeDirectory.appending(
+        path: "Library/Mobile Documents", directoryHint: .isDirectory
+    )
+
+    /// The app folders of this Mac's iCloud Drive that macOS gives a name, which only a Mac with iCloud Drive has.
+    private static func namedContainers() -> [(container: URL, shown: String)] {
+        let containers = (try? FileManager.default.contentsOfDirectory(
+            at: mobileDocuments, includingPropertiesForKeys: nil
+        )) ?? []
+        return containers.filter { $0.lastPathComponent != "com~apple~CloudDocs" }.compactMap { container in
+            guard let shown = try? container.resourceValues(forKeys: [.ubiquitousItemContainerDisplayNameKey])
+                .ubiquitousItemContainerDisplayName, !shown.isEmpty
+            else { return nil }
+            return (container, shown)
+        }
+    }
+
+    @Test(.enabled("iCloud Drive on this Mac names an app's folder") { !namedContainers().isEmpty })
+    func namesAnAppsFolderAsMacOSShowsIt() {
+        for (container, shown) in Self.namedContainers() {
+            let file = container.appending(path: "Documents/Report.pages")
+            #expect(CloudStorage.containerName(of: file, under: Self.mobileDocuments) == shown, "\(container.lastPathComponent)")
+        }
+    }
+
+    @Test func groupsTheDownloadsByTheFolderFinderShowsThemIn() throws {
+        let directory = try TemporaryDirectory()
+        let root = directory.url.appending(path: "Library/Mobile Documents", directoryHint: .isDirectory)
+        func file(_ path: String, _ size: Int64) throws -> CloudFile {
+            let url = try directory.file("Library/Mobile Documents/\(path)")
+            let container = CloudStorage.containerName(of: url, under: root)
+            return CloudFile(url: url, name: url.lastPathComponent, container: container, size: size, modified: nil)
+        }
+        let files = [
+            try file("com~apple~CloudDocs/Muzica/A.mp3", 20),
+            try file("iCloud~org~example~Notes/Documents/Letter.txt", 5),
+            try file("com~apple~CloudDocs/Archive.zip", 40),
+            try file("com~apple~CloudDocs/Muzica/B.mp3", 30),
+            try file("com~apple~CloudDocs/Documents/pfp/Me.png", 15),
+            try file("iCloud~org~example~Notes/documents/Drafts/Plan.txt", 2),
+        ]
+
+        let folders = CloudStorage.folders(of: files, home: directory.url)
+
+        #expect(folders.map(\.names) == [
+            ["iCloud Drive", "Muzica"], ["iCloud Drive"], ["iCloud Drive", "Documents", "pfp"], ["Notes"],
+            ["Notes", "Drafts"],
+        ])
+        #expect(folders.map(\.size) == [50, 40, 15, 5, 2])
+        #expect(folders.first?.files.map(\.name) == ["B.mp3", "A.mp3"])
+        let found = Set(files.filter { $0.name == "A.mp3" }.map(\.url))
+        #expect(folders.first?.keeping(found)?.files.map(\.name) == ["A.mp3"])
+        #expect(folders.first?.keeping(found)?.size == 20)
+        #expect(folders.last?.keeping(found) == nil)
+    }
+
+    /// Scans the real iCloud Drive of the Mac running the tests, which must work and change nothing.
+    @Test func readsThisMacWithoutFreeingAnything() async {
+        let scan = await CloudStorage.downloaded()
+        #expect(scan.files.allSatisfy { $0.size >= CloudStorage.minimumSize })
+        #expect(scan.files.allSatisfy { FileManager.default.fileExists(atPath: $0.url.path(percentEncoded: false)) })
+        #expect(Set(scan.files.map(\.id)).count == scan.files.count)
+    }
+
+    /// A row's size is what removing the download frees, never the length the file claims: a file stored
+    /// compressed takes fewer blocks than its length, and a clone shares its blocks, so removing it frees nothing.
+    /// Only iCloud can say a file is safely there, so the test says it for these.
+    @Test func aFilesSizeIsWhatRemovingItsDownloadFrees() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        let plain = try directory.file("\(drive)/plain.bin", bytes: 3_000_000)
+        let compressed = try directory.compressedTextFile("\(drive)/compressed.txt")
+        let original = try directory.file("\(drive)/original.bin", bytes: 2_000_000)
+        let clone = original.deletingLastPathComponent().appending(path: "clone.bin")
+        #expect(clonefile(original.path(percentEncoded: false), clone.path(percentEncoded: false), 0) == 0)
+
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url,
+            minimumSize: 1,
+            exclusions: .none,
+            into: collector,
+            countingFor: nil,
+            isSafe: { _ in true },
+            unless: { false }
+        )
+        let sizes = Dictionary(uniqueKeysWithValues: collector.collected.files.map { ($0.name, $0.size) })
+
+        #expect(sizes["plain.bin"] == ReclaimableSpace.of(plain))
+        #expect((sizes["plain.bin"] ?? 0) >= 3_000_000)
+        #expect(sizes["compressed.txt"] == ReclaimableSpace.of(compressed))
+        #expect((sizes["compressed.txt"] ?? .max) < 240_000, "the compressed file was weighed by its length")
+        #expect(sizes["original.bin"] == nil, "a file whose blocks a clone shares frees nothing")
+        #expect(sizes["clone.bin"] == nil, "a clone frees nothing")
+    }
+
+    @Test func holdsBackWhatKeepDownloadedKeepsOnThisMac() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        for path in ["Trip/Plans/route.pdf", "Trip/ticket.pdf", "Map.pdf", "Notes/a.pdf"] {
+            try directory.file("\(drive)/\(path)", bytes: 2_000)
+        }
+        let pinned: Set = ["Trip", "Map.pdf"]
+
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, isPinned: { pinned.contains($0.lastPathComponent) },
+            unless: { false }
+        )
+
+        let held = Dictionary(uniqueKeysWithValues: collector.collected.files.map { ($0.name, $0.heldBack) })
+        #expect(held["route.pdf"] == .keptDownloaded)
+        #expect(held["ticket.pdf"] == .keptDownloaded)
+        #expect(held["Map.pdf"] == .keptDownloaded)
+        #expect(held["a.pdf"] == .some(nil))
+        #expect(collector.collected.files.filter(\.isRecommended).map(\.name) == ["a.pdf"])
+    }
+
+    @Test func recommendsOnlyWhatIsInICloudDriveItself() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/Report.pdf", bytes: 2_000)
+        try directory.file("Library/Mobile Documents/iCloud~org~example~notes/Documents/notes.db", bytes: 2_000)
+
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, isPinned: { _ in false }, unless: { false }
+        )
+
+        let held = Dictionary(uniqueKeysWithValues: collector.collected.files.map { ($0.name, $0.heldBack) })
+        #expect(held["Report.pdf"] == .some(nil))
+        #expect(held["notes.db"] == .inAnAppsICloudFolder)
+    }
+
+    @Test func holdsBackPasswordsAndWalletsItWouldTakeOffline() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        for path in ["Passwords.kdbx", "Coins/wallets/wallet.dat", "Coins/wallets/db.log", "Coins/prices.csv"] {
+            try directory.file("\(drive)/\(path)", bytes: 2_000)
+        }
+
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, isPinned: { _ in false }, unless: { false }
+        )
+
+        let held = Dictionary(uniqueKeysWithValues: collector.collected.files.map { ($0.name, $0.heldBack) })
+        #expect(held["Passwords.kdbx"] == .opensOnlyOnline)
+        #expect(held["wallet.dat"] == .opensOnlyOnline)
+        #expect(held["db.log"] == .opensOnlyOnline)
+        #expect(held["prices.csv"] == .some(nil))
+    }
+
+    @Test func saysWhenICloudDriveIsNotSetUp() async throws {
+        let directory = try TemporaryDirectory()
+
+        #expect(!CloudStorage.isSetUp(home: directory.url))
+        #expect(await CloudStorage.downloaded(home: directory.url).isNotSetUp)
+
+        try directory.directory("Library/Mobile Documents/com~apple~CloudDocs")
+        #expect(CloudStorage.isSetUp(home: directory.url))
+        #expect(await CloudStorage.downloaded(home: directory.url).isNotSetUp == false)
+    }
+
+    /// A folder kept only in the cloud, which no test can make, is named to the walk.
+    @Test func neverLooksIntoAFolderThatLivesOnlyInTheCloud() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        try directory.file("\(drive)/plain.bin", bytes: 3_000_000)
+        try directory.file("\(drive)/Evicted/inside.bin", bytes: 3_000_000)
+        let evicted = PathPattern.comparablePath(of: directory.url.appending(path: "\(drive)/Evicted"))
+
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url,
+            minimumSize: 1,
+            exclusions: .none,
+            into: collector,
+            countingFor: nil,
+            isSafe: { _ in true },
+            isDataless: { PathPattern.comparablePath(of: $0) == evicted },
+            unless: { false }
+        )
+
+        #expect(collector.collected.files.map(\.name) == ["plain.bin"])
+    }
+
+    /// A download that takes a row's worth of space but shares it with another copy frees nothing, so it is left
+    /// out of the list and counted, for the page to say why it is missing.
+    @Test func countsTheDownloadsLeftOutBecauseAnotherCopySharesTheirSpace() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        try directory.file("\(drive)/plain.bin", bytes: 3_000_000)
+        let original = try directory.file("\(drive)/original.bin", bytes: 2_000_000)
+        let small = try directory.file("\(drive)/small.bin", bytes: 200_000)
+        let inPackage = try directory.file("\(drive)/Notes.rtfd/TXT.rtf", bytes: 2_000_000)
+        let drivePath = directory.url.appending(path: drive)
+        for (source, name) in [(original, "clone.bin"), (small, "small clone.bin"), (inPackage, "Notes.rtf")] {
+            let clone = drivePath.appending(path: name)
+            #expect(clonefile(source.path(percentEncoded: false), clone.path(percentEncoded: false), 0) == 0)
+        }
+
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: CloudStorage.minimumSize, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+
+        #expect(collector.collected.files.map(\.name) == ["plain.bin"])
+        #expect(collector.collected.sharedDownloads == 4, "only the clones that take a row's worth count")
+    }
+
+    @Test func leavesAFolderWithoutICloudAlone() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/plain.txt", bytes: 4_000_000)
+
+        let scan = await CloudStorage.downloaded(home: directory.url)
+        #expect(scan.files.isEmpty, "an ordinary file was offered as an iCloud one")
+        #expect(!scan.couldNotRead)
+        #expect(scan.cutShort == nil)
+    }
+
+    /// Without Full Disk Access, iCloud Drive cannot be read. The scan then says so, rather than reporting
+    /// nothing to free.
+    @Test(.permissionsHold) func saysWhenICloudDriveCouldNotBeRead() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("Library/Mobile Documents")
+        try directory.setPermissions(0o000, of: "Library/Mobile Documents")
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: directory.url.appending(path: "Library/Mobile Documents").path(percentEncoded: false)
+            )
+        }
+
+        let scan = await CloudStorage.downloaded(home: directory.url)
+
+        #expect(scan.couldNotRead)
+        #expect(scan.files.isEmpty)
+    }
+
+    /// A Mac where iCloud Drive was never set up has no `Mobile Documents` folder. That is nothing to list, not a
+    /// folder that could not be read, so the page does not ask for Full Disk Access, which would change nothing.
+    @Test func aMacWithoutICloudDriveIsNotOneThatCouldNotBeRead() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("Library")
+
+        let scan = await CloudStorage.downloaded(home: directory.url)
+
+        #expect(!scan.couldNotRead)
+        #expect(scan.files.isEmpty)
+    }
+
+    /// A walk that stops early, because it ran out of time or filled its list, says it was cut short, so a
+    /// partial list is never shown as a complete one.
+    @Test func saysWhenTheWalkWasCutShort() async throws {
+        let directory = try TemporaryDirectory()
+        for index in 0..<20 {
+            try directory.file("Library/Mobile Documents/com~apple~CloudDocs/folder\(index)/file.bin", bytes: 1_000)
+        }
+
+        let held = DispatchSemaphore(value: 0)
+        defer { held.signal() }
+
+        let scan = await CloudStorage.downloaded(
+            home: directory.url, minimumSize: 1, exclusions: .none, desktopPictures: [], within: 0,
+            isDataless: { _ in
+                held.wait()
+                held.signal()
+                return false
+            }
+        )
+
+        #expect(scan.cutShort == .ranOutOfTime)
+    }
+
+    /// A full list keeps the biggest files the walk finds, wherever they are, and still says it is not all of it.
+    @Test func aFullListKeepsTheBiggestFilesFoundAnywhere() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/a/first.bin", bytes: 2_000)
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/b/second.bin", bytes: 30_000)
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/z/last.bin", bytes: 90_000)
+        let collector = CloudStorage.Collector(maximum: 2)
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+
+        #expect(Set(collector.collected.files.map(\.name)) == ["last.bin", "second.bin"])
+        #expect(collector.collected.cutShort == .listIsFull)
+    }
+
+    @Test func aListThatFilledBeforeTheTimeRanOutSaysTheTimeRanOut() {
+        let collector = CloudStorage.Collector(maximum: 1)
+        for name in ["a.bin", "b.bin"] {
+            collector.add(CloudFile(
+                url: URL(filePath: "/org.example/\(name)"), name: name, container: "iCloud Drive", size: 2_000_000,
+                modified: nil
+            ))
+        }
+        #expect(collector.collected.cutShort == .listIsFull)
+
+        collector.ranOutOfTime()
+        collector.add(CloudFile(
+            url: URL(filePath: "/org.example/c.bin"), name: "c.bin", container: "iCloud Drive", size: 3_000_000,
+            modified: nil
+        ))
+        #expect(collector.collected.cutShort == .ranOutOfTime)
+    }
+
+    private func linkInICloudDrive(
+        _ name: String, to destination: String, in directory: borrowing TemporaryDirectory
+    ) throws {
+        let drive = try directory.directory("Library/Mobile Documents/com~apple~CloudDocs")
+        try FileManager.default.createSymbolicLink(
+            atPath: drive.appending(path: name).path(percentEncoded: false), withDestinationPath: destination
+        )
+    }
+
+    private func safeScan(of directory: borrowing TemporaryDirectory) async -> CloudScan {
+        await CloudStorage.downloaded(
+            home: directory.url, minimumSize: 1, exclusions: .none, desktopPictures: [], within: CloudStorage.budget,
+            isSafe: { _ in true }, isDataless: { _ in false }
+        )
+    }
+
+    @Test func readsDesktopAndDocumentsWhereICloudDriveKeepsThem() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Documents/pfp/Me.png", bytes: 2_000)
+        try directory.file("Desktop/Shot.png", bytes: 3_000)
+        try linkInICloudDrive("Documents", to: "../../../Documents", in: directory)
+        try linkInICloudDrive(
+            "Desktop", to: directory.url.appending(path: "Desktop").path(percentEncoded: false), in: directory
+        )
+
+        let scan = await safeScan(of: directory)
+
+        #expect(scan.files.map(\.name) == ["Shot.png", "Me.png"])
+        #expect(scan.files.allSatisfy { $0.isRecommended })
+        #expect(scan.cutShort == nil)
+        #expect(!scan.couldNotRead)
+        #expect(scan.folders.map(\.names) == [["iCloud Drive", "Desktop"], ["iCloud Drive", "Documents", "pfp"]])
+    }
+
+    @Test func leavesAHomeFolderICloudDriveDoesNotKeep() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Documents/Local.png", bytes: 2_000)
+        try directory.file("Desktop/Local.png", bytes: 2_000)
+        try directory.file("Elsewhere/Other.png", bytes: 2_000)
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/Documents/InICloud.png", bytes: 2_000)
+        try linkInICloudDrive("Desktop", to: "../../../Elsewhere", in: directory)
+
+        let scan = await safeScan(of: directory)
+
+        #expect(scan.files.map(\.name) == ["InICloud.png"])
+    }
+
+    @Test func aHomeFolderICloudDriveKeepsFollowsTheRulesOfTheRest() async throws {
+        let directory = try TemporaryDirectory()
+        let kept = try directory.file("Documents/Pinned/Kept.png", bytes: 2_000)
+        let secret = try directory.file("Documents/Vault.kdbx", bytes: 2_000)
+        try directory.file("Documents/Excluded/Left.png", bytes: 2_000)
+        let collector = CloudStorage.Collector()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1,
+            exclusions: Exclusions(paths: [directory.url.appending(path: "Documents/Excluded")]),
+            keptInTheHome: directory.url.appending(path: "Documents", directoryHint: .isDirectory),
+            into: collector, countingFor: nil, isSafe: { _ in true },
+            isPinned: { $0.lastPathComponent == "Pinned" }, unless: { false }
+        )
+
+        let found = Dictionary(uniqueKeysWithValues: collector.collected.files.map { ($0.name, $0) })
+        #expect(Set(found.keys) == [kept.lastPathComponent, secret.lastPathComponent])
+        #expect(found["Kept.png"]?.heldBack == .keptDownloaded)
+        #expect(found["Vault.kdbx"]?.heldBack == .opensOnlyOnline)
+        #expect(found["Kept.png"]?.container == "iCloud Drive")
+    }
+
+    @Test func aHomeFolderKeptDownloadedWholeHoldsBackWhatIsInIt() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Documents/File.png", bytes: 2_000)
+        let collector = CloudStorage.Collector()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none,
+            keptInTheHome: directory.url.appending(path: "Documents", directoryHint: .isDirectory),
+            into: collector, countingFor: nil, isSafe: { _ in true },
+            isPinned: { $0.lastPathComponent == "Documents" }, unless: { false }
+        )
+
+        #expect(collector.collected.files.first?.heldBack == .keptDownloaded)
+    }
+
+    @Test func aHomeFolderThatIsExcludedIsNotRead() throws {
+        let directory = try TemporaryDirectory()
+        let documents = directory.url.appending(path: "Documents", directoryHint: .isDirectory)
+        try directory.file("Documents/File.png", bytes: 2_000)
+        let collector = CloudStorage.Collector()
+        let count = ScanCount()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: Exclusions(paths: [documents]),
+            keptInTheHome: documents, into: collector, countingFor: count, isSafe: { _ in true }, unless: { false }
+        )
+
+        #expect(count.value == 0)
+        #expect(collector.collected.files.isEmpty)
+    }
+
+    @Test(.permissionsHold) func aHomeFolderThatCannotBeReadIsNamedAndTheRestStays() async throws {
+        let directory = try TemporaryDirectory()
+        let documents = try directory.directory("Documents")
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/InICloud.png", bytes: 2_000)
+        try linkInICloudDrive("Documents", to: "../../../Documents", in: directory)
+        let path = documents.path(percentEncoded: false)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path) }
+
+        let scan = await safeScan(of: directory)
+
+        #expect(scan.files.map(\.name) == ["InICloud.png"])
+        #expect(!scan.couldNotRead)
+        #expect(scan.unreadableFolders == ["Documents"])
+    }
+
+    @Test(.permissionsHold) func namesAFolderInsideThatCouldNotBeRead() async throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        try directory.file("\(drive)/Found.png", bytes: 2_000)
+        try directory.file("\(drive)/Locked/Hidden.png", bytes: 2_000)
+        try directory.setPermissions(0, of: "\(drive)/Locked")
+        let locked = directory.url.appending(path: "\(drive)/Locked").path(percentEncoded: false)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: locked) }
+
+        let scan = await safeScan(of: directory)
+
+        #expect(scan.files.map(\.name) == ["Found.png"])
+        #expect(scan.notRead.map(\.lastPathComponent) == ["Locked"])
+        #expect(!scan.couldNotRead)
+        #expect(scan.unreadableFolders.isEmpty)
+    }
+
+    @Test(.permissionsHold) func namesADocumentSavedAsAPackageThatCouldNotBeReadWhole() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        try directory.file("\(drive)/Notes.rtfd/Attachments/take.bin", bytes: 2_000)
+        try directory.setPermissions(0, of: "\(drive)/Notes.rtfd/Attachments")
+        let attachments = directory.url.appending(path: "\(drive)/Notes.rtfd/Attachments").path(percentEncoded: false)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: attachments) }
+        let collector = CloudStorage.Collector()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+
+        #expect(collector.collected.files.isEmpty)
+        #expect(collector.collected.notRead.map(\.lastPathComponent) == ["Notes.rtfd"])
+    }
+
+    @Test func aFolderGoneDuringTheWalkWasNotRefused() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        try directory.file("\(drive)/First/one.bin", bytes: 2_000)
+        try directory.file("\(drive)/Second/two.bin", bytes: 2_000)
+        let folders = directory.url.appending(path: drive, directoryHint: .isDirectory)
+        let collector = CloudStorage.Collector()
+        var isGone = false
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true },
+            isDataless: { url in
+                if !isGone, ["First", "Second"].contains(url.lastPathComponent) {
+                    isGone = true
+                    let other = url.lastPathComponent == "First" ? "Second" : "First"
+                    try? FileManager.default.removeItem(at: folders.appending(path: other))
+                }
+                return false
+            },
+            unless: { false }
+        )
+
+        #expect(isGone)
+        #expect(collector.collected.notRead.isEmpty)
+        #expect(!collector.collected.couldNotRead)
+    }
+
+    @Test func aWalkThatRunsOutOfTimeCostsTheOtherWalksNothing() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/Stalls/File.png", bytes: 2_000)
+        try directory.file("Documents/Found.png", bytes: 2_000)
+        try linkInICloudDrive("Documents", to: "../../../Documents", in: directory)
+        let held = DispatchSemaphore(value: 0)
+        defer { held.signal() }
+
+        let scan = await CloudStorage.downloaded(
+            home: directory.url, minimumSize: 1, exclusions: .none, desktopPictures: [], within: 5,
+            while: { false }, isSafe: { _ in true },
+            isDataless: { url in
+                if url.lastPathComponent == "Stalls" {
+                    held.wait()
+                    held.signal()
+                }
+                return false
+            }
+        )
+
+        #expect(scan.files.map(\.name) == ["Found.png"])
+        #expect(scan.cutShort == .ranOutOfTime)
+    }
+
+    @Test func aWalkGoesOnPastItsBudgetWhileMacOSAsks() async throws {
+        let directory = try TemporaryDirectory()
+        for index in 0..<3 {
+            try directory.file("Library/Mobile Documents/com~apple~CloudDocs/file\(index).bin", bytes: 2_000)
+        }
+
+        let scan = await CloudStorage.downloaded(
+            home: directory.url, minimumSize: 1, exclusions: .none, desktopPictures: [], within: 0.05,
+            while: { true }, isSafe: { _ in true },
+            isDataless: { _ in
+                Thread.sleep(forTimeInterval: 0.1)
+                return false
+            }
+        )
+
+        #expect(scan.files.count == 3)
+        #expect(scan.cutShort == nil)
+    }
+
+    @Test func aStoppedScanReturnsWhileItsWalkIsHeld() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/file.bin", bytes: 1_000)
+        let held = DispatchSemaphore(value: 0)
+        let (entered, enters) = AsyncStream.makeStream(of: Void.self)
+        let clock = ContinuousClock()
+        let running = Task(priority: .userInitiated) {
+            let scan = await CloudStorage.downloaded(
+                home: directory.url, minimumSize: 1, exclusions: .none, desktopPictures: [],
+                within: 3_600,
+                // The walk runs on a thread of its own, so holding it holds none of the task pool's.
+                isDataless: { _ in
+                    enters.yield()
+                    held.wait()
+                    return false
+                }
+            )
+            return (scan, clock.now)
+        }
+        var waiting = entered.makeAsyncIterator()
+        await waiting.next()
+
+        let stopped = clock.now
+        running.cancel()
+        let (scan, returned) = await running.value
+        held.signal()
+
+        #expect(returned - stopped < Unanswered.returnsForTheCancel)
+        #expect(scan.cutShort == .ranOutOfTime)
+    }
+
+    @Test func aWalkGivenUpWhileItReadsAsksAboutNothingMore() throws {
+        let directory = try TemporaryDirectory()
+        for index in 0..<3 {
+            try directory.file("Library/Mobile Documents/com~apple~CloudDocs/file\(index).bin", bytes: 1_000)
+        }
+        let collector = CloudStorage.Collector()
+        var asked = 0
+        var isGivenUp = false
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true },
+            isDataless: { _ in
+                asked += 1
+                isGivenUp = true
+                return false
+            },
+            unless: { isGivenUp }
+        )
+
+        #expect(asked == 1)
+        #expect(collector.collected.cutShort == .ranOutOfTime)
+    }
+
+    @Test func listsOnlyWhatFinderShows() throws {
+        let directory = try TemporaryDirectory()
+        let cloud = "Library/Mobile Documents"
+        try directory.file("\(cloud)/com~apple~CloudDocs/Song.mp3", bytes: 2_000_000)
+        try directory.file("\(cloud)/com~apple~CloudDocs/Data/Shared.bin", bytes: 2_000_000)
+        try directory.file("\(cloud)/iCloud~org~example~notes/Documents/Note.bin", bytes: 2_000_000)
+        try directory.file("\(cloud)/iCloud~org~example~notes/Data/cache.bin", bytes: 2_000_000)
+        try directory.file("\(cloud)/iCloud~org~example~notes/state.bin", bytes: 2_000_000)
+        let collector = CloudStorage.Collector()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+
+        #expect(collector.collected.files.map(\.name).sorted() == ["Note.bin", "Shared.bin", "Song.mp3"])
+    }
+
+    @Test func looksIntoTheFolderAfterAFileWhoseDownloadWasRemoved() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        let evicted = try directory.file("\(drive)/Evicted.bin", bytes: 2_000_000)
+        for folder in ["A", "B", "C", "D", "E"] {
+            try directory.file("\(drive)/\(folder)/x.bin", bytes: 2_000_000)
+        }
+        let collector = CloudStorage.Collector()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true },
+            isDataless: { $0.lastPathComponent == evicted.lastPathComponent }, unless: { false }
+        )
+
+        let folders = collector.collected.files.map { $0.url.deletingLastPathComponent().lastPathComponent }
+        #expect(folders.sorted() == ["A", "B", "C", "D", "E"])
+    }
+
+    @Test func namesAFileAsFinderShowsIt() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Mobile Documents/com~apple~CloudDocs/Buget 3:4.bin", bytes: 16)
+        let collector = CloudStorage.Collector()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+
+        #expect(collector.collected.files.map(\.name) == ["Buget 3/4.bin"])
+    }
+
+    @Test func anExcludedFolderIsNotWalked() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        for index in 0..<20 {
+            try directory.file("\(drive)/Archive/old\(index).bin", bytes: 16)
+        }
+        try directory.file("\(drive)/kept.bin", bytes: 16)
+        let archive = directory.url.appending(path: "\(drive)/Archive", directoryHint: .isDirectory)
+        let collector = CloudStorage.Collector()
+        let count = ScanCount()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: Exclusions(paths: [archive]), into: collector,
+            countingFor: count, isSafe: { _ in true }, unless: { false }
+        )
+
+        #expect(collector.collected.files.map(\.name) == ["kept.bin"])
+        #expect(count.value == 3, "iCloud Drive, the archive and kept.bin, nothing inside the archive")
+    }
+
+    /// iCloud Drive keeps a document saved as a package as one item, and Finder removes its download whole.
+    @Test func aDocumentSavedAsAPackageIsOneItem() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        try directory.file("\(drive)/Notes.rtfd/TXT.rtf", bytes: 2_000_000)
+        try directory.file("\(drive)/Notes.rtfd/Attachments/take.bin", bytes: 1_000_000)
+        try directory.file("\(drive)/Kept.rtfd/TXT.rtf", bytes: 2_000_000)
+        try directory.file("\(drive)/Kept.rtfd/private.bin", bytes: 2_000_000)
+        try directory.file("\(drive)/Folder/inside.bin", bytes: 2_000_000)
+        let package = directory.url.appending(path: "\(drive)/Notes.rtfd", directoryHint: .isDirectory)
+        let excluded = directory.url.appending(path: "\(drive)/Kept.rtfd/private.bin")
+        let collector = CloudStorage.Collector()
+
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: Exclusions(paths: [excluded]), into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+        let files = Dictionary(uniqueKeysWithValues: collector.collected.files.map { ($0.name, $0) })
+
+        #expect(files.keys.sorted() == ["Notes.rtfd", "inside.bin"])
+        #expect(collector.collected.notRead.isEmpty)
+        #expect(files["Notes.rtfd"]?.size == FileSize.walk(package, unless: { false })?.size)
+        #expect((files["Notes.rtfd"]?.size ?? 0) >= 3_000_000)
+    }
+
+    /// Editing a file inside a package leaves the package's own date as it was, so the newest date inside is what
+    /// tells that it changed since the scan.
+    @Test func freesNoPackageEditedInsideSinceTheScan() async throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        let inside = try directory.file("\(drive)/Notes.rtfd/TXT.rtf", bytes: 2_000_000)
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+        let scanned = try #require(collector.collected.files.first)
+
+        let untouched = await CloudStorage.free([scanned], exclusions: .none, whyNotSafe: { _ in nil }).refused
+        let later: [FileAttributeKey: Any] = [.modificationDate: Date.now.addingTimeInterval(60)]
+        try FileManager.default.setAttributes(later, ofItemAtPath: inside.path(percentEncoded: false))
+        let edited = await CloudStorage.free([scanned], exclusions: .none, whyNotSafe: { _ in nil }).refused
+
+        #expect(untouched.map(\.reason) != [.editedSinceScan], "only iCloud can remove a download, so a test's fails")
+        #expect(edited.map(\.reason) == [.editedSinceScan])
+    }
+
+    @Test func leavesAlonePackagesThatHoldSomethingExcludedSinceTheScan() async throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        let inside = try directory.file("\(drive)/Notes.rtfd/TXT.rtf", bytes: 2_000_000)
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+        let scanned = try #require(collector.collected.files.first)
+        let undated = CloudFile(
+            url: scanned.url, name: scanned.name, container: scanned.container, size: 1, modified: nil
+        )
+        let excluded = Exclusions(paths: [inside])
+        let evicted = Mutex<[URL]>([])
+
+        let refused = await CloudStorage.free([scanned], exclusions: excluded, whyNotSafe: { _ in nil }) { url in
+            evicted.withLock { $0.append(url) }
+        }.refused
+        let undatedRefused = await CloudStorage.free([undated], exclusions: excluded, whyNotSafe: { _ in nil }) { url in
+            evicted.withLock { $0.append(url) }
+        }.refused
+
+        #expect(refused.map(\.reason) == [.excluded])
+        #expect(undatedRefused.map(\.reason) == [.excluded])
+        let nothingWasEvicted = evicted.withLock { $0.isEmpty }
+        #expect(nothingWasEvicted)
+    }
+
+    @Test func stopsBetweenFilesOnceItsTaskIsCancelled() async throws {
+        let directory = try TemporaryDirectory()
+        let files = try downloads(3, in: directory)
+
+        let (entered, enters) = AsyncStream.makeStream(of: Void.self)
+        let goesOn = DispatchSemaphore(value: 0)
+
+        let removal = Task {
+            await CloudStorage.free(files, exclusions: .none, whyNotSafe: { _ in nil }) { _ in
+                enters.yield()
+                goesOn.wait()
+            }
+        }
+        var waiting = entered.makeAsyncIterator()
+        await waiting.next()
+        removal.cancel()
+        goesOn.signal()
+        let done = await removal.value
+
+        #expect(done.freed.map(\.url) == [files[0].url])
+        #expect(done.refused.isEmpty)
+    }
+
+    @Test func leavesADownloadKeepDownloadedTookSinceTheScan() async throws {
+        let directory = try TemporaryDirectory()
+        func download(_ path: String, heldBack: HoldBack? = nil) throws -> CloudFile {
+            let url = try directory.file("Library/Mobile Documents/com~apple~CloudDocs/\(path)", bytes: 2_000)
+            let modified = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            return CloudFile(
+                url: url, name: url.lastPathComponent, container: "iCloud Drive", size: 2_000, modified: modified,
+                heldBack: heldBack
+            )
+        }
+        let itself = try download("Kept.pdf")
+        let inAFolder = try download("Trip/Plans/route.pdf")
+        let inAnAppsFolder = try download("App.pdf", heldBack: .inAnAppsICloudFolder)
+        let chosenKnowingly = try download("Chosen.pdf", heldBack: .keptDownloaded)
+        let plain = try download("Plain.pdf")
+        let pinned: Set = ["Kept.pdf", "Trip", "App.pdf", "Chosen.pdf"]
+
+        let done = await CloudStorage.free(
+            [itself, inAFolder, inAnAppsFolder, chosenKnowingly, plain], exclusions: .none, whyNotSafe: { _ in nil },
+            evict: { _ in }, isPinned: { pinned.contains($0.lastPathComponent) }
+        )
+
+        #expect(done.freed == [chosenKnowingly, plain])
+        #expect(done.refused.map(\.url) == [itself.url, inAFolder.url, inAnAppsFolder.url])
+        #expect(Set(done.refused.map(\.reason)) == [.keptDownloaded])
+    }
+
+    @Test func removingDownloadsKeepsNoThreadOfSwiftsPool() async throws {
+        let directory = try TemporaryDirectory()
+        let count = ProcessInfo.processInfo.activeProcessorCount + 1
+        let files = try downloads(count, in: directory)
+        let arrived = Mutex(0)
+        let everyoneIsIn = DispatchSemaphore(value: 0)
+
+        // Each waits for all the others to be in theirs, which more removals than Swift's pool has threads can't do
+        // on them.
+        let freed = await withTaskGroup(of: Int.self) { group in
+            for file in files {
+                group.addTask {
+                    await CloudStorage.free([file], exclusions: .none, whyNotSafe: { _ in nil }) { _ in
+                        let here = arrived.withLock { count in
+                            count += 1
+                            return count
+                        }
+                        if here == count {
+                            for _ in 1..<count { everyoneIsIn.signal() }
+                        } else if everyoneIsIn.wait(timeout: .now() + 30) == .timedOut {
+                            throw CocoaError(.fileLocking)
+                        }
+                    }.freed.count
+                }
+            }
+            return await group.reduce(0, +)
+        }
+
+        #expect(freed == count)
+    }
+
+    @Test func countsEachFileItFrees() async throws {
+        let directory = try TemporaryDirectory()
+        let files = try downloads(3, in: directory)
+        let counted = MoveCount()
+
+        let done = await MoveCount.$current.withValue(counted) {
+            await CloudStorage.free(files, exclusions: .none, whyNotSafe: { _ in nil }) { url in
+                if url == files[2].url { throw CocoaError(.fileLocking) }
+            }
+        }
+
+        #expect(done.freed.map(\.url) == [files[0].url, files[1].url])
+        #expect(done.refused.map(\.reason) == [.inUse(by: [])])
+        #expect(counted.value == 2)
+    }
+
+    private func downloads(_ count: Int, in directory: borrowing TemporaryDirectory) throws -> [CloudFile] {
+        try (1...count).map { index in
+            let url = try directory.file("file\(index).bin", bytes: 2_000_000)
+            let modified = try url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            return CloudFile(
+                url: url, name: url.lastPathComponent, container: "iCloud Drive", size: 2_000_000, modified: modified
+            )
+        }
+    }
+
+    /// A file a program holds, as the desktop picture is held, cannot be locked, and the person is told which program.
+    @Test func aFileAProgramHoldsIsRefusedAsInUse() {
+        let locked = CocoaError(.fileLocking)
+        let file = URL(filePath: "/Users/someone/Library/Mobile Documents/com~apple~CloudDocs/a.bin")
+        #expect(CloudStorage.reason(for: locked) == .inUse(by: []))
+        #expect(CloudStorage.reason(for: locked, at: file, holders: { $0 == file ? ["Example"] : [] }) == .inUse(by: ["Example"]))
+        let other = CocoaError(.fileWriteNoPermission)
+        #expect(CloudStorage.reason(for: other) == .failed(other.localizedDescription))
+    }
+
+    @Test func saysWhyFileProviderKeptADownload() {
+        func refusal(_ code: NSFileProviderError.Code, because underlying: [NSError] = []) -> NSError {
+            NSError(
+                domain: NSFileProviderErrorDomain, code: code.rawValue,
+                userInfo: underlying.isEmpty ? [:] : [NSMultipleUnderlyingErrorsKey: underlying]
+            )
+        }
+
+        #expect(CloudStorage.reason(for: refusal(.unsyncedEdits)) == .notUploaded)
+        #expect(CloudStorage.reason(for: refusal(.nonEvictable)) == .notRemovable)
+        #expect(CloudStorage.reason(for: refusal(.nonEvictableChildren)) == .notRemovable)
+        #expect(
+            CloudStorage.reason(for: refusal(.nonEvictableChildren, because: [refusal(.unsyncedEdits)]))
+                == .notUploaded
+        )
+        let busy = NSError(domain: NSPOSIXErrorDomain, code: Int(EBUSY))
+        #expect(CloudStorage.reason(for: busy) == .inUse(by: []))
+        #expect(CloudStorage.reason(for: refusal(.nonEvictableChildren, because: [busy])) == .inUse(by: []))
+    }
+
+    @Test func readsKeepDownloadedFromTheFileItself() throws {
+        let directory = try TemporaryDirectory()
+        func file(_ name: String, carrying attribute: String? = nil) throws -> URL {
+            let url = try directory.file(name, bytes: 1)
+            if let attribute {
+                #expect(setxattr(url.path(percentEncoded: false), attribute, nil, 0, 0, 0) == 0)
+            }
+            return url
+        }
+        let withFlags = try file("flags.pdf", carrying: "com.apple.fileprovider.pinned#PX")
+        let withoutFlags = try file("plain.pdf", carrying: "com.apple.fileprovider.pinned")
+        let another = try file("other.pdf", carrying: "com.apple.fileprovider.pinnedElsewhere")
+        let none = try file("none.pdf")
+        let link = directory.url.appending(path: "link.pdf")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: withFlags)
+
+        #expect(CloudStorage.isPinned(withFlags))
+        #expect(CloudStorage.isPinned(withoutFlags))
+        #expect(!CloudStorage.isPinned(another))
+        #expect(!CloudStorage.isPinned(none))
+        #expect(!CloudStorage.isPinned(link))
+    }
+
+    /// The desktop picture is open for as long as it is shown, so the scan says which file it is.
+    @Test func theDesktopPictureIsMarked() throws {
+        let directory = try TemporaryDirectory()
+        let drive = "Library/Mobile Documents/com~apple~CloudDocs"
+        let picture = try directory.file("\(drive)/Wallpaper.png", bytes: 2_000_000)
+        try directory.file("\(drive)/Other.png", bytes: 2_000_000)
+
+        let collector = CloudStorage.Collector()
+        CloudStorage.collect(
+            home: directory.url, minimumSize: 1, exclusions: .none, desktopPictures: [picture], into: collector,
+            countingFor: nil, isSafe: { _ in true }, unless: { false }
+        )
+        let marked = Dictionary(uniqueKeysWithValues: collector.collected.files.map { ($0.name, $0.isDesktopPicture) })
+
+        #expect(marked == ["Wallpaper.png": true, "Other.png": false])
+    }
+}

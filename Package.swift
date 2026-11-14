@@ -26,7 +26,9 @@ let package = Package(
     ],
     dependencies: [
         // Relay command palette and workflow engine (bundled copy of the standalone Relay app's core).
-        .package(path: "Packages/RelayKit")
+        .package(path: "Packages/RelayKit"),
+        // Application inventory, leftovers, orphans, receipts, Homebrew and removal logic ported from Peel (GPL-3.0-or-later).
+        .package(path: "Packages/PeelCore")
     ],
     targets: [
         .target(
@@ -42,7 +44,8 @@ let package = Package(
                 .product(name: "RelayUI", package: "RelayKit"),
                 .product(name: "RelaySecurity", package: "RelayKit"),
                 .product(name: "RelayTasks", package: "RelayKit"),
-                .product(name: "RelayCommandPacks", package: "RelayKit")
+                .product(name: "RelayCommandPacks", package: "RelayKit"),
+                .product(name: "PeelCore", package: "PeelCore")
             ],
             path: "Sources/SKMoleApp"
         ),

@@ -1,0 +1,143 @@
+public import Foundation
+
+/// The result of one scan of the installed packages. `couldNotAsk` is set when `pkgutil` gave no answer, which
+/// is not the same as finding no packages.
+public struct PackageScan: Sendable {
+    public var receipts: [PackageReceipt] = []
+    public var couldNotAsk = false
+}
+
+public struct PackageReceipt: Sendable, Hashable, Identifiable {
+    public struct Item: Sendable, Hashable, Identifiable {
+        public let url: URL
+        /// Nil when the size is not known: the item did not answer in time, or macOS would not let Peel open it.
+        /// Unknown is not the same as empty.
+        public let size: Int64?
+        public let requiresPrivileges: Bool
+        /// Why `RemovalGuard` never moves the item, such as a file in `/usr/local/bin`.
+        public var refusal: GuardRefusal?
+        /// Why the item is left for the person to choose: what measuring it saw (not measured, not read, a wallet,
+        /// or a repository), or `/Users/Shared`, which every account on the Mac uses. Or why it cannot be moved at
+        /// all: it needs an administrator, and the helper would refuse it.
+        public var heldBack: HoldBack?
+        /// How an app the package installed is removed instead, by the rules its own page follows.
+        public var removedElsewhere: RemovedElsewhere?
+        /// An app whose own uninstaller runs once it moves, which the question before the move warns about.
+        public var uninstallsItself: UninstallsItself? = nil
+        /// The app the package put at this place or inside it, for which the question says what it leaves behind.
+        public var app: InstalledApp? = nil
+        public var leftInTheSystem: LeftInTheSystem? = nil
+        public var commandToRunFirst: CommandToRunFirst? = nil
+
+        /// True when Peel never moves this item. It is listed but never offered.
+        public var isLeftAlone: Bool {
+            refusal != nil || heldBack?.cannotBeMoved == true || removedElsewhere != nil
+        }
+
+        public var id: URL { url }
+
+        /// True while only the helper can move the item and the helper can't act: its checkbox is off then.
+        public func isLocked(canUseHelper: Bool) -> Bool {
+            requiresPrivileges && !canUseHelper
+        }
+    }
+
+    public let identifier: String
+    public let version: String?
+    public let installDate: Date?
+    /// The volume the package was installed to, which is where its receipt is kept, or the home folder of the account
+    /// it was installed for.
+    public let volume: URL
+    public var items: [Item]
+    /// True when the file list is known and nothing on it is still on disk. This is judged from the disk, not
+    /// from `items`, which leaves out what is excluded or protected even while it is still there.
+    public var nothingLeftOnDisk = false
+    /// False when `pkgutil` did not say what the package installed, because it failed or ran out of time.
+    /// Nothing can then be said about what is left, and an empty list is not "nothing left".
+    public var isFileListKnown = true
+    /// True when the package's scripts put its files in place: it installed into a temporary folder, or listed
+    /// nothing. Its receipt then doesn't say where they are, so nothing is judged left or gone from it.
+    public var installedThroughItsScripts = false
+    /// The apps the package put on this Mac that are still where it put them. Excluding one leaves the receipt alone
+    /// too, which is asked of the exclusions as they stand whenever it counts.
+    public var apps: [InstalledApp] = []
+    /// The name macOS gave the package when it installed it, such as "AdGuard", if its install history keeps one.
+    public var name: String?
+    /// The version of what the installer installed, as its history says it, which is what a person knows it by:
+    /// `version` is the package's own number.
+    public var productVersion: String?
+
+    /// Whether the package was installed for the account whose home folder is `home` alone, which keeps its receipt
+    /// there.
+    public func isInstalledForTheAccount(home: URL = .homeDirectory) -> Bool {
+        PackageActions.isTheHome(volume, home: home)
+    }
+
+    /// The receipts on a disk of the packages also installed for the account, whose rows would otherwise read alike.
+    public static func sayingForAllUsers(_ receipts: [PackageReceipt], home: URL = .homeDirectory) -> Set<ID> {
+        let forTheAccount = Set(receipts.filter { $0.isInstalledForTheAccount(home: home) }.map(\.identifier))
+        return Set(receipts.filter { forTheAccount.contains($0.identifier) && !$0.isInstalledForTheAccount(home: home) }
+            .map(\.id))
+    }
+
+    /// What a list in a question calls each of `receipts`: its name, unless another of them has it too, as the packages
+    /// of one installer do, which is no way to tell them apart.
+    public static func names(of receipts: [PackageReceipt]) -> [String] {
+        let counts = Dictionary(receipts.compactMap(\.name).map { ($0, 1) }, uniquingKeysWith: +)
+        return receipts.map { receipt in
+            receipt.name.flatMap { counts[$0] == 1 ? $0 : nil } ?? receipt.identifier
+        }
+    }
+
+    /// A package can be installed on the startup disk and for an account too, each with a receipt of its own.
+    public var id: String {
+        let place = volume.path(percentEncoded: false)
+        return place == "/" ? identifier : place + "/" + identifier
+    }
+
+    /// The version to show: the product's when the history gives one.
+    public var shownVersion: String? { productVersion ?? version }
+
+    public var installedApps: [String] { apps.map(\.name).sorted() }
+
+    /// What forgetting the package's files could free now, as an orphan group counts it. Unknown when the file list
+    /// is, since an empty list then says nothing about what is left.
+    public func movable(canUseHelper: Bool) -> SizeTotal {
+        guard isFileListKnown else { return SizeTotal(known: 0, isComplete: false) }
+        let selectable = Set(selectableRows(canUseHelper: canUseHelper).selectable)
+        return SizeTotal(items.filter { selectable.contains($0.url) }.map(\.size))
+    }
+
+    public func selectableRows(canUseHelper: Bool) -> SelectableRows<URL> {
+        let selectable = items.filter { !$0.isLocked(canUseHelper: canUseHelper) && !$0.isLeftAlone }
+        return SelectableRows(
+            rows: items.map(\.url),
+            selectable: selectable.map(\.url),
+            recommended: selectable.filter { $0.heldBack == nil }.map(\.url)
+        )
+    }
+
+    /// The size a row of the list shows, as the page's total does: none while nothing could move now.
+    public func figure(canUseHelper: Bool) -> SizeTotal? {
+        let movable = movable(canUseHelper: canUseHelper)
+        return movable.isNothing ? nil : movable
+    }
+
+    /// How many items only the helper can move and a person could select once it can act.
+    public var itemsWaitingForTheHelper: Int { items.count { $0.requiresPrivileges && !$0.isLeftAlone } }
+
+    /// True when the package still has files on disk but none of them can be moved: each is excluded, protected,
+    /// or left alone. False when the file list is unknown, since then nothing is known about what is left.
+    public var holdsNothingToRemove: Bool {
+        isFileListKnown && !nothingLeftOnDisk && items.allSatisfy(\.isLeftAlone)
+    }
+}
+
+extension PackageReceipt {
+    /// Whether `query` matches the identifier, the name macOS gave the package, or where one of its files is, since few
+    /// know a package by its identifier.
+    public func matches(_ query: String) -> Bool {
+        SearchText.matches(identifier, query) || name.map { SearchText.matches($0, query) } == true
+            || items.contains { SearchText.matches($0.url.path(percentEncoded: false), query) }
+    }
+}

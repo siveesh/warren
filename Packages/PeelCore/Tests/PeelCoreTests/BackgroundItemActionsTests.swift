@@ -1,0 +1,1356 @@
+import Foundation
+@testable import PeelCore
+import Synchronization
+import PeelPrivileged
+import Testing
+
+struct BackgroundItemActionsTests {
+    @Test func theHelperIsAskedForOnlyWhenThePageCanUseIt() {
+        let app = URL(filePath: "/Applications/Example.app", directoryHint: .isDirectory)
+        func daemon(
+            source: BackgroundItem.Source = .systemLibrary,
+            plist: URL? = URL(filePath: "/Library/LaunchDaemons/org.example.job.plist"),
+            owner: URL? = nil,
+            isDisabled: Bool = false
+        ) -> BackgroundItem {
+            BackgroundItem(
+                label: "org.example.job", kind: .daemon, source: source, plistURL: plist, program: nil, runsAtLoad: nil,
+                keepsAlive: nil, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: owner, isOrphan: false,
+                state: .loaded, isDisabled: isDisabled
+            )
+        }
+        #expect(daemon().waitsForTheHelper)
+
+        var registered = daemon(source: .app, plist: nil, owner: app)
+        registered.isManagedByServiceManagement = true
+        #expect(!registered.waitsForTheHelper)
+
+        var turnedOff = daemon(source: .app, plist: nil, owner: app, isDisabled: true)
+        turnedOff.isManagedByServiceManagement = true
+        #expect(turnedOff.waitsForTheHelper)
+
+        var leftByAGoneApp = daemon(source: .app, plist: nil)
+        leftByAGoneApp.isManagedByServiceManagement = true
+        #expect(leftByAGoneApp.waitsForTheHelper)
+
+        var excluded = daemon()
+        excluded.isExcluded = true
+        #expect(!excluded.waitsForTheHelper)
+
+        var unknown = daemon()
+        unknown.state = .unknown
+        #expect(unknown.waitsForTheHelper)
+
+        var fileOnly = BackgroundItem(
+            label: "org.example.agent", kind: .agent, source: .systemLibrary,
+            plistURL: URL(filePath: "/Library/LaunchAgents/org.example.agent.plist"), program: nil, runsAtLoad: nil,
+            keepsAlive: nil, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil, isOrphan: false,
+            state: .loaded, isDisabled: false
+        )
+        #expect(fileOnly.waitsForTheHelper)
+        fileOnly.isExcluded = true
+        #expect(!fileOnly.waitsForTheHelper)
+    }
+
+    private func item(state: BackgroundItem.State, plist: URL?) -> BackgroundItem {
+        BackgroundItem(
+            label: "com.example.agent", kind: .agent, source: .userLibrary, plistURL: plist, program: nil,
+            runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil, ownerName: nil,
+            ownerURL: nil, isOrphan: false, state: state, isDisabled: false
+        )
+    }
+
+    @Test func aJobAnAppAddedCanBeStoppedOnlyWhileItRuns() {
+        func added(_ state: BackgroundItem.State) -> BackgroundItem {
+            var job = BackgroundItem(
+                label: "com.example.agent", kind: .agent, source: .app, plistURL: nil, program: "/Applications/App.app/x",
+                runsAtLoad: nil, keepsAlive: nil, ownerBundleIdentifier: "com.example", ownerName: "App",
+                ownerURL: URL(filePath: "/Applications/App.app"), isOrphan: false, state: state, isDisabled: false
+            )
+            job.isManagedByServiceManagement = true
+            return job
+        }
+        #expect(added(.running(pid: 42)).offersControls)
+        #expect(added(.running(pid: 42)).isRunning)
+        #expect(!added(.loaded).offersControls)
+        #expect(!added(.loaded).isRunning)
+    }
+
+    @Test func stoppingAJobThatHasLeftIsNoFailure() async throws {
+        var left = item(state: .loaded, plist: nil)
+        left.loadsInTheBackgroundSession = true
+
+        try await BackgroundItemActions.stop(left, waitingUpTo: 30) { arguments in
+            arguments[0] == "print" ? (113, "Could not find service") : (3, "Boot-out failed: 3: No such process")
+        }
+    }
+
+    @Test func startGoesByWhatLaunchdHasNowRatherThanWhatThePageRead() {
+        let file = URL(filePath: "/Users/me/Library/LaunchAgents/job.plist")
+        func plan(_ state: BackgroundItem.State, isGone: Bool) -> BackgroundItemActions.Start {
+            let now = BackgroundItemActions.asItIsNow(item(state: state, plist: file), isGone: isGone)
+            return BackgroundItemActions.plan(toStart: now, isRefusedByLaunchd: { _ in false })
+        }
+
+        #expect(plan(.notLoaded, isGone: false) == .kickstart)
+        #expect(plan(.loaded, isGone: true) == .bootstrap(file))
+        #expect(plan(.running(pid: 42), isGone: true) == .bootstrap(file))
+        #expect(plan(.notLoaded, isGone: true) == .bootstrap(file))
+        #expect(plan(.loaded, isGone: false) == .kickstart)
+        #expect(
+            BackgroundItemActions.asItIsNow(item(state: .running(pid: 42), plist: file), isGone: false).state
+                == .running(pid: 42)
+        )
+    }
+
+    @Test func anAgentOfTheBackgroundSessionIsAskedForInTheUserDomain() throws {
+        let uid = getuid()
+        var background = item(state: .loaded, plist: nil)
+        background.loadsInTheBackgroundSession = true
+
+        #expect(BackgroundItemActions.target(of: item(state: .loaded, plist: nil)) == "gui/\(uid)/com.example.agent")
+        #expect(BackgroundItemActions.target(of: background) == "user/\(uid)/com.example.agent")
+        #expect(try #require(JobDefinition(["Label": "a", "LimitLoadToSessionType": "Background"])).loadsInTheBackground)
+        #expect(try #require(JobDefinition(["Label": "a", "LimitLoadToSessionType": ["Background"]])).loadsInTheBackground)
+        #expect(try #require(JobDefinition(["Label": "a", "LimitLoadToSessionType": ["Aqua", "Background"]])).loadsInTheBackground)
+        #expect(try !#require(JobDefinition(["Label": "a", "LimitLoadToSessionType": ["Aqua", "LoginWindow"]])).loadsInTheBackground)
+        #expect(try !#require(JobDefinition(["Label": "a"])).loadsInTheBackground)
+    }
+
+    @Test func listsAnExcludedAppsJobWithoutActingOnIt() {
+        func job(_ label: String, owner: String) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: .agent, source: .userLibrary,
+                plistURL: URL(filePath: "/Users/me/Library/LaunchAgents/\(label).plist"), program: "/Applications/x",
+                runsAtLoad: true, keepsAlive: true, ownerBundleIdentifier: owner, ownerName: nil,
+                ownerURL: nil, isOrphan: false, state: .running(pid: 42), isDisabled: false
+            )
+        }
+        let rows = BackgroundItems.rows(
+            [job("org.example.other.agent", owner: "org.example.other"), job("org.example.guard.agent", owner: "org.example.guard")],
+            exclusions: Exclusions(bundleIdentifiers: ["org.example.guard"])
+        )
+
+        #expect(rows.map(\.label) == ["org.example.guard.agent", "org.example.other.agent"])
+        #expect(rows.map(\.isExcluded) == [true, false])
+        #expect(rows.map(\.canBeControlled) == [false, true])
+        #expect(rows.map(\.canMoveToTrash) == [false, true])
+    }
+
+    @Test func eachStateOffersTheControlsThatChangeIt() {
+        let file = URL(filePath: "/Users/me/Library/LaunchAgents/job.plist")
+        #expect(item(state: .running(pid: 42), plist: file).controls == [.stop, .restart])
+        #expect(item(state: .loaded, plist: file).controls == [.runNow, .unload])
+        #expect(item(state: .notLoaded, plist: file).controls == [.load])
+        #expect(item(state: .unknown, plist: file).controls.isEmpty)
+
+        func disabled(_ state: BackgroundItem.State) -> BackgroundItem {
+            BackgroundItem(
+                label: "com.example.agent", kind: .agent, source: .userLibrary, plistURL: file, program: nil,
+                runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil, ownerName: nil,
+                ownerURL: nil, isOrphan: false, state: state, isDisabled: true
+            )
+        }
+        // launchd refuses to load a disabled job, so only Enable is offered until it is enabled.
+        #expect(disabled(.notLoaded).controls.isEmpty)
+        #expect(disabled(.notLoaded).offersEnableOrDisable)
+        #expect(disabled(.loaded).controls == [.runNow, .unload])
+        #expect(disabled(.running(pid: 42)).controls == [.stop, .restart])
+
+        var registered = BackgroundItem(
+            label: "com.example.agent", kind: .agent, source: .app, plistURL: nil, program: "/Applications/App.app/x",
+            runsAtLoad: nil, keepsAlive: nil, ownerBundleIdentifier: "com.example", ownerName: "App",
+            ownerURL: URL(filePath: "/Applications/App.app"), isOrphan: false, state: .running(pid: 42), isDisabled: false
+        )
+        registered.isManagedByServiceManagement = true
+        #expect(registered.controls == [.stop])
+        registered.state = .loaded
+        #expect(registered.controls.isEmpty)
+
+        var elsewhere = item(state: .loaded, plist: URL(filePath: "/tmp/org.example.job.plist"))
+        elsewhere.source = .otherFile
+        #expect(elsewhere.controls == [.stop])
+        #expect(!elsewhere.offersEnableOrDisable)
+
+        var left = item(state: .loaded, plist: nil)
+        left.source = .app
+        left.isManagedByServiceManagement = true
+        #expect(left.isLeftByAGoneApp)
+        #expect(left.controls == [.remove])
+        #expect(!left.offersEnableOrDisable)
+
+        var excluded = item(state: .running(pid: 42), plist: file)
+        excluded.isExcluded = true
+        #expect(excluded.controls.isEmpty)
+        #expect(!excluded.offersEnableOrDisable)
+        #expect(item(state: .loaded, plist: file).offersEnableOrDisable)
+    }
+
+    @Test func stopWaitsForTheProcessLaunchdStillNamesToEnd() async throws {
+        // `bootout` returns at once while launchd keeps a job that ignores the signal until its time runs out.
+        let job = item(state: .running(pid: 4242), plist: nil)
+        let printed = """
+            gui/501/com.example.agent = {
+            \tpath = /Users/me/Library/LaunchAgents/com.example.agent.plist
+            \tstate = SIGTERMed
+            \tpid = 4242
+            }
+            """
+        let asked = Mutex<[String]>([])
+        let waited = Mutex<[String]>([])
+
+        try await BackgroundItemActions.stop(job, waitingUpTo: 30, launchctl: { arguments in
+            asked.withLock { $0.append(arguments[0]) }
+            return arguments[0] == "print" ? (0, printed) : (0, "")
+        }, untilEnded: { process, limit in
+            waited.withLock { $0.append("\(process) within \(Int(limit))") }
+            return true
+        })
+
+        #expect(asked.withLock { $0 } == ["bootout", "print"])
+        #expect(waited.withLock { $0 } == ["4242 within 30"])
+    }
+
+    @Test func stopWaitsForNothingOnceLaunchdNamesNoProcess() async throws {
+        let job = item(state: .running(pid: 4242), plist: nil)
+        let waited = Mutex(false)
+
+        for printed in [(Int32(113), "Could not find service"), (0, "gui/501/com.example.agent = {\n\tstate = not running\n}")] {
+            try await BackgroundItemActions.stop(job, waitingUpTo: 30, launchctl: { arguments in
+                arguments[0] == "print" ? printed : (0, "")
+            }, untilEnded: { _, _ in
+                waited.withLock { $0 = true }
+                return true
+            })
+        }
+
+        #expect(!waited.withLock { $0 })
+    }
+
+    @Test func restartsOnlyAJobPeelMayControlAndAsksLaunchdToKillAndStartIt() async {
+        var excluded = item(state: .running(pid: 42), plist: URL(filePath: "/Users/me/Library/LaunchAgents/job.plist"))
+        excluded.isExcluded = true
+        await #expect(throws: BackgroundItemActions.Failure.notControlled) {
+            try await BackgroundItemActions.restart(excluded)
+        }
+
+        // A job launchd doesn't have: `kickstart -k` answers that it can't find it, and nothing else runs.
+        let unknown = BackgroundItem(
+            label: "org.example.never-loaded", kind: .agent, source: .userLibrary, plistURL: nil,
+            program: nil, runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil, ownerName: nil,
+            ownerURL: nil, isOrphan: false, state: .running(pid: 42), isDisabled: false
+        )
+        let asked = Mutex<[[String]]>([])
+        await #expect {
+            try await BackgroundItemActions.restart(unknown) { arguments in
+                asked.withLock { $0.append(arguments) }
+                return (113, "Could not find service \"org.example.never-loaded\" in domain for user gui: 501")
+            }
+        } throws: { error in
+            guard case .launchctl(let output) = error as? BackgroundItemActions.Failure else { return false }
+            return output.localizedCaseInsensitiveContains("could not find service")
+        }
+        #expect(asked.withLock { $0 } == [["kickstart", "-k", "gui/\(getuid())/org.example.never-loaded"]])
+    }
+
+    @Test func startRunsALoadedJobAtOnceAndLoadsOneThatIsNot() {
+        let file = URL(filePath: "/Users/me/Library/LaunchAgents/job.plist")
+
+        #expect(item(state: .loaded, plist: file).startsAtOnce)
+        #expect(item(state: .running(pid: 42), plist: file).startsAtOnce)
+        #expect(!item(state: .notLoaded, plist: file).startsAtOnce)
+        #expect(BackgroundItemActions.plan(toStart: item(state: .loaded, plist: file)) == .kickstart)
+        #expect(BackgroundItemActions.plan(toStart: item(state: .notLoaded, plist: nil)) == .kickstart)
+        #expect(item(state: .notLoaded, plist: nil).startsAtOnce)
+    }
+
+    @Test func nothingIsControlledWhileTheExclusionsAreNotKnown() {
+        let job = item(state: .running(pid: 42), plist: URL(filePath: "/Users/me/Library/LaunchAgents/job.plist"))
+        for exclusions in [Exclusions.unreadable(because: nil), .notYetRead] {
+            let row = BackgroundItems.rows([job], exclusions: exclusions)[0]
+
+            #expect(!row.canBeControlled)
+            #expect(!row.offersControls)
+            #expect(BackgroundItemActions.refusal(for: row) != nil)
+        }
+        #expect(BackgroundItems.rows([job], exclusions: .none)[0].canBeControlled)
+    }
+
+    @Test func aJobIsExcludedWithAnAppExcludedByItsPlace() async throws {
+        let vendor = URL(filePath: "/Applications/Vendor", directoryHint: .isDirectory)
+        let plist = URL(filePath: "/Users/x/Library/LaunchAgents/org.example.vendor.agent.plist")
+        let job = BackgroundItem(
+            label: "org.example.vendor.agent", kind: .agent, source: .userLibrary, plistURL: plist,
+            program: "/Applications/Vendor/Tool.app/Contents/MacOS/agent", runsAtLoad: true, keepsAlive: false,
+            ownerBundleIdentifier: "org.example.vendor", ownerName: nil,
+            ownerURL: vendor.appending(path: "Tool.app", directoryHint: .isDirectory), isOrphan: false,
+            state: .running(pid: 42), isDisabled: false
+        )
+        let excluded = Exclusions(paths: [vendor])
+        let moved = Mutex<[URL]>([])
+        let service = TrashService(
+            environment: SearchEnvironment(homeDirectory: URL(filePath: "/Users/x"), rootDirectory: URL(filePath: "/")),
+            exclusions: excluded
+        ) { url in
+            moved.withLock { $0.append(url) }
+            return url
+        }
+
+        let row = try #require(BackgroundItems.rows([job], exclusions: excluded).first)
+        let result = try await BackgroundItemActions.moveToTrash(
+            job, isHelperEnabled: false, trash: service
+        ) { _ in nil }
+
+        #expect(row.isExcluded)
+        #expect(!row.canBeControlled)
+        #expect(!row.canMoveToTrash)
+        #expect(moved.withLock { $0 }.isEmpty)
+        #expect(result.result.failures.map(\.reason) == [.guarded(.excluded)])
+    }
+
+    @Test func movesNoJobOfAnAppExcludedSinceItWasRead() async throws {
+        let plist = URL(filePath: "/Users/x/Library/LaunchAgents/org.example.guard.agent.plist")
+        let job = BackgroundItem(
+            label: "org.example.guard.agent", kind: .agent, source: .userLibrary, plistURL: plist,
+            program: "/Applications/x", runsAtLoad: true, keepsAlive: false, ownerBundleIdentifier: "org.example.guard",
+            ownerName: nil, ownerURL: nil, isOrphan: false, state: .notLoaded, isDisabled: false
+        )
+        let moved = Mutex<[URL]>([])
+        let service = TrashService(
+            environment: SearchEnvironment(
+                homeDirectory: URL(filePath: "/Users/x"), rootDirectory: URL(filePath: "/")
+            ),
+            exclusions: Exclusions(bundleIdentifiers: ["org.example.guard"])
+        ) { url in
+            moved.withLock { $0.append(url) }
+            return url
+        }
+
+        let result = try await BackgroundItemActions.moveToTrash(
+            job, isHelperEnabled: false, trash: service
+        ) { _ in nil }
+
+        #expect(moved.withLock { $0 }.isEmpty)
+        #expect(result.result.failures.map(\.reason) == [.guarded(.excluded)])
+    }
+
+    @Test func knowsAJobItsGoneAppLeftLoaded() {
+        let job = { (source: BackgroundItem.Source, owner: URL?, isOrphan: Bool, program: String?) in
+            BackgroundItem(
+                label: "org.example.helper", kind: .agent, source: source, plistURL: nil, program: program,
+                runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: "org.example.app", ownerName: "Example",
+                ownerURL: owner, isOrphan: isOrphan, state: .loaded, isDisabled: false
+            )
+        }
+        let installed = URL(filePath: "/Applications/Example.app", directoryHint: .isDirectory)
+        let gone = "/Applications/Example.app/Contents/MacOS/helper"
+
+        #expect(job(.app, nil, true, gone).isLeftByAGoneApp)
+        #expect(job(.app, nil, false, nil).isLeftByAGoneApp)
+        #expect(!job(.app, installed, false, nil).isLeftByAGoneApp)
+        #expect(!job(.app, nil, false, "/bin/sh").isLeftByAGoneApp)
+        #expect(!job(.userLibrary, nil, true, gone).isLeftByAGoneApp)
+    }
+
+    @Test func anAppsJobWhoseProgramLaunchctlLeavesOutIsNeverCalledOrphaned() throws {
+        let directory = try TemporaryDirectory()
+        let helper = "Tide.app/Contents/Library/LoginItems/TideHelper.app/Contents/MacOS/TideHelper"
+        let inTheTrash = try directory.runningProgram("home/.Trash/\(helper)")
+        defer { inTheTrash.terminate() }
+        let inPlace = try directory.runningProgram("home/Applications/\(helper)")
+        defer { inPlace.terminate() }
+        let registered = Launchctl.JobDetails(
+            path: "(submitted by smd.341)", managedBy: "com.apple.xpc.ServiceManagement",
+            parentBundleIdentifier: "org.example.tide"
+        )
+        func item(_ details: Launchctl.JobDetails, running pid: Int32?) throws -> BackgroundItem {
+            let found = BackgroundItems.undeclaredItem(
+                ("org.example.tide.helper", .agent, "gui/501/org.example.tide.helper"),
+                answer: .details(details),
+                ownership: BackgroundItemOwnership(installedApps: []),
+                loaded: .init(user: ["org.example.tide.helper": pid]),
+                exclusions: .none
+            )
+            guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+            return item
+        }
+
+        let fromTheTrash = try item(registered, running: inTheTrash.processIdentifier)
+        #expect(fromTheTrash.runsFromTheTrash)
+        #expect(!fromTheTrash.isOrphan)
+        #expect(fromTheTrash.isLeftByAGoneApp)
+
+        let stopped = try item(registered, running: nil)
+        #expect(!stopped.runsFromTheTrash)
+        #expect(!stopped.isOrphan)
+        #expect(stopped.isLeftByAGoneApp)
+
+        let elsewhere = try item(registered, running: inPlace.processIdentifier)
+        #expect(!elsewhere.runsFromTheTrash)
+        #expect(!elsewhere.isOrphan)
+
+        var named = registered
+        named.program = "/Applications/Tide.app/Contents/MacOS/org.example.tide.gone"
+        let goneProgram = try item(named, running: nil)
+        #expect(goneProgram.isOrphan)
+        #expect(goneProgram.isLeftByAGoneApp)
+
+        let trashedProgram = try #require(RunningProgram.path(of: inTheTrash.processIdentifier))
+        named.program = trashedProgram
+        #expect(try !item(named, running: inTheTrash.processIdentifier).runsFromTheTrash)
+
+        named.program = "/bin/sh"
+        let present = try item(named, running: nil)
+        #expect(!present.isOrphan)
+        #expect(!present.isLeftByAGoneApp)
+    }
+
+    @Test func knowsAJobItsAppGaveLaunchdItself() throws {
+        func item(_ details: Launchctl.JobDetails) throws -> BackgroundItem {
+            let found = BackgroundItems.undeclaredItem(
+                ("org.example.tide.ShipIt", .agent, "gui/501/org.example.tide.ShipIt"), answer: .details(details),
+                ownership: BackgroundItemOwnership(installedApps: []), loaded: .init(), exclusions: .none
+            )
+            guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+            return item
+        }
+        let submitted = try item(.init(path: "(submitted by Tide.42)", program: "/Users/me/Library/Caches/ShipIt"))
+        let registered = try item(.init(
+            path: "(submitted by smd.251)", managedBy: "com.apple.xpc.ServiceManagement",
+            parentBundleIdentifier: "org.example.tide"
+        ))
+
+        #expect(submitted.isSubmittedByItsApp)
+        #expect(!registered.isSubmittedByItsApp)
+    }
+
+    @Test func aRegisteredJobStartsAsItsAppSaysAndOtherwiseItIsNotKnown() throws {
+        let directory = try TemporaryDirectory()
+        func write(_ plist: [String: Any], at path: String) throws {
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try directory.file(path, contents: data)
+        }
+        try write(["CFBundleIdentifier": "org.example.tide"], at: "Applications/Tide.app/Contents/Info.plist")
+        try write(
+            ["CFBundleIdentifier": "org.example.tide.loginhelper"],
+            at: "Applications/Tide.app/Contents/Library/LoginItems/Tide Helper.app/Contents/Info.plist"
+        )
+        try write(
+            ["Label": "org.example.tide.agent", "BundleProgram": "Contents/MacOS/Agent", "KeepAlive": true],
+            at: "Applications/Tide.app/Contents/Library/LaunchAgents/org.example.tide.agent.plist"
+        )
+        let app = InstalledApp(
+            url: directory.url.appending(path: "Applications/Tide.app"), bundleIdentifier: "org.example.tide", name: "Tide"
+        )
+        let ownership = BackgroundItemOwnership(installedApps: [app])
+        func item(_ label: String, _ details: Launchctl.JobDetails) throws -> BackgroundItem {
+            let found = BackgroundItems.undeclaredItem(
+                (label, .agent, "gui/501/\(label)"), answer: .details(details), ownership: ownership,
+                loaded: .init(), exclusions: .none
+            )
+            guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+            return item
+        }
+        let registered = Launchctl.JobDetails(
+            path: "(submitted by smd.251)", managedBy: "com.apple.xpc.ServiceManagement",
+            parentBundleIdentifier: "org.example.tide"
+        )
+
+        let loginItem = try item("org.example.tide.loginhelper", registered)
+        let agent = try item("org.example.tide.agent", registered)
+        let theApp = try item("org.example.tide", registered)
+        let submitted = try item("org.example.tide.ShipIt", .init(path: "(submitted by Tide.42)", program: "/bin/sh"))
+        let disabled = BackgroundItems.disabledJobs(
+            in: .init(user: [:], system: [:], userDisabled: ["org.example.tide.loginhelper": true, "org.example.tide.other": true]),
+            listed: [], ownership: ownership
+        )
+
+        #expect(loginItem.runsAtLoad == true && loginItem.keepsAlive == true)
+        #expect(agent.runsAtLoad == true && agent.keepsAlive == true)
+        #expect(theApp.runsAtLoad == true && theApp.keepsAlive == nil)
+        #expect(submitted.runsAtLoad == nil && submitted.keepsAlive == nil)
+        #expect(disabled.first { $0.label == "org.example.tide.loginhelper" }?.runsAtLoad == true)
+        #expect(disabled.first { $0.label == "org.example.tide.other" }.map { $0.runsAtLoad == nil && $0.keepsAlive == nil } == true)
+    }
+
+    @Test func aDaemonHomebrewNamesAfterAVersionedFormulaCanBeControlled() {
+        let daemon = BackgroundItem(
+            label: "sh.brew.postgresql@16", kind: .daemon, source: .systemLibrary, plistURL: nil,
+            program: "/opt/homebrew/opt/postgresql@16/bin/postgres", runsAtLoad: true, keepsAlive: true,
+            ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil, isOrphan: false, state: .loaded,
+            isDisabled: false
+        )
+        #expect(daemon.canBeControlled)
+    }
+
+    @Test func aDaemonWithANamePeelWontPassSaysSo() {
+        func daemon(_ label: String) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: .daemon, source: .systemLibrary, plistURL: nil, program: "/usr/local/bin/helper",
+                runsAtLoad: true, keepsAlive: true, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil,
+                isOrphan: false, state: .loaded, isDisabled: false
+            )
+        }
+
+        #expect(daemon("org.example.my helper").unusableLabel == .notTakenByTheHelper)
+        #expect(!daemon("org.example.my helper").canBeControlled)
+        #expect(daemon("sh.brew.postgresql@16").unusableLabel == nil)
+        #expect(daemon("com.apple.example").unusableLabel == nil)
+    }
+
+    @Test func aJobLoadedFromAFileElsewhereCanOnlyBeStopped() {
+        func agent(_ label: String, _ source: BackgroundItem.Source) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: .agent, source: source, plistURL: nil, program: "/usr/local/bin/agent",
+                runsAtLoad: true, keepsAlive: true, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil,
+                isOrphan: false, state: .running(pid: 4_242), isDisabled: false
+            )
+        }
+
+        #expect(agent("org.example.elsewhere", .otherFile).canOnlyBeStopped)
+        #expect(!agent("org.example.declared", .userLibrary).canOnlyBeStopped)
+        #expect(!agent("org.example.elsewhere/x", .otherFile).canOnlyBeStopped)
+    }
+
+    @Test func anAgentWhoseNameReachesAnotherJobIsLeftAlone() {
+        func agent(_ label: String) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: .agent, source: .userLibrary, plistURL: nil, program: "/usr/local/bin/agent",
+                runsAtLoad: true, keepsAlive: true, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil,
+                isOrphan: false, state: .loaded, isDisabled: false
+            )
+        }
+
+        #expect(!agent("com.openssh.ssh-agent/x").canBeControlled)
+        #expect(agent("com.openssh.ssh-agent/x").unusableLabel == .holdsASlash)
+        #expect(agent("org.example.agent\u{7}").unusableLabel == .holdsAControlCharacter)
+        #expect(agent("org.example.my agent").unusableLabel == nil)
+        #expect(BackgroundItemActions.refusal(for: agent("com.openssh.ssh-agent/x")) != nil)
+        #expect(agent("org.example.agent").canBeControlled)
+    }
+
+    @Test func aJobInTheUserDomainIsAskedAboutThere() throws {
+        let directory = try TemporaryDirectory()
+        let job = try PropertyListSerialization.data(
+            fromPropertyList: ["Label": "org.example.background", "Program": "/bin/cat"], format: .xml, options: 0
+        )
+        let file = try directory.file("Elsewhere/org.example.background.plist", contents: job)
+        let loaded = BackgroundItems.Loaded(
+            user: ["org.example.background": 42, "org.example.window": nil], inTheUserDomain: ["org.example.background"]
+        )
+
+        let undeclared = BackgroundItems.undeclared(in: loaded, declared: [], uid: 501)
+        let found = BackgroundItems.undeclaredItem(
+            try #require(undeclared.first),
+            answer: .details(Launchctl.JobDetails(path: file.path(percentEncoded: false), program: "/bin/cat")),
+            ownership: BackgroundItemOwnership(installedApps: []), loaded: loaded, exclusions: .none
+        )
+
+        #expect(undeclared.map(\.target) == ["user/501/org.example.background", "gui/501/org.example.window"])
+        guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+        #expect(item.loadsInTheBackgroundSession)
+        #expect(BackgroundItems.Loaded(user: [:], inTheUserDomain: nil).unanswered.lists == [.agent])
+    }
+
+    @Test func leavesOutLaunchctlsAdviceToRunItAsRoot() {
+        let bootstrap = "Bootstrap failed: 5: Input/output error\nTry re-running the command as root for richer errors.\n"
+        let kickstart = "Could not kickstart service: 1: Operation not permitted\nTry running `launchctl kickstart -k` as root for richer errors."
+
+        #expect(Launchctl.withoutAdviceToRunAsRoot(bootstrap) == "Bootstrap failed: 5: Input/output error")
+        #expect(Launchctl.withoutAdviceToRunAsRoot(kickstart) == "Could not kickstart service: 1: Operation not permitted")
+        #expect(Launchctl.withoutAdviceToRunAsRoot("Not privileged to start service.") == "Not privileged to start service.")
+    }
+
+    @Test func aJobWhoseFileIsGoneSaysSo() throws {
+        let directory = try TemporaryDirectory()
+        let job = try PropertyListSerialization.data(
+            fromPropertyList: ["Label": "org.example.tide.agent", "Program": "/bin/cat"], format: .xml, options: 0
+        )
+        let elsewhere = try directory.file("Elsewhere/org.example.tide.agent.plist", contents: job)
+        let gone = directory.url.appending(path: "Library/LaunchAgents/org.example.tide.gone.plist")
+        func item(_ label: String, loadedFrom file: URL) throws -> BackgroundItem {
+            let found = BackgroundItems.undeclaredItem(
+                (label, .agent, "gui/501/\(label)"),
+                answer: .details(Launchctl.JobDetails(path: file.path(percentEncoded: false), program: "/bin/cat")),
+                ownership: BackgroundItemOwnership(installedApps: []), loaded: .init(), exclusions: .none
+            )
+            guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+            return item
+        }
+
+        #expect(try item("org.example.tide.gone", loadedFrom: gone).isFileGone)
+        #expect(try !item("org.example.tide.agent", loadedFrom: elsewhere).isFileGone)
+    }
+
+    @Test func aSystemExtensionsJobIsLeftToSystemSettings() throws {
+        let label = "NetworkExtension.org.example.tide.network-extension.1.0.42"
+        let printed = """
+            system/\(label) = {
+            \tactive count = 2
+            \tpath = (submitted by smd[43864])
+            \ttype = Submitted
+            \tstate = running
+
+            \tprogram = /Library/SystemExtensions/76132A3E-1833-4E7B-99E9-D2947DEA2142/org.example.tide.network-extension.systemextension/Contents/MacOS/org.example.tide.network-extension
+            \tdomain = system
+            \tpid = 52348
+            }
+            """
+        let details = try #require(Launchctl.parseDetails(printed))
+        func item(_ details: Launchctl.JobDetails) throws -> BackgroundItem {
+            let found = BackgroundItems.undeclaredItem(
+                (label, .daemon, "system/\(label)"), answer: .details(details),
+                ownership: BackgroundItemOwnership(installedApps: []), loaded: .init(system: [label: 52348]),
+                exclusions: .none
+            )
+            guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+            return item
+        }
+        var elsewhere = details
+        elsewhere.program = "/Library/Application Support/org.example.tide/helper"
+
+        let extensionsJob = try item(details)
+        let helpersJob = try item(elsewhere)
+
+        #expect(extensionsJob.isSystemExtension)
+        #expect(!extensionsJob.canBeControlled)
+        #expect(BackgroundItemActions.refusal(for: extensionsJob) != nil)
+        #expect(!helpersJob.isSystemExtension)
+        #expect(helpersJob.canBeControlled)
+    }
+
+    @Test func aJobServiceManagementManagesIsTurnedOffInSystemSettings() throws {
+        let label = "org.example.tide.loginhelper"
+        let tide = InstalledApp(url: URL(filePath: "/Applications/Tide.app"), bundleIdentifier: "org.example.tide", name: "Tide")
+        func item(_ details: Launchctl.JobDetails, disabled: Bool = false) throws -> BackgroundItem {
+            let found = BackgroundItems.undeclaredItem(
+                (label, .agent, "gui/501/\(label)"), answer: .details(details),
+                ownership: BackgroundItemOwnership(installedApps: [tide]),
+                loaded: .init(user: [label: nil], userDisabled: [label: disabled]), exclusions: .none
+            )
+            guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+            return item
+        }
+        let registered = Launchctl.JobDetails(
+            path: "(submitted by smd.251)", managedBy: "com.apple.xpc.ServiceManagement",
+            parentBundleIdentifier: "org.example.tide"
+        )
+        let submitted = Launchctl.JobDetails(path: "(submitted by Tide.42)", program: "/bin/sh")
+
+        let managed = try item(registered)
+        let managedAndDisabled = try item(registered, disabled: true)
+        let other = try item(submitted)
+
+        #expect(managed.isManagedByServiceManagement)
+        #expect(BackgroundItemActions.refusal(toSwitch: managed, on: false) != nil)
+        #expect(BackgroundItemActions.refusal(toSwitch: managedAndDisabled, on: true) == nil)
+        #expect(!other.isManagedByServiceManagement)
+        #expect(BackgroundItemActions.refusal(toSwitch: other, on: false) == nil)
+    }
+
+    @Test func aDisabledJobComesBackWhenItsAppDeclaresIt() throws {
+        let directory = try TemporaryDirectory()
+        func write(_ plist: [String: Any], at path: String) throws {
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try directory.file(path, contents: data)
+        }
+        try write(["CFBundleIdentifier": "org.example.postgres2"], at: "Applications/Postgres.app/Contents/Info.plist")
+        try write(
+            ["CFBundleIdentifier": "org.example.postgres2LoginHelper"],
+            at: "Applications/Postgres.app/Contents/Library/LoginItems/PostgresLoginHelper.app/Contents/Info.plist"
+        )
+        let app = InstalledApp(
+            url: directory.url.appending(path: "Applications/Postgres.app"), bundleIdentifier: "org.example.postgres2",
+            name: "Postgres"
+        )
+
+        let items = BackgroundItems.disabledJobs(
+            in: .init(user: [:], system: [:], userDisabled: ["org.example.postgres2LoginHelper": true, "org.example.unknown": true]),
+            listed: [], ownership: BackgroundItemOwnership(installedApps: [app])
+        )
+
+        #expect(items.map(\.label) == ["org.example.postgres2LoginHelper"])
+        #expect(items.first?.ownerURL == app.url)
+        #expect(items.first?.runsAtLoad == true)
+    }
+
+    @Test func readsEachAppsBundleOnceHoweverManyLabelsAreAsked() throws {
+        let directory = try TemporaryDirectory()
+        func write(_ plist: [String: Any], at path: String) throws {
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try directory.file(path, contents: data)
+        }
+        try write(["CFBundleIdentifier": "org.example.tide"], at: "Applications/Tide.app/Contents/Info.plist")
+        try write(
+            ["Label": "org.example.tide-sync", "Program": "/bin/true"],
+            at: "Applications/Tide.app/Contents/Library/LaunchAgents/sync.plist"
+        )
+        let app = InstalledApp(
+            url: directory.url.appending(path: "Applications/Tide.app"), bundleIdentifier: "org.example.tide", name: "Tide"
+        )
+        let ownership = BackgroundItemOwnership(installedApps: [app])
+
+        #expect(ownership.owner(declaring: "org.example.tide-sync", kind: .agent)?.url == app.url)
+        try write(
+            ["Label": "org.example.tide-later", "Program": "/bin/true"],
+            at: "Applications/Tide.app/Contents/Library/LaunchAgents/later.plist"
+        )
+
+        #expect(ownership.owner(declaring: "org.example.tide-later", kind: .agent) == nil, "read again for a second label")
+        #expect(ownership.owner(declaring: "org.example.tide-sync", kind: .daemon) == nil)
+        #expect(BackgroundItemOwnership(installedApps: [app]).owner(declaring: "org.example.tide-later", kind: .agent) != nil)
+    }
+
+    @Test func aJobWhoseLabelLeadsNowhereIsNotDisabled() throws {
+        let directory = try TemporaryDirectory()
+        let info = try PropertyListSerialization.data(
+            fromPropertyList: ["CFBundleIdentifier": "org.example.tide"], format: .xml, options: 0
+        )
+        try directory.file("Applications/Tide.app/Contents/Info.plist", contents: info)
+        let app = InstalledApp(
+            url: directory.url.appending(path: "Applications/Tide.app"), bundleIdentifier: "org.example.tide", name: "Tide"
+        )
+        let program = app.url.appending(path: "Contents/MacOS/helperd").path(percentEncoded: false)
+        func item(_ label: String) throws -> BackgroundItem {
+            let found = BackgroundItems.undeclaredItem(
+                (label, .agent, "gui/501/\(label)"), answer: .details(.init(path: "(submitted by Tide.42)", program: program)),
+                ownership: BackgroundItemOwnership(installedApps: [app]), loaded: .init(user: [label: nil]),
+                exclusions: .none
+            )
+            guard case .item(let item) = found else { throw CocoaError(.featureUnsupported) }
+            return item
+        }
+
+        let byLabel = try item("org.example.tide.ShipIt")
+        let elsewhere = try item("org.example.helperd")
+
+        #expect(byLabel.ownerBundleIdentifier == "org.example.tide" && byLabel.mayBeDisabled)
+        #expect(elsewhere.ownerBundleIdentifier == "org.example.tide" && !elsewhere.mayBeDisabled)
+        #expect(BackgroundItemActions.refusal(toSwitch: elsewhere, on: false) != nil)
+    }
+
+    @Test func aDisabledJobLaunchdDoesNotHaveIsEnabledFirst() {
+        let plist = URL(filePath: "/Users/x/Library/LaunchAgents/com.example.agent.plist")
+        let disabled = BackgroundItem(
+            label: "com.example.agent", kind: .agent, source: .userLibrary, plistURL: plist, program: nil,
+            runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil, ownerName: nil,
+            ownerURL: nil, isOrphan: false, state: .notLoaded, isDisabled: true
+        )
+
+        #expect(BackgroundItemActions.plan(toStart: disabled, isRefusedByLaunchd: { _ in false }) == .needsEnabling)
+        let enabled = item(state: .notLoaded, plist: plist)
+        #expect(BackgroundItemActions.plan(toStart: enabled, isRefusedByLaunchd: { _ in false }) == .bootstrap(plist))
+    }
+
+    /// On macOS 27 a job whose file carries a download's quarantine mark cannot be loaded. A job launchd already
+    /// holds is still woken, marked or not.
+    @Test func theMarkOfADownloadStopsALoadAndNothingElse() {
+        let plist = URL(filePath: "/Users/x/Library/LaunchAgents/com.example.agent.plist")
+        let marked = { (_: URL) in true }
+
+        #expect(
+            BackgroundItemActions.plan(toStart: item(state: .notLoaded, plist: plist), isRefusedByLaunchd: marked)
+                == .blockedByQuarantine
+        )
+        #expect(
+            BackgroundItemActions.plan(toStart: item(state: .loaded, plist: plist), isRefusedByLaunchd: marked)
+                == .kickstart
+        )
+        #expect(
+            BackgroundItemActions.plan(
+                toStart: item(state: .running(pid: 42), plist: plist),
+                isRefusedByLaunchd: marked
+            ) == .kickstart
+        )
+        #expect(
+            BackgroundItemActions.plan(
+                toStart: item(state: .notLoaded, plist: plist),
+                isRefusedByLaunchd: { _ in false }
+            ) == .bootstrap(plist)
+        )
+        // Nothing to load from: an app submitted this one, and launchctl is asked for it by name.
+        #expect(
+            BackgroundItemActions.plan(toStart: item(state: .notLoaded, plist: nil), isRefusedByLaunchd: marked)
+                == .kickstart
+        )
+    }
+
+    /// Starting, stopping and switching a job go by its label, so a label macOS itself uses would reach macOS's own
+    /// job. The helper refuses one for a daemon; the same refusal holds for an agent, which `launchctl` runs
+    /// without the helper. `com.openssh.ssh-agent` is an agent macOS ships whose label says nothing about Apple.
+    @Test func neverActsOnALabelMacOSUses() {
+        func agent(_ label: String) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: .agent, source: .userLibrary, plistURL: nil, program: nil,
+                runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil, ownerName: nil,
+                ownerURL: nil, isOrphan: false, state: .loaded, isDisabled: false
+            )
+        }
+        let refused = BackgroundItemActions.Failure.notControlled
+
+        #expect(BackgroundItemActions.refusal(for: agent("com.apple.Finder.helper")) == refused)
+        #expect(BackgroundItemActions.refusal(for: agent("com.openssh.ssh-agent")) == refused)
+        #expect(BackgroundItemActions.refusal(for: agent("com.openssh.ssh-agent.DFF8D2B5-E315-46B4-9087-D4072EBC64DC")) == refused)
+        #expect(BackgroundItemActions.refusal(for: agent("com.example.agent")) == nil)
+    }
+
+    @Test func controlsADaemonOnlyUnderALabelTheHelperTakes() {
+        func job(_ label: String, _ kind: BackgroundItem.Kind) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: kind, source: .systemLibrary, plistURL: nil, program: nil,
+                runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil, ownerName: nil,
+                ownerURL: nil, isOrphan: false, state: .loaded, isDisabled: false
+            )
+        }
+
+        #expect(job("org.example.daemon", .daemon).canBeControlled)
+        #expect(!job("org.example.a daemon", .daemon).canBeControlled)
+        #expect(!job("-org.example.daemon", .daemon).canBeControlled)
+        #expect(!job(HelperIdentity.helperIdentifier, .daemon).canBeControlled)
+        #expect(!job("com.openssh.sshd", .daemon).canBeControlled)
+        #expect(!job("com.openssh.sshd.DFF8D2B5-E315-46B4-9087-D4072EBC64DC", .daemon).canBeControlled)
+        #expect(BackgroundItemActions.refusal(for: job("org.example.a daemon", .daemon)) != nil)
+
+        #expect(job("org.example.an agent", .agent).canBeControlled, "`launchctl` runs an agent without the helper")
+        #expect(!job("com.apple.Finder.helper", .agent).canBeControlled)
+    }
+
+    private func item(_ source: BackgroundItem.Source, state: BackgroundItem.State, plist: URL?) -> BackgroundItem {
+        BackgroundItem(
+            label: "com.example.agent", kind: source == .systemLibrary ? .daemon : .agent, source: source,
+            plistURL: plist, program: nil, runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil,
+            ownerName: nil, ownerURL: nil, isOrphan: false, state: state, isDisabled: false
+        )
+    }
+
+    /// A job stopped before a move that is then refused would be left stopped with its file in place.
+    @Test func movesTheFileFirstAndStopsTheJobOnlyOnceItHasGone() async throws {
+        let plist = URL(filePath: "/Users/x/Library/LaunchAgents/com.example.agent.plist")
+        let steps = Mutex<[String]>([])
+        func service(refusing: Bool) -> TrashService {
+            TrashService(
+                environment: SearchEnvironment(
+                    homeDirectory: URL(filePath: "/Users/x"),
+                    rootDirectory: URL(filePath: "/")
+                )
+            ) { url in
+                steps.withLock { $0.append("move") }
+                if refusing { throw TrashService.RefusedOnceHeld(refusal: .protectedLocation) }
+                return url
+            }
+        }
+        let stop: (BackgroundItem) async -> BackgroundItemActions.Failure? = { _ in
+            steps.withLock { $0.append("stop") }
+            return nil
+        }
+
+        let moved = try await BackgroundItemActions.moveToTrash(
+            item(.userLibrary, state: .running(pid: 7), plist: plist),
+            isHelperEnabled: false,
+            trash: service(refusing: false),
+            stop: stop
+        )
+        #expect(moved.result.trashed.count == 1)
+        #expect(moved.stillRunning == nil)
+        #expect(steps.withLock { $0 } == ["move", "stop"])
+
+        // Refused: nothing is stopped, and the refusal comes back in the result, with the reason the guard gave, so
+        // it is written down like any other.
+        steps.withLock { $0 = [] }
+        let refused = try await BackgroundItemActions.moveToTrash(
+            item(.userLibrary, state: .running(pid: 7), plist: plist),
+            isHelperEnabled: false,
+            trash: service(refusing: true),
+            stop: stop
+        )
+        #expect(refused.result.trashed.isEmpty)
+        #expect(refused.result.failures.map(\.reason) == [.guarded(.protectedLocation)])
+        #expect(steps.withLock { $0 } == ["move"])
+
+        // A job launchd does not hold has nothing to stop.
+        steps.withLock { $0 = [] }
+        _ = try await BackgroundItemActions.moveToTrash(
+            item(.userLibrary, state: .notLoaded, plist: plist),
+            isHelperEnabled: false,
+            trash: service(refusing: false),
+            stop: stop
+        )
+        #expect(steps.withLock { $0 } == ["move"])
+
+        // A row named by its file has no label Peel read, and a job under that name may run from another file.
+        steps.withLock { $0 = [] }
+        var named = item(.userLibrary, state: .unknown, plist: plist)
+        named.isClosedToPeel = true
+        named.isNamedByItsFile = true
+        _ = try await BackgroundItemActions.moveToTrash(
+            named, isHelperEnabled: false, trash: service(refusing: false), stop: stop
+        )
+        #expect(steps.withLock { $0 } == ["move"])
+    }
+
+    /// Once its file is in the Trash nothing loads the job again, but one launchd could not stop runs until the Mac
+    /// restarts, and the page has to say so.
+    @Test func saysWhenAJobKeepsRunningAfterItsFileMoved() async throws {
+        let plist = URL(filePath: "/Users/x/Library/LaunchAgents/com.example.agent.plist")
+        let environment = SearchEnvironment(homeDirectory: URL(filePath: "/Users/x"), rootDirectory: URL(filePath: "/"))
+        let trash = TrashService(environment: environment) { $0 }
+        let refused = BackgroundItemActions.Failure.launchctl("Boot-out failed: 5: Input/output error")
+
+        let moved = try await BackgroundItemActions.moveToTrash(
+            item(.userLibrary, state: .running(pid: 7), plist: plist),
+            isHelperEnabled: false, trash: trash, stop: { _ in refused }
+        )
+
+        #expect(moved.result.trashed.count == 1)
+        #expect(moved.stillRunning == refused)
+    }
+
+    /// `launchctl print` answers 113 for a job launchd does not have, in either domain, whoever asks.
+    @Test func asksLaunchdWhetherAJobIsGone() async {
+        func job(_ label: String, _ kind: BackgroundItem.Kind) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: kind, source: kind == .daemon ? .systemLibrary : .userLibrary,
+                plistURL: nil, program: nil, runsAtLoad: false, keepsAlive: false, ownerBundleIdentifier: nil,
+                ownerName: nil, ownerURL: nil, isOrphan: false, state: .notLoaded, isDisabled: false
+            )
+        }
+
+        #expect(await BackgroundItemActions.isGone(job("org.example.never-loaded", .agent)))
+        #expect(await BackgroundItemActions.isGone(job("org.example.never-loaded", .daemon)))
+        #expect(!(await BackgroundItemActions.isGone(job("com.apple.Finder", .agent))))
+        #expect(!(await BackgroundItemActions.isGone(job("com.apple.logd", .daemon))))
+    }
+
+    /// The helper moves what is in `/Library`, so without it nothing is touched and nothing is stopped.
+    @Test func movesNothingFromTheSystemLibraryWithoutTheHelper() async {
+        let plist = URL(filePath: "/Library/LaunchDaemons/com.example.agent.plist")
+        let touched = Mutex(false)
+        let trash = TrashService(
+            environment: SearchEnvironment(homeDirectory: URL(filePath: "/Users/x"), rootDirectory: URL(filePath: "/"))
+        ) { url in
+            touched.withLock { $0 = true }
+            return url
+        }
+
+        await #expect(throws: BackgroundItemActions.Failure.requiresPrivileges) {
+            try await BackgroundItemActions.moveToTrash(
+                item(.systemLibrary, state: .running(pid: 7), plist: plist),
+                isHelperEnabled: false, trash: trash, stop: { _ in nil }
+            )
+        }
+        await #expect(throws: BackgroundItemActions.Failure.noFileToMove) {
+            try await BackgroundItemActions.moveToTrash(
+                item(.app, state: .running(pid: 7), plist: nil), isHelperEnabled: true, trash: trash, stop: { _ in nil }
+            )
+        }
+        #expect(!touched.withLock { $0 })
+    }
+}
+
+/// The jobs declared in the three folders launchd reads, read without asking `launchctl`.
+struct DeclaredBackgroundItemsTests {
+    private func job(_ label: String, program: String? = nil, disabled: Bool = false) throws -> Data {
+        var plist: [String: Any] = ["Label": label, "Disabled": disabled]
+        if let program { plist["ProgramArguments"] = [program] }
+        return try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+    }
+
+    private func environment(_ directory: borrowing TemporaryDirectory) -> SearchEnvironment {
+        SearchEnvironment(
+            homeDirectory: directory.url.appending(path: "home", directoryHint: .isDirectory),
+            rootDirectory: directory.url.appending(path: "root", directoryHint: .isDirectory)
+        )
+    }
+
+    @Test func aLabelTwoFilesDeclareRunsFromTheOneLaunchdNames() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/org.example.updater.plist", contents: job("org.example.updater"))
+        let shared = try directory.file(
+            "root/Library/LaunchAgents/org.example.updater.plist", contents: job("org.example.updater")
+        )
+        let items = BackgroundItems.declared(
+            in: environment(directory), ownership: BackgroundItemOwnership(installedApps: []),
+            loaded: BackgroundItems.Loaded(user: ["org.example.updater": 42])
+        )
+
+        let named = await BackgroundItems.settlingSharedLabels(items) { _ in shared.path(percentEncoded: false) }
+        let unknown = await BackgroundItems.settlingSharedLabels(items) { _ in nil }
+        let loadedRow = named.first { $0.source == .systemLibrary }
+        let otherRow = named.first { $0.source == .userLibrary }
+
+        #expect(loadedRow?.state == .running(pid: 42))
+        #expect(otherRow?.state == .notLoaded)
+        #expect(otherRow?.anotherFileIsLoaded == true)
+        #expect(unknown.count == 2 && unknown.allSatisfy { $0.state == .unknown })
+        #expect(unknown.allSatisfy { $0.stateNotKnown == .whichFileNotSaid })
+    }
+
+    @Test func saysWhichListOfLaunchctlsLeftAStateUnknown() {
+        let unread = BackgroundItems.Loaded(user: nil, system: [:], userDisabled: [:], systemDisabled: nil)
+
+        #expect(unread.whyNotKnown(.agent) == .jobsNotListed)
+        #expect(unread.whyNotKnown(.daemon) == .disabledNotListed)
+        #expect(BackgroundItems.Loaded().whyNotKnown(.agent) == nil)
+    }
+
+    /// launchd runs a program with the arguments after it, and a program named apart from them (`Program`) takes the
+    /// place of the first. The whole command is read for its shape.
+    @Test func readsTheWholeCommandOfAJob() throws {
+        let directory = try TemporaryDirectory()
+        let fetches: [String: Any] = [
+            "Label": "org.example.fetch", "ProgramArguments": ["/usr/bin/curl", "-fsSL", "https://example.org"],
+        ]
+        let named: [String: Any] = [
+            "Label": "org.example.named", "Program": "/bin/sh", "ProgramArguments": ["sh", "-c", "true"],
+        ]
+        for (label, plist) in ["org.example.fetch": fetches, "org.example.named": named] {
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try directory.file("home/Library/LaunchAgents/\(label).plist", contents: data)
+        }
+        let agent = try job("org.example.agent", program: "/bin/sleep")
+        try directory.file("home/Library/LaunchAgents/org.example.agent.plist", contents: agent)
+
+        let ownership = BackgroundItemOwnership(installedApps: [])
+        let items = BackgroundItems.declared(in: environment(directory), ownership: ownership)
+
+        let shapes = Dictionary(uniqueKeysWithValues: items.map { ($0.label, $0.unusualCommand) })
+        #expect(shapes["org.example.fetch"] == .downloads)
+        #expect(shapes["org.example.named"] == .runsCodeFromItsSettings)
+        #expect(shapes["org.example.agent"] == .some(nil))
+    }
+
+    /// A file in these folders that can't be read as a job, not a property list or one without a `Label`, is one
+    /// launchd can't load. It is listed under its file name so it can be moved to the Trash, and nothing else is
+    /// offered for it.
+    @Test func listsAJobFileLaunchdCannotRead() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/org.example.broken.plist", contents: Data("<plist".utf8))
+        let noLabel = try PropertyListSerialization.data(fromPropertyList: ["RunAtLoad": true], format: .xml, options: 0)
+        try directory.file("home/Library/LaunchAgents/org.example.nolabel.plist", contents: noLabel)
+        try directory.file("home/Library/LaunchAgents/org.example.agent.plist", contents: job("org.example.agent"))
+
+        let ownership = BackgroundItemOwnership(installedApps: [])
+        let items = BackgroundItems.declared(in: environment(directory), ownership: ownership)
+
+        let unreadable = items.filter(\.isUnreadable).sorted { $0.label < $1.label }
+        #expect(unreadable.map(\.label) == ["org.example.broken", "org.example.nolabel"])
+        for item in unreadable {
+            #expect(item.state == .notLoaded)
+            #expect(item.canMoveToTrash)
+            #expect(item.program == nil)
+        }
+        #expect(items.filter { !$0.isUnreadable }.map(\.label) == ["org.example.agent"])
+    }
+
+    @Test(.permissionsHold) func namesAJobFilePeelCannotReadForWhatItIs() throws {
+        let directory = try TemporaryDirectory()
+        let closed = "home/Library/LaunchAgents/org.example.closed.plist"
+        try directory.file(closed, contents: job("org.example.agent", program: "/bin/sh"))
+        try directory.setPermissions(0, of: closed)
+        try directory.file("home/Library/LaunchAgents/org.example.broken.plist", contents: Data("<plist".utf8))
+
+        let items = BackgroundItems.declared(
+            in: environment(directory), ownership: BackgroundItemOwnership(installedApps: [])
+        )
+
+        let unread = try #require(items.first { $0.label == "org.example.closed" })
+        #expect(unread.isClosedToPeel && unread.isNamedByItsFile)
+        #expect(!unread.isUnreadable, "launchd reads it as root, so nothing says macOS can't load it")
+        #expect(!unread.isOrphan, "what it runs is not known")
+        #expect(unread.state == .notLoaded)
+        let broken = try #require(items.first { $0.label == "org.example.broken" })
+        #expect(broken.isUnreadable && !broken.isClosedToPeel)
+    }
+
+    @Test func asksLaunchdWhichJobAFilePeelCannotReadLoaded() {
+        var closed = BackgroundItem(
+            label: "org.example.closed", kind: .agent, source: .userLibrary,
+            plistURL: URL(filePath: "/org.example/LaunchAgents/org.example.closed.plist"), program: nil,
+            runsAtLoad: nil, keepsAlive: nil, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil,
+            isOrphan: false, state: .unknown, isDisabled: false
+        )
+        closed.isClosedToPeel = true
+        closed.isNamedByItsFile = true
+        let loaded = BackgroundItems.Loaded(user: ["org.example.closed": 42])
+
+        #expect(BackgroundItems.undeclared(in: loaded, declared: [closed], uid: 501).map(\.label) == ["org.example.closed"])
+    }
+
+    @Test func aJobLoadedFromAFilePeelCannotReadTakesItsRow() {
+        func item(
+            _ label: String, _ source: BackgroundItem.Source, _ plist: String, program: String? = nil
+        ) -> BackgroundItem {
+            BackgroundItem(
+                label: label, kind: .daemon, source: source, plistURL: URL(filePath: plist), program: program,
+                runsAtLoad: nil, keepsAlive: nil, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil,
+                isOrphan: false, state: .running(pid: 7), isDisabled: false
+            )
+        }
+        var closed = item("org.example.closed", .systemLibrary, "/Library/LaunchDaemons/org.example.closed.plist")
+        closed.state = .unknown
+        closed.isClosedToPeel = true
+        closed.isNamedByItsFile = true
+        let fromIt = item(
+            "org.example.daemon", .otherFile, "/Library/LaunchDaemons/org.example.closed.plist",
+            program: "/usr/local/bin/org.example.daemon"
+        )
+        let elsewhere = item("org.example.stray", .otherFile, "/org.example/org.example.stray.plist")
+
+        let rows = BackgroundItems.placing([fromIt, elsewhere], into: [closed])
+
+        #expect(rows.map(\.label) == ["org.example.daemon", "org.example.stray"])
+        #expect(rows.first?.source == .systemLibrary, "launchd loaded it from its own folder, not from elsewhere")
+        #expect(rows.first?.isClosedToPeel == true && rows.first?.isNamedByItsFile == false)
+        #expect(rows.first?.mayBeDisabled == false, "the row after it is named by its file and has no Enable")
+        #expect(rows.last?.source == .otherFile && rows.last?.isClosedToPeel == false)
+    }
+
+    @Test(.permissionsHold) func namesAJobFolderPeelCannotLookIn() throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/LaunchAgents")
+        try directory.setPermissions(0, of: "home/Library/LaunchAgents")
+        defer { try? directory.setPermissions(0o755, of: "home/Library/LaunchAgents") }
+
+        let unlisted = BackgroundItems.unlistedJobFolders(in: environment(directory))
+
+        #expect(unlisted.map(\.refused.lastPathComponent) == ["LaunchAgents"], "a folder that isn't there hides nothing")
+        #expect(unlisted.first?.source == .userLibrary)
+    }
+
+    @Test func aJobLoadedFromAFolderPeelCannotLookInComesFromThatFolder() {
+        let folder = URL(filePath: "/org.example/home/Library/LaunchAgents", directoryHint: .isDirectory)
+        let job = BackgroundItem(
+            label: "org.example.agent", kind: .agent, source: .otherFile,
+            plistURL: folder.appending(path: "org.example.agent.plist"), program: "/bin/sh", runsAtLoad: nil,
+            keepsAlive: nil, ownerBundleIdentifier: nil, ownerName: nil, ownerURL: nil, isOrphan: false,
+            state: .running(pid: 7), isDisabled: false
+        )
+
+        let rows = BackgroundItems.placing([job], into: [], unlisted: [(folder, .userLibrary)])
+
+        #expect(rows.first?.source == .userLibrary, "launchd loaded it from its own folder, not from elsewhere")
+        #expect(rows.first?.isClosedToPeel == true)
+        #expect(rows.first?.mayBeDisabled == false, "once it isn't loaded, nothing lists it")
+    }
+
+    /// macOS keeps its own jobs under `/System/Library` and `/Library/Apple/System/Library`, so a file in these
+    /// folders that uses one of their labels, or any `com.apple.` label, is not macOS's. A label names a job only
+    /// in its own domain, so such a copy runs beside the real one: it is listed, marked, and never acted on.
+    @Test func showsAJobThatBorrowsALabelOfMacOSAndActsOnNone() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/updater.plist", contents: job("com.example.agent", program: "/bin/sh"))
+        try directory.file("root/Library/LaunchDaemons/com.example.helper.plist", contents: job("com.example.helper"))
+        try directory.file("root/Library/LaunchDaemons/apple.plist", contents: job("com.apple.madeup.peeltest"))
+        let shipped = try #require(SystemDaemons.shipped.first { !$0.hasPrefix("com.apple.") })
+        try directory.file("home/Library/LaunchAgents/daemon.plist", contents: job(shipped))
+        try directory.file("home/Library/LaunchAgents/ssh.plist", contents: job("com.openssh.ssh-agent"))
+        try directory.file("home/Library/LaunchAgents/unnamed.plist", contents: Data())
+        try directory.file("home/Library/LaunchAgents/notes.txt")
+
+        let items = BackgroundItems.declared(
+            in: environment(directory),
+            ownership: BackgroundItemOwnership(installedApps: [])
+        )
+
+        let jobs = items.filter { !$0.isUnreadable }
+        let labels = ["com.apple.madeup.peeltest", "com.example.agent", "com.example.helper", "com.openssh.ssh-agent", shipped]
+        #expect(jobs.map(\.label).sorted() == labels.sorted())
+        for borrowed in jobs where borrowed.label != "com.example.agent" && borrowed.label != "com.example.helper" {
+            #expect(borrowed.usesALabelOfMacOS, "\(borrowed.label)")
+            #expect(!borrowed.canMoveToTrash, "\(borrowed.label)")
+            #expect(BackgroundItemActions.refusal(for: borrowed) != nil, "\(borrowed.label)")
+        }
+        let own = try #require(items.first { $0.label == "com.example.agent" })
+        #expect(!own.usesALabelOfMacOS)
+        #expect(own.canMoveToTrash)
+        #expect(BackgroundItemActions.refusal(for: own) == nil)
+    }
+
+    /// A loaded job no file in the three folders declares is listed when an app registered or submitted it, whether
+    /// or not Peel can name that app, and when something loaded it from a file anywhere else, which launchd forgets at
+    /// the next logout or restart. A job macOS loaded from its own folders is not, and neither is an excluded file.
+    @Test func listsAJobLoadedFromElsewhereOrWithNoOwner() throws {
+        let directory = try TemporaryDirectory()
+        let ownership = BackgroundItemOwnership(installedApps: [])
+        let stray = try directory.file("home/Desktop/org.example.stray.plist", contents: job("org.example.stray", program: "/bin/sh"))
+        func item(_ label: String, _ details: Launchctl.JobDetails, exclusions: Exclusions = .none) -> BackgroundItem? {
+            let found = BackgroundItems.undeclaredItem(
+                (label, .agent, "gui/501/\(label)"),
+                answer: .details(details),
+                ownership: ownership,
+                loaded: .init(),
+                exclusions: exclusions
+            )
+            guard case .item(let item) = found else { return nil }
+            return item
+        }
+
+        let loadedElsewhere = try #require(item("org.example.stray", .init(path: stray.path(percentEncoded: false), program: "/bin/sh")))
+        #expect(loadedElsewhere.source == .otherFile)
+        #expect(loadedElsewhere.plistURL?.lastPathComponent == "org.example.stray.plist")
+        #expect(!loadedElsewhere.canMoveToTrash)
+
+        let nobodys = try #require(item("org.example.nobody", .init(path: "(submitted by tool[42])", program: "/usr/local/bin/org.example.nobody")))
+        #expect(nobodys.source == .app)
+        #expect(nobodys.ownerBundleIdentifier == nil)
+
+        #expect(item("com.openssh.ssh-agent", .init(path: "/System/Library/LaunchAgents/com.openssh.ssh-agent.plist", program: "/usr/bin/ssh-agent")) == nil)
+        #expect(
+            item(
+                "org.example.stray",
+                .init(path: stray.path(percentEncoded: false), program: "/bin/sh"),
+                exclusions: Exclusions(paths: [stray])
+            ) == nil
+        )
+    }
+
+    /// A job whose answer cannot be read may belong in the list, so its kind is reported; one no longer loaded is gone.
+    @Test func reportsTheKindOfAJobItCouldNotRead() {
+        let ownership = BackgroundItemOwnership(installedApps: [])
+        func found(_ answer: Launchctl.Answer, _ kind: BackgroundItem.Kind) -> BackgroundItems.Undeclared {
+            BackgroundItems.undeclaredItem(
+                ("org.example.job", kind, "gui/501/org.example.job"),
+                answer: answer, ownership: ownership, loaded: .init(), exclusions: .none
+            )
+        }
+
+        #expect(found(.unreadable, .agent) == .unreadable(.agent))
+        #expect(found(.unreadable, .daemon) == .unreadable(.daemon))
+        #expect(found(.gone, .agent) == .nothing)
+        #expect(BackgroundItems.Loaded().unanswered.isEmpty)
+        #expect(BackgroundItems.Loaded(user: nil).unanswered == .init(lists: [.agent]))
+        #expect(BackgroundItems.Loaded(userDisabled: nil).unanswered == .init(overrides: [.agent]))
+        #expect(
+            BackgroundItems.Loaded(system: nil, systemDisabled: nil).unanswered
+                == .init(lists: [.daemon], overrides: [.daemon])
+        )
+        let merged = BackgroundItems.merged([found(.gone, .agent), found(.unreadable, .daemon)], loaded: .init())
+        #expect(merged.items.isEmpty)
+        #expect(merged.unanswered == .init(jobs: [.daemon]))
+        #expect(merged.unanswered.kinds == [.daemon])
+        #expect(BackgroundItems.merged([], loaded: .init(user: nil)).unanswered == .init(lists: [.agent]))
+    }
+
+    /// A job an app registered is known only while it is loaded, so after Disable and a restart it would leave the
+    /// list with no way to Enable it. launchd keeps the override by label, and an override that disables a job no row
+    /// lists yet, of an app that is installed, is a row of its own. Apple's labels and a gone app's stay out.
+    @Test func keepsADisabledJobOfAnInstalledAppListed() throws {
+        let app = InstalledApp(url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "org.example.app", name: "Example")
+        let ownership = BackgroundItemOwnership(installedApps: [app])
+        let loaded = BackgroundItems.Loaded(
+            user: ["org.example.app.running": nil],
+            system: [:],
+            userDisabled: ["org.example.app.helper": true, "org.example.app.on": false, "org.example.gone.helper": true,
+                           "com.apple.example": true, "org.example.app.running": true],
+            systemDisabled: ["org.example.app.daemon": true]
+        )
+
+        let items = BackgroundItems.disabledJobs(in: loaded, listed: [], ownership: ownership)
+
+        #expect(items.map(\.label).sorted() == ["org.example.app.daemon", "org.example.app.helper"])
+        for item in items {
+            #expect(item.isDisabled)
+            #expect(item.state == .notLoaded)
+            #expect(item.source == .app)
+            #expect(item.ownerBundleIdentifier == "org.example.app")
+            #expect(item.ownerURL == app.url)
+        }
+        #expect(items.first { $0.label == "org.example.app.daemon" }?.kind == .daemon)
+    }
+
+    @Test func knowsWhereEachJobsOwnerIs() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/org.example.app.helper.plist", contents: job("org.example.app.helper"))
+        try directory.file("home/Library/LaunchAgents/org.example.gone.helper.plist", contents: job("org.example.gone.helper"))
+        let app = InstalledApp(url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "org.example.app", name: "Example")
+
+        let items = BackgroundItems.declared(
+            in: environment(directory),
+            ownership: BackgroundItemOwnership(installedApps: [app])
+        )
+
+        #expect(items.first { $0.label == "org.example.app.helper" }?.ownerURL == app.url)
+        #expect(items.first { $0.label == "org.example.gone.helper" }?.ownerURL == nil)
+    }
+
+    /// One label declared in two folders is two files, and each row opens its own.
+    @Test func keepsTwoFilesThatDeclareOneLabelApart() throws {
+        let directory = try TemporaryDirectory()
+        for folder in ["home/Library/LaunchAgents", "root/Library/LaunchAgents"] {
+            try directory.file("\(folder)/com.example.agent.plist", contents: job("com.example.agent"))
+        }
+
+        let items = BackgroundItems.declared(
+            in: environment(directory),
+            ownership: BackgroundItemOwnership(installedApps: [])
+        )
+
+        #expect(items.count == 2)
+        #expect(Set(items.map(\.id)).count == 2)
+        #expect(items.map(\.source) == [.userLibrary, .systemLibrary])
+    }
+
+    @Test func leavesOutWhatTheUserExcluded() throws {
+        let directory = try TemporaryDirectory()
+        let excluded = try directory.file("home/Library/LaunchAgents/com.example.agent.plist", contents: job("com.example.agent"))
+        try directory.file("home/Library/LaunchAgents/com.example.other.plist", contents: job("com.example.other"))
+
+        let items = BackgroundItems.declared(
+            in: environment(directory),
+            ownership: BackgroundItemOwnership(installedApps: []),
+            exclusions: Exclusions(paths: [excluded])
+        )
+
+        #expect(items.map(\.label) == ["com.example.other"])
+    }
+
+    /// `launchctl` reports jobs by label, so the state comes from the label inside the file, not from its name.
+    @Test func takesTheStateFromTheLabelInsideTheFile() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/named-after-something-else.plist", contents: job("com.example.agent"))
+        let loaded = BackgroundItems.Loaded(user: ["com.example.agent": 91], userDisabled: ["com.example.agent": true])
+
+        let items = BackgroundItems.declared(
+            in: environment(directory),
+            ownership: BackgroundItemOwnership(installedApps: []),
+            loaded: loaded
+        )
+
+        #expect(items.first?.state == .running(pid: 91))
+        #expect(items.first?.isDisabled == true)
+    }
+
+    /// Where `launchctl` answered its jobs or its overrides in a form Peel cannot read, a job's state is not known,
+    /// never "not loaded".
+    @Test func aJobWhoseStateCouldNotBeReadIsNotKnown() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/agent.plist", contents: job("com.example.agent"))
+        try directory.file("root/Library/LaunchDaemons/daemon.plist", contents: job("com.example.daemon"))
+        let loaded = BackgroundItems.Loaded(user: nil, system: ["com.example.daemon": 12], systemDisabled: nil)
+        let ownership = BackgroundItemOwnership(installedApps: [])
+
+        let items = BackgroundItems.declared(in: environment(directory), ownership: ownership, loaded: loaded)
+
+        #expect(items.first { $0.label == "com.example.agent" }?.state == .unknown)
+        #expect(items.first { $0.label == "com.example.daemon" }?.state == .unknown)
+        #expect(BackgroundItems.undeclared(in: loaded, declared: items, uid: 501).isEmpty)
+    }
+
+    /// A loaded job is asked about as one an app submitted only when no file in the three folders declares it, so
+    /// a job with a file is never asked about again, nor listed a second time. Apple's own are never asked about.
+    @Test func asksOnlyAboutLoadedJobsNoFileDeclares() throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("home/Library/LaunchAgents/updater.plist", contents: job("com.example.agent"))
+        let loaded = BackgroundItems.Loaded(user: ["com.example.agent": 91, "com.example.submitted": nil, "com.apple.Finder": 1])
+        let items = BackgroundItems.declared(
+            in: environment(directory),
+            ownership: BackgroundItemOwnership(installedApps: []),
+            loaded: loaded
+        )
+
+        let undeclared = BackgroundItems.undeclared(in: loaded, declared: items, uid: 501)
+
+        #expect(undeclared.map(\.label) == ["com.example.submitted"])
+        #expect(undeclared.first?.target == "gui/501/com.example.submitted")
+    }
+}

@@ -1,0 +1,61 @@
+import Foundation
+@testable import PeelCore
+import Testing
+
+struct InstalledAppTests {
+    @Test func answersWhetherItIsPeelWithoutWorkingItOutAgain() {
+        let app = InstalledApp(url: URL(filePath: "/Applications/Editor.app"), bundleIdentifier: "org.example.editor", name: "Editor")
+        var answers = 0
+
+        let took = processorTime { for _ in 0..<200_000 where app.isPeelItself { answers += 1 } }
+
+        #expect(answers == 0)
+        #expect(took < .milliseconds(100))
+    }
+
+    @Test func theAppAroundTheRunningCodeIsPeelWhateverItIsCalled() {
+        let around = InstalledApp(url: Bundle.main.bundleURL.deletingLastPathComponent(), bundleIdentifier: "org.example.around", name: "Around")
+
+        #expect(around.isPeelItself)
+    }
+
+    @Test func theRunningCopyIsTheAppTheCodeRunsFrom() {
+        let running = InstalledApp(url: Bundle.main.bundleURL, bundleIdentifier: "org.example.running", name: "Running")
+        let around = InstalledApp(url: Bundle.main.bundleURL.deletingLastPathComponent(), bundleIdentifier: "org.example.around", name: "Around")
+        let other = InstalledApp(url: URL(filePath: "/Applications/Editor.app"), bundleIdentifier: "org.example.editor", name: "Editor")
+
+        #expect(running.isTheRunningCopy)
+        #expect(!around.isTheRunningCopy)
+        #expect(!other.isTheRunningCopy)
+    }
+
+    @Test func aCopyWithAnotherUseKeepsEverythingElse() {
+        let app = InstalledApp(
+            url: URL(filePath: "/Applications/Tide.app"), bundleIdentifier: "org.example.tide", name: "Tide",
+            architectures: [.arm64, .x86_64], asksForIntelFirst: true, lastUsedDate: .distantPast
+        )
+
+        let copy = app.withUse(lastUsedDate: .now, isUseRecorded: false)
+
+        #expect(copy.prefersIntel)
+        #expect(copy.withUse(lastUsedDate: .distantPast, isUseRecorded: true) == app)
+    }
+
+    @Test func anAppOpenedAgainIsTheSameBuildAndAnUpdateIsNot() {
+        func app(version: String = "2.0", build: String = "200", team: String = "ABCDE12345",
+                 architectures: Set<Architecture> = [.arm64], opened: Date? = nil) -> InstalledApp {
+            InstalledApp(
+                url: URL(filePath: "/Applications/Example.app"), bundleIdentifier: "org.example.app", name: "Example",
+                version: version, buildVersion: build, teamIdentifier: team, architectures: architectures,
+                lastUsedDate: opened
+            )
+        }
+        let before = app()
+
+        #expect(before.isTheSameBuild(as: app(opened: .now)))
+        #expect(!before.isTheSameBuild(as: app(version: "2.1")))
+        #expect(!before.isTheSameBuild(as: app(build: "201")))
+        #expect(!before.isTheSameBuild(as: app(team: "ZYXWV98765")))
+        #expect(!before.isTheSameBuild(as: app(architectures: [.arm64, .x86_64])))
+    }
+}

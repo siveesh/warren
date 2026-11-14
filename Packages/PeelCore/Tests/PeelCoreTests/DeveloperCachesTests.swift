@@ -1,0 +1,2439 @@
+import Foundation
+@testable import PeelCore
+import PeelPrivileged
+import Testing
+
+struct DeveloperCachesTests {
+    /// The public scan in a home of the test's own, with no user cache folder, so no real cache is read.
+    @Test func saysWhatAToolKeepsElsewhereThroughALink() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        try directory.file("ssd/DerivedData/MyApp-abcdefgh/Build/x.o", bytes: 4_000)
+        try directory.file("ssd/gradle-caches/modules-2/x.jar", bytes: 4_000)
+        try directory.directory("home/Library/Developer/Xcode")
+        try directory.directory("home/.gradle")
+        let derivedData = home.appending(path: "Library/Developer/Xcode/DerivedData")
+        let caches = home.appending(path: ".gradle/caches")
+        try FileManager.default.createSymbolicLink(
+            at: derivedData, withDestinationURL: directory.url.appending(path: "ssd/DerivedData")
+        )
+        try FileManager.default.createSymbolicLink(
+            at: caches, withDestinationURL: directory.url.appending(path: "ssd/gradle-caches")
+        )
+        let tools = DeveloperCaches.definitions.filter { ["xcode", "gradle"].contains($0.id) }
+
+        let found = await DeveloperCaches.scan(tools, homeDirectory: home)
+        let kept = Dictionary(uniqueKeysWithValues: found.map {
+            ($0.id, $0.keptElsewhere.map(PathPattern.comparablePath))
+        })
+
+        #expect(kept["xcode"] == [PathPattern.comparablePath(of: derivedData)])
+        #expect(kept["gradle"] == [PathPattern.comparablePath(of: caches)])
+        #expect(found.filter { !$0.locations.isEmpty }.isEmpty)
+    }
+
+    private func scanned(_ home: URL, exclusions: Exclusions = .none) async -> [DeveloperEnvironment] {
+        await DeveloperCaches.scan(
+            in: SearchEnvironment(homeDirectory: home, rootDirectory: home), exclusions: exclusions
+        )
+    }
+
+    /// A scan stopped while it waits on a folder returns within a second and measures no more folders.
+    @Test func aStoppedScanStops() async throws {
+        let directory = try TemporaryDirectory()
+        let paths = (1...30).map { "Library/Caches/Tool/\($0)" }
+        for path in paths {
+            try directory.directory(path)
+        }
+        let tool = DeveloperCaches.Definition(
+            id: "tool",
+            name: "Tool",
+            systemImage: "hammer",
+            appBundleIdentifiers: [],
+            folders: paths.map { DeveloperCaches.Folder($0, .cache, source: "https://example.com") }
+        )
+        let unanswered = Unanswered()
+
+        let stop = try await unanswered.stop {
+            _ = await DeveloperCaches.scan([tool], homeDirectory: directory.url, measure: unanswered.walk)
+        }
+
+        #expect(stop.took < Unanswered.returnsForTheCancel)
+        #expect(stop.askedBefore < paths.count)
+        #expect(stop.askedAfter == 0)
+    }
+
+    /// A folder macOS would not let Peel open is not one that took too long: both are unknown and never selected
+    /// for the user, and the page says which of the two it was.
+    @Test(.permissionsHold) func tellsAFolderMacOSRefusedFromOneThatDidNotAnswer() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".npm/_cacache/content/data", bytes: 80_000)
+        try directory.file(".npm/_npx/package/index.js", bytes: 8_000)
+        try directory.setPermissions(0o000, of: ".npm/_cacache")
+        defer { try? directory.setPermissions(0o755, of: ".npm/_cacache") }
+
+        let environments = await DeveloperCaches.scan(
+            DeveloperCaches.definitions,
+            homeDirectory: directory.url,
+            exclusions: .none
+        ) { url in
+            url.lastPathComponent == "_npx" ? nil : await FileSize.contents(of: url)
+        }
+
+        let npm = try #require(environments.first)
+        let refused = try #require(npm.locations.first { $0.url.lastPathComponent == "_cacache" })
+        let slow = try #require(npm.locations.first { $0.url.lastPathComponent == "_npx" })
+        #expect(refused.size == nil)
+        #expect(refused.couldNotBeRead, "a folder macOS refused reads as one that took too long")
+        #expect(slow.size == nil)
+        #expect(!slow.couldNotBeRead)
+        #expect(!refused.isRecommended && !slow.isRecommended)
+    }
+
+    @Test func oneRuleSaysWhyAFolderStays() {
+        typealias Location = DeveloperEnvironment.Location
+        func location(
+            _ kind: DeveloperEnvironment.ContentKind = .cache, size: Int64? = 4_000, couldNotBeRead: Bool = false,
+            workspace: DeveloperEnvironment.Workspace? = nil, isTheTools: Bool = true, heldBack: HoldBack? = nil
+        ) -> Location {
+            Location(
+                url: URL(filePath: "/Users/me/Library/Caches/org.example.tool", directoryHint: .isDirectory),
+                kind: kind, size: size, source: "https://example.org", couldNotBeRead: couldNotBeRead,
+                workspace: workspace, isTheTools: isTheTools, heldBack: heldBack
+            )
+        }
+        let openedToday = DeveloperEnvironment.Workspace(name: "Example", lastUsed: .now)
+
+        #expect(location(size: nil, couldNotBeRead: true, heldBack: .holdsAWallet).keptBecause
+            == .heldBack(.holdsAWallet))
+        #expect(location(.models, size: nil, heldBack: .holdsAPasswordDatabase).keptBecause
+            == .heldBack(.holdsAPasswordDatabase))
+        #expect(location(size: nil, heldBack: .holdsRepository).keptBecause == .heldBack(.notMeasured))
+        #expect(location(size: nil, workspace: openedToday).keptBecause == .heldBack(.notMeasured))
+        #expect(location(size: nil, isTheTools: false).keptBecause == .heldBack(.notMeasured))
+        #expect(location(.models, size: nil).keptBecause == .heldBack(.notMeasured))
+        #expect(location(size: nil, couldNotBeRead: true).keptBecause == .heldBack(.couldNotBeRead))
+        #expect(location(.models, heldBack: .writtenRecently).keptBecause == .heldBack(.writtenRecently))
+        #expect(location(.models).keptBecause == .keptByDefault)
+        #expect(location(isTheTools: false).keptBecause == .notTheTools)
+        #expect(location(workspace: openedToday).keptBecause == .workspaceMayBeInUse(lastUsed: openedToday.lastUsed))
+        #expect(location().keptBecause == nil)
+    }
+
+    @Test func aSearchFindsAToolByTheNamesOfItsFolders() {
+        let hub = URL(filePath: "/Users/me/.cache/huggingface/hub", directoryHint: .isDirectory)
+        let tool = DeveloperEnvironment(
+            id: "huggingface", name: "Hugging Face", systemImage: "hammer", appBundleIdentifiers: [],
+            locations: [DeveloperEnvironment.Location(url: hub, kind: .models, size: 1, source: "https://example.com")]
+        )
+
+        let list = SearchableList([tool]) { $0.searchKey }
+
+        #expect(list.matching("").count == 1)
+        #expect(list.matching("hugging").count == 1)
+        #expect(list.matching("huggingface").count == 1, "the folder's own name found nothing")
+        #expect(list.matching("DerivedData").isEmpty)
+    }
+
+    /// Xcode's caches wait on Simulator too, so the request to quit names whichever of an environment's apps is
+    /// running: the environment's name would ask for Xcode while only Simulator runs, and the request would keep
+    /// coming back. Finder runs on every Mac, and an identifier nobody uses stands for an app that is closed.
+    @Test func namesTheAppThatRunsRatherThanTheEnvironment() throws {
+        let xcode = try #require(DeveloperCaches.definitions.first { $0.id == "xcode" })
+        #expect(xcode.appBundleIdentifiers.contains("com.apple.dt.Xcode"))
+        #expect(xcode.appBundleIdentifiers.contains("com.apple.iphonesimulator"))
+        func environment(_ apps: [String]) -> DeveloperEnvironment {
+            DeveloperEnvironment(id: "tools", name: "Tools", systemImage: "hammer", appBundleIdentifiers: apps, locations: [])
+        }
+
+        #expect(environment(["org.example.closed", "com.apple.finder"]).runningApp == "Finder")
+        #expect(environment(["org.example.closed"]).runningApp == nil)
+    }
+
+    @Test func namesAnAppThatCarriesItsVersionInItsIdentifier() throws {
+        var tools = DeveloperEnvironment(id: "tools", name: "Tools", systemImage: "hammer", appBundleIdentifiers: [], locations: [])
+        tools.appIdentifierPrefixes = ["com.apple.find"]
+        #expect(tools.runningApp == "Finder")
+        tools.appIdentifierPrefixes = ["org.example."]
+        #expect(tools.runningApp == nil)
+        let adobe = try #require(DeveloperCaches.definitions.first { $0.id == "adobe" })
+        #expect(adobe.appIdentifierPrefixes == ["com.adobe.PremierePro.", "com.adobe.ame.application."])
+    }
+
+    @Test func everyIntelliJIDEKeepsItsCachesWhileItRuns() throws {
+        let jetbrains = try #require(DeveloperCaches.definitions.first { $0.id == "jetbrains" })
+        let androidStudio = try #require(DeveloperCaches.definitions.first { $0.id == "androidstudio" })
+
+        for identifier in [
+            "com.jetbrains.dataspell", "com.jetbrains.gateway", "com.jetbrains.mps", "com.jetbrains.writerside-EAP",
+            "com.jetbrains.intellij-EAP", "com.jetbrains.CLion-EAP", "com.jetbrains.pycharm-EAP",
+        ] {
+            #expect(jetbrains.appBundleIdentifiers.contains(identifier), "\(identifier)")
+        }
+        #expect(androidStudio.appBundleIdentifiers.contains("com.google.android.studio-EAP"))
+    }
+
+    @Test func saysWhyALocationStaysByTheRuleThatRecommendsIt() {
+        func location(_ kind: DeveloperEnvironment.ContentKind, size: Int64? = 10) -> DeveloperEnvironment.Location {
+            DeveloperEnvironment.Location(
+                url: URL(filePath: "/Users/me/Library/Caches/tool"), kind: kind, size: size, source: "https://example.com"
+            )
+        }
+        var held = location(.cache)
+        held.heldBack = .holdsAWallet
+        var another = location(.cache)
+        another.isTheTools = false
+        var opened = location(.buildData)
+        opened.workspace = DeveloperEnvironment.Workspace(name: "App", lastUsed: nil)
+        var closed = location(.cache, size: nil)
+        (closed.couldNotBeRead, closed.closedByPermissions) = (true, true)
+        let unmeasured = location(.cache, size: nil)
+
+        #expect(location(.cache).keptBecause == nil)
+        #expect(location(.models).keptBecause == .keptByDefault)
+        #expect(held.keptBecause == .heldBack(.holdsAWallet))
+        #expect(another.keptBecause == .notTheTools)
+        #expect(opened.keptBecause == .workspaceMayBeInUse(lastUsed: nil))
+        #expect(closed.keptBecause == .heldBack(.closedByPermissions))
+        #expect(unmeasured.keptBecause == .heldBack(.notMeasured))
+        for sample in [location(.cache), location(.models), held, another, opened, closed, unmeasured] {
+            #expect(sample.isRecommended == (sample.keptBecause == nil))
+        }
+    }
+
+    @Test func everyChannelOfZedKeepsItsFoldersWhileItRuns() throws {
+        let zed = try #require(DeveloperCaches.definitions.first { $0.id == "zed" })
+
+        #expect(zed.appBundleIdentifiers == ["dev.zed.Zed", "dev.zed.Zed-Preview", "dev.zed.Zed-Nightly", "dev.zed.Zed-Dev"])
+    }
+
+    /// Space asks about a folder however it was spelled, so another spelling of the same folder (another case, or
+    /// the home folder through a link) must still find what the table lists inside it. Finding nothing, Space
+    /// would move Coursier's folder whole, the JVMs beside its cache included.
+    @Test func findsWhatItListsInsideAFolderSpelledAnotherWay() throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("home/Library/Caches/Coursier/v1")
+        try FileManager.default.createSymbolicLink(
+            at: directory.url.appending(path: "link"),
+            withDestinationURL: directory.url.appending(path: "home")
+        )
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+
+        let left = DeveloperCaches.FoldersLeftToDeveloper(home: home).inside
+        let asWritten = left(home.appending(path: "Library/Caches", directoryHint: .isDirectory))
+        let otherCase = left(home.appending(path: "library/caches", directoryHint: .isDirectory))
+        let throughALink = left(directory.url.appending(path: "link/Library/Caches", directoryHint: .isDirectory))
+
+        #expect(asWritten.contains(["Coursier"]))
+        #expect(otherCase == asWritten, "another case found \(otherCase)")
+        #expect(throughALink == asWritten, "a link found \(throughALink)")
+    }
+
+    @Test func reportsOnlyExistingLocationsSortedBySize() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".npm/_cacache/content/data", bytes: 80_000)
+        try directory.file(".npm/_npx/package/index.js", bytes: 8_000)
+        try directory.file("Library/Developer/Xcode/DerivedData/ModuleCache.noindex/module.pcm", bytes: 20_000)
+        try directory.directory("Library/Developer/Xcode/Archives/2026-09-17/App 17.09.2026, 10.00.xcarchive")
+
+        let environments = await scanned(directory.url)
+
+        #expect(environments.map(\.id) == ["npm", "xcode"])
+        let npm = try #require(environments.first)
+        #expect(npm.locations.map(\.url.lastPathComponent) == ["_cacache", "_npx"])
+        let xcode = try #require(environments.last)
+        #expect(xcode.locations.first { $0.kind == .archives }?.isRecommended == false)
+        #expect(xcode.locations.first { $0.kind == .buildData }?.isRecommended == true)
+    }
+
+    @Test func listsABrowsersCachesAndNothingOfWhatItKeepsForThePerson() async throws {
+        let directory = try TemporaryDirectory()
+        let chrome = "Library/Application Support/Google/Chrome"
+        let caches = [
+            "ShaderCache", "GrShaderCache", "component_crx_cache", "extensions_crx_cache", "Default/GPUCache",
+            "Profile 1/DawnWebGPUCache",
+        ]
+        for cache in caches {
+            try directory.file("\(chrome)/\(cache)/data_0", bytes: 4_096)
+        }
+        let kept = [
+            "Default/Local Storage/leveldb/000003.log", "Default/Service Worker/CacheStorage/index", "Default/History",
+        ]
+        for kept in kept + ["Local State"] {
+            try directory.file("\(chrome)/\(kept)", bytes: 4_096)
+        }
+
+        let environments = await scanned(directory.url)
+
+        let folder = directory.url.appending(path: chrome).path(percentEncoded: false) + "/"
+        let listed = try #require(environments.first { $0.id == "chrome" }).locations.map {
+            $0.url.path(percentEncoded: false).replacingOccurrences(of: folder, with: "")
+        }
+        #expect(Set(listed) == Set(caches))
+    }
+
+    @Test func listsTheCachesOfEveryBuildOfBrave() async throws {
+        let directory = try TemporaryDirectory()
+        let brave = "Library/Application Support/BraveSoftware"
+        let caches = ["Brave-Browser-Beta/ShaderCache", "Brave-Browser-Nightly/Default/GPUCache", "Brave-Origin/ShaderCache"]
+        for cache in caches {
+            try directory.file("\(brave)/\(cache)/data_0", bytes: 4_096)
+        }
+        try directory.file("\(brave)/Brave-Origin/Default/Local Storage/leveldb/000003.log", bytes: 4_096)
+
+        let environments = await scanned(directory.url)
+
+        let folder = directory.url.appending(path: brave).path(percentEncoded: false) + "/"
+        let listed = environments.filter { ["brave", "braveorigin"].contains($0.id) }.flatMap(\.locations).map {
+            $0.url.path(percentEncoded: false).replacingOccurrences(of: folder, with: "")
+        }
+        #expect(Set(listed) == Set(caches))
+    }
+
+    /// Opera is built on Chromium and keeps the same caches in the folder Opera itself names.
+    @Test func listsOperasCachesAsChromiumNamesThem() async throws {
+        let directory = try TemporaryDirectory()
+        let opera = "Library/Application Support/com.operasoftware.Opera"
+        for path in ["ShaderCache/data_0", "Default/GPUCache/data_0", "Default/History"] {
+            try directory.file("\(opera)/\(path)", bytes: 4_096)
+        }
+
+        let environments = await scanned(directory.url)
+
+        let listed = try #require(environments.first { $0.id == "opera" }).locations.map(\.url.lastPathComponent)
+        #expect(Set(listed) == ["ShaderCache", "GPUCache"])
+    }
+
+    @Test func listsTheCachesOfTheChromeThatChromeDevToolsMCPDrives() async throws {
+        let directory = try TemporaryDirectory()
+        let profiles = [".cache/chrome-devtools-mcp/chrome-profile", ".cache/chrome-devtools-mcp-cli/chrome-profile-canary"]
+        for profile in profiles {
+            for path in ["ShaderCache/data_0", "Default/GPUCache/data_0", "Default/Cookies"] {
+                try directory.file("\(profile)/\(path)", bytes: 4_096)
+            }
+        }
+
+        let environments = await scanned(directory.url)
+
+        let home = directory.url.path(percentEncoded: false)
+        let listed = try #require(environments.first { $0.id == "chrome-devtools-mcp" }).locations.map {
+            String($0.url.path(percentEncoded: false).dropFirst(home.count))
+        }
+        #expect(Set(listed) == Set(profiles.flatMap { ["\($0)/ShaderCache", "\($0)/Default/GPUCache"] }))
+    }
+
+    @Test func neverListsAFolderInsideAnotherItAlreadyLists() async throws {
+        let directory = try TemporaryDirectory()
+        let chrome = "Library/Application Support/Google/Chrome"
+        try directory.file("\(chrome)/GPUPersistentCache/GPUCache/data_0", bytes: 4_096)
+        try directory.file("\(chrome)/Default/GPUCache/data_0", bytes: 4_096)
+
+        let environments = await scanned(directory.url)
+
+        let folder = directory.url.appending(path: chrome).path(percentEncoded: false) + "/"
+        let listed = try #require(environments.first { $0.id == "chrome" }).locations.map {
+            $0.url.path(percentEncoded: false).replacingOccurrences(of: folder, with: "")
+        }
+        #expect(Set(listed) == ["GPUPersistentCache", "Default/GPUCache"])
+    }
+
+    @Test func listsABrowsersModelsWithoutSelectingThem() async throws {
+        let directory = try TemporaryDirectory()
+        let chrome = "Library/Application Support/Google/Chrome"
+        try directory.file("\(chrome)/OptGuideOnDeviceModel/2025.8.8.1141/weights.bin", bytes: 4_096)
+        try directory.file("\(chrome)/optimization_guide_model_store/2/abc/model.tflite", bytes: 4_096)
+
+        let environments = await scanned(directory.url)
+
+        let models = try #require(environments.first { $0.id == "chrome" }).locations
+        let names = models.map(\.url.lastPathComponent).sorted()
+        #expect(names == ["OptGuideOnDeviceModel", "optimization_guide_model_store"])
+        #expect(models.allSatisfy { $0.kind == .models && !$0.isRecommended })
+    }
+
+    @Test func listsAnElectronAppsCachesWhereItsDataCarriesLocalState() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let app = { (name: String, electron: Bool) throws -> InstalledApp in
+            let bundle = try directory.directory("Applications/\(name).app/Contents/Frameworks")
+            if electron {
+                let framework = bundle.appending(path: "Electron Framework.framework")
+                try FileManager.default.createDirectory(at: framework, withIntermediateDirectories: true)
+            }
+            return InstalledApp(
+                url: bundle.deletingLastPathComponent().deletingLastPathComponent(),
+                bundleIdentifier: "org.example.\(name.lowercased())", name: name, bundleName: name
+            )
+        }
+        let apps = [try app("Chat", true), try app("Notes", true), try app("Native", false), try app("Code", true)]
+        for name in ["Chat", "Native", "Code"] {
+            try directory.file("home/Library/Application Support/\(name)/Local State")
+            try directory.file("home/Library/Application Support/\(name)/GPUCache/data_0", bytes: 4_096)
+        }
+        try directory.file("home/Library/Application Support/Notes/GPUCache/data_0", bytes: 4_096)
+        try directory.file("home/Library/Application Support/Chat/Cache/Cache_Data/index", bytes: 4_096)
+        try directory.file("home/Library/Application Support/Chat/Local Storage/leveldb/000003.log", bytes: 4_096)
+
+        let definitions = DeveloperCaches.electronDefinitions(for: apps, home: home)
+        let environments = await DeveloperCaches.scan(definitions, homeDirectory: home)
+
+        #expect(definitions.map(\.id) == ["electron.org.example.chat"])
+        let chat = try #require(environments.first)
+        #expect(chat.appBundleIdentifiers == ["org.example.chat"])
+        #expect(chat.locations.map(\.url.lastPathComponent).sorted() == ["Cache", "GPUCache"])
+    }
+
+    @Test func makesOneToolOfEveryCopyOfAnElectronApp() throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let copy = { (place: String, identifier: String) throws -> InstalledApp in
+            try directory.directory("\(place)/Chat.app/Contents/Frameworks/Electron Framework.framework")
+            return InstalledApp(
+                url: directory.url.appending(path: "\(place)/Chat.app", directoryHint: .isDirectory),
+                bundleIdentifier: identifier, name: "Chat", bundleName: "Chat"
+            )
+        }
+        let apps = [
+            try copy("Applications", "org.example.chat"), try copy("home/Applications", "org.example.chat"),
+            try copy("Other", "org.example.chat-beta"),
+        ]
+        try directory.file("home/Library/Application Support/Chat/Local State")
+
+        let definitions = DeveloperCaches.electronDefinitions(for: apps, home: home)
+
+        #expect(definitions.map(\.id) == ["electron.org.example.chat"])
+        #expect(definitions.first?.appBundleIdentifiers == ["org.example.chat", "org.example.chat-beta"])
+    }
+
+    @Test func listsVSCodesOwnFoldersForAnEditorBuiltOnItAndNeverItsBackups() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let app = { (name: String, product: String?) throws -> InstalledApp in
+            try directory.directory("Applications/\(name).app/Contents/Frameworks/Electron Framework.framework")
+            if let product {
+                try directory.file("Applications/\(name).app/Contents/Resources/app/product.json", contents: Data(product.utf8))
+            }
+            return InstalledApp(
+                url: directory.url.appending(path: "Applications/\(name).app", directoryHint: .isDirectory),
+                bundleIdentifier: "org.example.\(name.lowercased())", name: name, bundleName: name
+            )
+        }
+        let forge = try app("Forge Editor", #"{"nameShort": "Forge", "dataFolderName": ".forge"}"#)
+        let chat = try app("Chat", nil)
+        for name in ["Forge", "Chat"] {
+            for path in ["Local State", "GPUCache/data_0", "CachedData/1a2b/x.code", "CachedExtensionVSIXs/x.vsix",
+                         "logs/20261011T120000/main.log", "Backups/1/untitled"] {
+                try directory.file("home/Library/Application Support/\(name)/\(path)", bytes: 4_096)
+            }
+        }
+
+        let environments = await DeveloperCaches.scan(
+            DeveloperCaches.electronDefinitions(for: [forge, chat], home: home), homeDirectory: home
+        )
+
+        let listed = { (identifier: String) in
+            let environment = environments.first { $0.appBundleIdentifiers == [identifier] }
+            return Set(environment?.locations.map(\.url.lastPathComponent) ?? [])
+        }
+        #expect(listed("org.example.forge editor") == ["GPUCache", "CachedData", "CachedExtensionVSIXs", "logs"])
+        #expect(listed("org.example.chat") == ["GPUCache"])
+    }
+
+    @Test func neverReadsAFolderAboveApplicationSupportAsAnElectronAppsData() throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        try directory.file("home/Library/Local State")
+        try directory.file("home/Library/Application Support/Local State")
+        let apps = try [("Up", "..", "{\"nameShort\": \"..\", \"dataFolderName\": \".up\"}"),
+                        ("Here", ".", "{\"nameShort\": \".\", \"dataFolderName\": \".here\"}"),
+                        ("Parent", "..", nil), ("Same", ".", nil)].map { file, name, product in
+            try directory.directory("Applications/\(file).app/Contents/Frameworks/Electron Framework.framework")
+            if let product {
+                try directory.file("Applications/\(file).app/Contents/Resources/app/product.json", contents: Data(product.utf8))
+            }
+            return InstalledApp(
+                url: directory.url.appending(path: "Applications/\(file).app", directoryHint: .isDirectory),
+                bundleIdentifier: "org.example.\(file.lowercased())", name: file,
+                bundleName: product == nil ? name : file
+            )
+        }
+
+        #expect(DeveloperCaches.electronDefinitions(for: apps, home: home).isEmpty)
+    }
+
+    @Test func takesAnElectronAppsNameAsWrittenWhereItsFoldersAreLookedFor() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let apps = try [("Chat [Beta]", "beta"), ("*", "star")].map { name, identifier in
+            try directory.directory("Applications/\(identifier).app/Contents/Frameworks/Electron Framework.framework")
+            try directory.file("home/Library/Application Support/\(name)/Local State")
+            try directory.file("home/Library/Application Support/\(name)/Partitions/team/Cache/index", bytes: 4_096)
+            return InstalledApp(
+                url: directory.url.appending(path: "Applications/\(identifier).app", directoryHint: .isDirectory),
+                bundleIdentifier: "org.example.\(identifier)", name: name, bundleName: name
+            )
+        }
+        try directory.file("home/Library/Application Support/Chat B/Partitions/team/Cache/index", bytes: 4_096)
+        try directory.file("home/Library/Application Support/Other/Cache/index", bytes: 4_096)
+
+        let environments = await DeveloperCaches.scan(
+            DeveloperCaches.electronDefinitions(for: apps, home: home), homeDirectory: home
+        )
+
+        let listed = { (identifier: String) in
+            let environment = environments.first { $0.appBundleIdentifiers == ["org.example.\(identifier)"] }
+            return environment?.locations.map { $0.url.pathComponents.suffix(4).joined(separator: "/") } ?? []
+        }
+        #expect(listed("beta") == ["Chat [Beta]/Partitions/team/Cache"])
+        #expect(listed("star") == ["*/Partitions/team/Cache"])
+    }
+
+    @Test func listsTheCachesOfAnElectronAppsPartitionsAndNeverTheirStorage() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        try directory.directory("Applications/Chat.app/Contents/Frameworks/Electron Framework.framework")
+        let chat = InstalledApp(
+            url: directory.url.appending(path: "Applications/Chat.app", directoryHint: .isDirectory),
+            bundleIdentifier: "org.example.chat", name: "Chat", bundleName: "Chat"
+        )
+        let partition = "home/Library/Application Support/Chat/Partitions/workspace"
+        try directory.file("home/Library/Application Support/Chat/Local State")
+        try directory.file("\(partition)/Cache/Cache_Data/index", bytes: 4_096)
+        try directory.file("\(partition)/Code Cache/js/index", bytes: 4_096)
+        try directory.file("\(partition)/GPUCache/data_0", bytes: 4_096)
+        try directory.file("\(partition)/Local Storage/leveldb/000003.log", bytes: 4_096)
+        try directory.file("\(partition)/IndexedDB/https_app.example_0.indexeddb.leveldb/000003.log", bytes: 4_096)
+
+        let environments = await DeveloperCaches.scan(
+            DeveloperCaches.electronDefinitions(for: [chat], home: home), homeDirectory: home
+        )
+
+        let listed = try #require(environments.first).locations.map {
+            $0.url.pathComponents.suffix(3).joined(separator: "/")
+        }
+        #expect(listed.sorted() == [
+            "Partitions/workspace/Cache", "Partitions/workspace/Code Cache", "Partitions/workspace/GPUCache",
+        ])
+    }
+
+    @Test func listsWhatVSCodeInsidersCachesAndNeverItsBackups() async throws {
+        let directory = try TemporaryDirectory()
+        let insiders = "Library/Application Support/Code - Insiders"
+        for path in [
+            "\(insiders)/CachedData/abc/main.js", "\(insiders)/logs/20261011/main.log",
+            "Library/Caches/com.microsoft.VSCodeInsiders.ShipIt/update.a1/Code.zip", "\(insiders)/Backups/1/untitled.txt",
+        ] {
+            try directory.file(path, bytes: 4_096)
+        }
+
+        let environments = await scanned(directory.url)
+
+        let home = directory.url.path(percentEncoded: false)
+        let listed = try #require(environments.first { $0.id == "vscodeinsiders" }).locations.map {
+            String($0.url.path(percentEncoded: false).dropFirst(home.count))
+        }
+        #expect(Set(listed) == [
+            "\(insiders)/CachedData", "\(insiders)/logs", "Library/Caches/com.microsoft.VSCodeInsiders.ShipIt",
+        ])
+    }
+
+    @Test func listsTheWebGPUCacheUnderItsFormerName() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let support = "Library/Application Support"
+        try directory.directory("Applications/Chat.app/Contents/Frameworks/Electron Framework.framework")
+        let chat = InstalledApp(
+            url: directory.url.appending(path: "Applications/Chat.app", directoryHint: .isDirectory),
+            bundleIdentifier: "org.example.chat", name: "Chat", bundleName: "Chat"
+        )
+        try directory.file("home/\(support)/Chat/Local State")
+        let caches = [
+            "\(support)/Google/Chrome/Default/DawnCache", "\(support)/Code/DawnCache", "\(support)/Chat/DawnCache",
+            "\(support)/Chat/Partitions/workspace/DawnCache",
+        ]
+        for cache in caches {
+            try directory.file("home/\(cache)/data_0", bytes: 4_096)
+        }
+
+        let definitions = DeveloperCaches.definitions + DeveloperCaches.electronDefinitions(for: [chat], home: home)
+        let environments = await DeveloperCaches.scan(definitions, homeDirectory: home)
+
+        let prefix = home.path(percentEncoded: false)
+        let listed = environments.flatMap(\.locations).filter { $0.url.lastPathComponent == "DawnCache" }
+        #expect(Set(listed.map { String($0.url.path(percentEncoded: false).dropFirst(prefix.count)) }) == Set(caches))
+        #expect(listed.allSatisfy { $0.isRecommended })
+    }
+
+    @Test func readsTheAppsInTheFoldersChosenInTheHomeItScans() async throws {
+        let directory = try TemporaryDirectory()
+        let tools = try directory.directory("Tools")
+        try directory.directory("Tools/Chat.app/Contents/Frameworks/Electron Framework.framework")
+        let info = ["CFBundleIdentifier": "org.example.chat", "CFBundleName": "Chat"]
+        try directory.file(
+            "Tools/Chat.app/Contents/Info.plist",
+            contents: try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+        )
+        try directory.file("Library/Application Support/Chat/Local State")
+        try directory.file("Library/Application Support/Chat/GPUCache/data_0", bytes: 4_096)
+        let chosen = directory.url.appending(path: "Library/Application Support/Peel/app-folders.json")
+        try #require(AppFolders(url: chosen).add([tools]) == .saved)
+
+        let environment = SearchEnvironment(homeDirectory: directory.url, rootDirectory: directory.url)
+        let environments = await DeveloperCaches.scan(in: environment)
+
+        let chat = try #require(environments.first { $0.appBundleIdentifiers == ["org.example.chat"] })
+        #expect(chat.locations.map(\.url.lastPathComponent) == ["GPUCache"])
+    }
+
+    @Test func findsHomebrewsCacheWhereItsSettingsMoveIt() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let moved = directory.url.appending(path: "Fast/Homebrew").path(percentEncoded: false)
+        let other = directory.url.appending(path: "Fast/Other").path(percentEncoded: false)
+        try directory.file("home/.homebrew/brew.env", contents: Data("HOMEBREW_CACHE=\(moved)\n".utf8))
+        try directory.file("home/.config/homebrew/brew.env", contents: Data("HOMEBREW_CACHE=\(other)\n".utf8))
+        try directory.directory("Fast/Homebrew/api")
+        for path in ["downloads/0a1b--tool.tar.gz", "Cask/app--1.0.dmg", "go_cache/entry", ".x_cache/a", "Music/a.m4a"] {
+            try directory.file("Fast/Homebrew/\(path)", bytes: 4_096)
+        }
+        try directory.file("Fast/Other/downloads/0a1b--tool.tar.gz", bytes: 4_096)
+        let homebrew = DeveloperCaches.definitions.filter { $0.id == "homebrew" }
+
+        let found = await DeveloperCaches.scan(homebrew, homeDirectory: home, rootDirectory: directory.url)
+
+        let listed = Set(found.flatMap(\.locations).map { $0.url.path(percentEncoded: false) })
+        #expect(listed == Set(["Cask", "downloads", "go_cache"].map { "\(moved)/\($0)" }))
+    }
+
+    @Test func leavesTheVersionOfFirebasesCLIThatRunsToIt() async throws {
+        let directory = try TemporaryDirectory()
+        for path in [
+            "emulators/firestore.jar", "extensions/org.example/source.zip", "crashlytics/buildtools/tools.jar",
+            "universal-maker/maker", "firebase-debug.log", "tools/lib/node_modules/firebase-tools/package.json",
+            "runtime/node",
+        ] {
+            try directory.file(".cache/firebase/\(path)", bytes: 4_096)
+        }
+        let firebase = DeveloperCaches.definitions.filter { $0.id == "firebase" }
+
+        let found = await DeveloperCaches.scan(firebase, homeDirectory: directory.url, exclusions: .none)
+
+        #expect(found.flatMap(\.locations).map(\.url.lastPathComponent).sorted() == [
+            "buildtools", "emulators", "extensions", "firebase-debug.log", "universal-maker",
+        ])
+    }
+
+    @Test func findsTheMovedCacheOfAHomebrewThatReadsItsTaps() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let moved = directory.url.appending(path: "Fast/Homebrew").path(percentEncoded: false)
+        try directory.file("home/.homebrew/brew.env", contents: Data("HOMEBREW_CACHE=\(moved)\n".utf8))
+        let digest = String(repeating: "0a", count: 32)
+        try directory.file("Fast/Homebrew/downloads/\(digest)--tool--1.0.tar.gz", bytes: 4_096)
+        let homebrew = DeveloperCaches.definitions.filter { $0.id == "homebrew" }
+
+        let found = await DeveloperCaches.scan(homebrew, homeDirectory: home, rootDirectory: directory.url)
+
+        #expect(found.flatMap(\.locations).map { $0.url.path(percentEncoded: false) } == ["\(moved)/downloads"])
+    }
+
+    /// A large `DerivedData`, or a Gradle cache on a cold disk, may not be measured in time. Such a folder is not
+    /// read as empty: it is listed first, with no size, and never selected for the user.
+    @Test func aFolderThatDidNotAnswerInTimeIsNotReadAsEmpty() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".npm/_cacache/content/data", bytes: 80_000)
+        try directory.file(".npm/_npx/package/index.js", bytes: 8_000)
+        try directory.file("Library/Developer/Xcode/DerivedData/ModuleCache.noindex/module.pcm", bytes: 20_000)
+
+        let environments = await DeveloperCaches.scan(
+            DeveloperCaches.definitions,
+            homeDirectory: directory.url,
+            exclusions: .none
+        ) { url in
+            url.lastPathComponent == "_npx" ? nil : await FileSize.contents(of: url)
+        }
+
+        let npm = try #require(environments.first)
+        #expect(npm.id == "npm")
+        #expect(npm.locations.map(\.url.lastPathComponent) == ["_npx", "_cacache"])
+        #expect(npm.locations.first?.size == nil)
+        #expect(npm.locations.first?.isRecommended == false, "what Peel could not measure is never selected for the user")
+        #expect(npm.locations.last?.isRecommended == true)
+        #expect(!npm.total.isComplete)
+        #expect(npm.total.known >= 80_000)
+        #expect(environments.last?.total.isComplete == true)
+    }
+
+    @Test func definitionsNeverPointAtWholeUserFolders() {
+        let risky: Set<String> = [
+            "", "Library", "Library/Caches", "Library/Application Support", "Library/Preferences", "Library/Logs",
+            "Documents", "Desktop", "Downloads", "Movies", "Pictures",
+            ".npm", ".cargo", ".gradle", ".m2", ".android", ".nuget", ".gem", ".bundle", ".aws", ".config", ".cache",
+            ".local", ".local/share", "go", ".vscode", ".ollama", ".lmstudio", ".cache/huggingface",
+        ]
+        // The only top-level entries in the table, each owned outright by the one tool that made it.
+        let ownedOutright: Set<String> = [
+            ".ccache", ".electron-gyp", ".gitlibs", ".node-gyp", ".virtualenvs", "nltk_data", "tensorflow_datasets",
+            ".zcompdump*", ".pnpm-store", "playwright_*dev_profile-*/", "playwright-artifacts-*/", "metro-cache/",
+            "metro-file-map-*", "node-compile-cache/", "tfhub_modules/", ".electron", "gensim-data", "stanza_resources",
+            ".u2net", ".create-expo-app", "tomcat.*.*/", "tomcat-docbase.*.*/", "jetty-docbase.*.*/",
+        ]
+        for definition in DeveloperCaches.definitions {
+            for path in definition.folders.map(\.path) {
+                #expect(!risky.contains(path), "\(definition.id) points at \(path)")
+                #expect(!path.hasPrefix("/"), "\(definition.id) points outside the home folder")
+                #expect(!path.contains(".."), "\(definition.id) climbs out of its folder")
+                #expect(
+                    path.split(separator: "/").count >= 2 || ownedOutright.contains(path),
+                    "\(definition.id) points at the whole of \(path)"
+                )
+            }
+        }
+    }
+
+    /// Toolchains, environments, and anything holding an account are installations or secrets, not caches.
+    @Test func neverListsToolchainsOrCredentials() {
+        let forbidden = [
+            ".sdkman", ".jenv", "nix/store", ".nix-profile", ".asdf", ".volta",
+            "conda/envs", "miniconda3/envs", "anaconda3/envs", ".local/pipx",
+            "Library/Android/sdk", "flutter/bin", ".stack/programs",
+            ".aws", ".ssh", ".gnupg", ".netrc", ".docker/config", ".kube/config", ".npmrc",
+            "qiskit-ibm.json", "qiskitrc", "dwave.conf", ".qcs", "xanadu-cloud", "pytket", ".qnx", "qbraidrc",
+            "credentials", "token",
+        ]
+        // Folders that hold an account, the user's own work, or an installation beside something cache-like. Only
+        // what is inside them may ever be listed, never they or a folder around them.
+        let onlyInParts: Set<String> = [
+            ".kube/cache", ".azure", ".config/gcloud", ".pulumi", ".qiskit", ".qbraid", ".expo", ".lmstudio",
+            "Library/Preferences/netlify", "Library/Application Support/com.vercel.cli",
+            "Library/Application Support/nomic.ai/GPT4All", "Library/Application Support/Adobe/Common",
+            // Coursier keeps the JVMs `cs java` installs beside its cache; a legacy `~/.ccache` holds `ccache.conf`;
+            // `~/.clojure` holds the person's own `deps.edn`.
+            "Library/Caches/Coursier", ".ccache", ".clojure", ".cabal",
+            // Java's deployment folder keeps its settings and the certificates a person trusted.
+            "Library/Application Support/Oracle/Java/Deployment",
+            // Corepack keeps the package manager versions a person chose in `lastKnownGood.json` beside its downloads.
+            ".cache/node/corepack",
+            // The standalone Firebase CLI unpacks the version it runs beside its downloads.
+            ".cache/firebase",
+            // Hex and Gleam keep a Hex account's key beside their packages; pub, RubyGems, rebar3, Stack, and opam
+            // what they installed; renv each project's library; the Dart analysis server each plug-in's state.
+            ".hex", "Library/Caches/gleam/hex/hexpm", ".pub-cache", ".local/share/gem", ".cache/rebar3", ".stack", ".opam",
+            "Library/Caches/org.R-project.R/R/renv", ".dartServer",
+            // VS Code and the editors built on it keep unsaved files in `Backups`; Zed its database and threads;
+            // Neovim its swap and undo files, and its plug-ins whatever they like in its cache, such as a sign-in key.
+            ".cache/nvim", "Library/Application Support/Code", "Library/Application Support/Code - Insiders",
+            "Library/Application Support/VSCodium", "Library/Application Support/Cursor",
+            "Library/Application Support/Windsurf", "Library/Application Support/Devin",
+            "Library/Application Support/Zed", ".local/state/nvim",
+            // minikube keeps its clusters' keys and the images a person added; Vagrant its machine index and key;
+            // Jan its chat history; Ollama a copy of its app while it updates.
+            ".minikube", ".minikube/cache/images", ".vagrant.d", "Library/Application Support/Jan/data", "Library/Caches/ollama",
+            // Unity keeps its licenses beside its caches; SonarScanner the client certificates it signs in with.
+            "Library/Unity", ".sonar",
+            // Each keeps conversations, settings, or keys beside its caches.
+            ".claude", ".codex", ".continue", ".cline", ".cline/data",
+            // AI apps keep the person's images, documents, databases, and keys beside the models they download.
+            "invokeai", "ComfyUI-Shared", "MochiDiffusion", ".omlx", "Library/Application Support/anythingllm-desktop/storage",
+            // Beside their models, AI libraries keep custom networks, settings, other tools, and accounts.
+            ".EasyOCR", ".fastai", ".llama", ".tabby", ".paddlex",
+        ]
+        // CocoaPods' spec repositories hold the ones a person added, which can carry unpushed work: only the copies of
+        // the public index are listed, the CDN's `trunk` and the Git clone CocoaPods names `master` or `cocoapods`,
+        // which is the tool's only when its origin is that index. nvm's, pyenv's, rbenv's and rustup's folders hold
+        // every version they installed; only their download caches are caches, and rustup's `tmp`.
+        let onlyTheseParts: [String: Set<String>] = [
+            ".cocoapods/repos": [".cocoapods/repos/trunk", ".cocoapods/repos/master", ".cocoapods/repos/cocoapods"],
+            ".nvm": [".nvm/.cache"], ".pyenv": [".pyenv/cache"], ".rbenv": [".rbenv/cache"],
+            ".rustup": [".rustup/downloads", ".rustup/tmp"],
+        ]
+        for definition in DeveloperCaches.definitions {
+            for path in definition.folders.map(\.path) {
+                for pattern in forbidden {
+                    #expect(!path.lowercased().contains(pattern.lowercased()), "\(definition.id) lists \(path)")
+                }
+                for folder in onlyInParts {
+                    #expect(!PathComponents.isPath(folder, atOrInside: path), "\(definition.id) lists the whole of \(folder)")
+                }
+                for (folder, parts) in onlyTheseParts where PathComponents.isPath(path, atOrInside: folder) {
+                    #expect(parts.contains(path), "\(definition.id) lists \(path)")
+                }
+            }
+        }
+    }
+
+    /// Claude Code and Codex keep a person's conversations and prompts beside their caches and logs, so only those
+    /// are listed. A running session reads its shell snapshot for every command, so that folder stays too.
+    @Test func listsWhatCodingAgentsCacheAndLogButNeverTheirConversations() async throws {
+        let directory = try TemporaryDirectory()
+        for path in [
+            ".claude/cache/changelog.md", ".claude/debug/session.txt", ".claude/statsig/flags",
+            ".claude/shell-snapshots/snapshot-zsh.sh", ".claude/paste-cache/abc", ".claude/history.jsonl",
+            ".claude/projects/app/session.jsonl", ".claude/image-cache/5f2a/1.png", ".claude/logs/2025-06-01.log",
+            ".codex/log/codex-tui.log", ".codex/sessions/rollout.jsonl",
+            ".codex/cache/tui-pets/frame-cache/cat/1a2b/frames/0.png",
+        ] {
+            try directory.file(path, bytes: 4_096)
+        }
+
+        let environments = await scanned(directory.url)
+
+        let listed = environments.filter { ["claudecode", "codex"].contains($0.id) }
+            .flatMap(\.locations).map { $0.url.pathComponents.suffix(2).joined(separator: "/") }
+        #expect(Set(listed) == [
+            ".claude/cache", ".claude/debug", ".claude/statsig", ".claude/image-cache", ".claude/logs", ".codex/log",
+            ".codex/cache",
+        ])
+    }
+
+    @Test func listsWhatNeovimItselfCachesAndNeverWhatItsPlugInsKeepThere() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".cache/nvim/luac/%2fUsers%2fme%2f.config%2fnvim%2finit.luac", bytes: 4_096)
+        try directory.file(".cache/nvim/codeium/config.json", bytes: 64)
+
+        let environments = await scanned(directory.url)
+
+        let listed = environments.filter { $0.id == "neovim" }.flatMap(\.locations)
+            .map { $0.url.pathComponents.suffix(2).joined(separator: "/") }
+        #expect(listed == ["nvim/luac"])
+    }
+
+    @Test func listsWhatOtherCodingAgentsCacheAndLogButNeverTheirSettings() async throws {
+        let directory = try TemporaryDirectory()
+        for path in [
+            ".cache/kilo/bin/rg", ".local/share/kilo/sessions/session.json", ".continue/logs/core.log",
+            ".continue/logs/prompt.log", ".continue/config.yaml", ".continue/sessions/session.json",
+            ".cline/data/logs/cline.log", ".cline/data/settings/providers.json", ".cline/data/sessions/1/messages.json",
+        ] {
+            try directory.file(path, bytes: 4_096)
+        }
+
+        let environments = await scanned(directory.url)
+
+        let home = directory.url.path(percentEncoded: false)
+        let listed = environments.filter { ["kilo", "continue", "cline"].contains($0.id) }
+            .flatMap(\.locations).map { String($0.url.path(percentEncoded: false).dropFirst(home.count)) }
+        #expect(Set(listed) == [".cache/kilo", ".continue/logs", ".cline/data/logs"])
+    }
+
+    @Test func listsTheModelsAIAppsDownloadAndNothingThePersonKeepsBeside() async throws {
+        let directory = try TemporaryDirectory()
+        let gpt4All = "Library/Application Support/nomic.ai/GPT4All"
+        let anythingLLM = "Library/Application Support/anythingllm-desktop/storage"
+        for path in [
+            "\(gpt4All)/Llama-3.2-3B-Instruct-Q4_0.gguf", "\(gpt4All)/gpt4all-1a2b.chat", "\(gpt4All)/localdocs_v3.db",
+            "\(gpt4All)/openai-capi.rmodel", "\(anythingLLM)/models/model.gguf", "\(anythingLLM)/logs/backend.log",
+            "\(anythingLLM)/documents/notes.json", "\(anythingLLM)/anythingllm.db", "\(anythingLLM)/vector-cache/a.json",
+            "invokeai/models/sdxl/model.safetensors", "invokeai/outputs/images/1.png", "invokeai/databases/invokeai.db",
+            "ComfyUI-Shared/models/checkpoints/model.safetensors", "ComfyUI-Shared/output/1.png",
+            "ComfyUI-Shared/input/1.png", "MochiDiffusion/models/sd/unet.bin", "MochiDiffusion/controlnet/canny.bin",
+            "MochiDiffusion/images/1.png", ".omlx/models/qwen/model.safetensors", ".omlx/cache/0/block.safetensors",
+            ".omlx/logs/server.log", ".omlx/settings.json", ".omlx/bin/omlx",
+        ] {
+            try directory.file(path, bytes: 4_096)
+        }
+
+        let environments = await scanned(directory.url)
+
+        let home = directory.url.path(percentEncoded: false)
+        let tools: Set = ["gpt4all", "anythingllm", "invokeai", "comfyui", "mochidiffusion", "omlx"]
+        let listed = environments.filter { tools.contains($0.id) }.flatMap(\.locations)
+        #expect(Set(listed.map { String($0.url.path(percentEncoded: false).dropFirst(home.count)) }) == [
+            "\(gpt4All)/Llama-3.2-3B-Instruct-Q4_0.gguf", "\(anythingLLM)/models", "\(anythingLLM)/logs",
+            "invokeai/models", "ComfyUI-Shared/models", "MochiDiffusion/models", "MochiDiffusion/controlnet",
+            ".omlx/models", ".omlx/cache", ".omlx/logs",
+        ])
+        #expect(Set(listed.filter(\.isRecommended).map(\.url.lastPathComponent)) == ["logs", "cache"])
+    }
+
+    @Test func listsTheModelsAILibrariesDownloadAndNothingElseOfTheirFolders() async throws {
+        let directory = try TemporaryDirectory()
+        for path in [
+            ".cache/clip/ViT-B-32.pt", ".EasyOCR/model/craft_mlt_25k.pth", ".EasyOCR/user_network/custom.py",
+            ".rembg/models/u2net/u2net.onnx", ".u2net/u2net.onnx", ".insightface/models/buffalo_l/det_10g.onnx",
+            ".deepface/weights/vgg_face_weights.h5", ".cache/docling/models/layout/model.safetensors",
+            "gensim-data/glove-wiki-gigaword-50/glove.gz", "stanza_resources/en/default.zip",
+            "Library/Caches/stanza/1.11.1/resources/en/default.zip", ".fastai/data/mnist/1.png",
+            ".fastai/archive/mnist.tgz", ".fastai/models/resnet.pth", ".fastai/config.ini",
+            "Library/Application Support/tts/tts_models--en--ljspeech--vits/model.pth",
+            "Library/Application Support/tts_cache/checkpoint", ".cache/suno/bark_v0/text_2.pt",
+            ".llama/checkpoints/Llama3.2-1B/consolidated.00.pth", ".llama/distributions/local/run.yaml",
+            ".cache/mlc_llm/model_weights/hf/model/params.bin", ".cache/mlc_llm/model_lib/model.dylib",
+            ".tabby/models/TabbyML/StarCoder-1B/model.gguf", ".tabby/ee/db.sqlite",
+            ".cache/instructlab/models/granite.gguf", ".local/share/ramalama/store/model/blob",
+            ".cache/vosk/vosk-model-small-en-us-0.15/am/final.mdl",
+            ".local/share/argos-translate/packages/translate-en_es/model.bin",
+            ".local/cache/argos-translate/downloads/translate-en_es.argosmodel",
+            ".torch/iopath_cache/detectron2/model.pkl", ".paddlex/official_models/PP-OCRv5/inference.pdiparams",
+            ".paddlex/func_ret/result.pkl",
+        ] {
+            try directory.file(path, bytes: 4_096)
+        }
+
+        let environments = await scanned(directory.url)
+
+        let home = directory.url.path(percentEncoded: false)
+        let tools: Set = [
+            "clip", "easyocr", "rembg", "insightface", "deepface", "docling", "gensim", "stanza", "fastai", "coquitts",
+            "bark", "llamamodels", "mlcllm", "tabby", "instructlab", "ramalama", "vosk", "argostranslate", "iopath",
+            "paddlex",
+        ]
+        let listed = environments.filter { tools.contains($0.id) }.flatMap(\.locations)
+        #expect(Set(listed.map { String($0.url.path(percentEncoded: false).dropFirst(home.count)) }) == [
+            ".cache/clip", ".EasyOCR/model", ".rembg/models", ".u2net", ".insightface/models", ".deepface/weights",
+            ".cache/docling/models", "gensim-data", "stanza_resources", "Library/Caches/stanza/1.11.1/resources",
+            ".fastai/data", ".fastai/archive", ".fastai/models", "Library/Application Support/tts",
+            "Library/Application Support/tts_cache", ".cache/suno/bark_v0", ".llama/checkpoints",
+            ".cache/mlc_llm/model_weights", ".cache/mlc_llm/model_lib", ".tabby/models", ".cache/instructlab/models",
+            ".local/share/ramalama", ".cache/vosk", ".local/share/argos-translate/packages",
+            ".local/cache/argos-translate/downloads", ".torch/iopath_cache", ".paddlex/official_models",
+        ])
+        #expect(Set(listed.filter(\.isRecommended).map(\.url.lastPathComponent)) == ["archive", "model_lib", "downloads"])
+        let caches = directory.url.appending(path: "Library/Caches")
+        #expect(DeveloperCaches.FoldersLeftToDeveloper(home: directory.url).inside(caches).contains(["stanza"]))
+    }
+
+    @Test func measuresOnlyTheModelsAndDatasetsItLists() async throws {
+        let directory = try TemporaryDirectory()
+        for path in [
+            ".ollama/models/blobs/sha256-1", ".ollama/logs/server.log", ".omlx/cache/0/block.safetensors",
+            ".cache/huggingface/hub/models--org--name/blobs/1",
+        ] {
+            try directory.file(path, bytes: 4_096)
+        }
+
+        let models = await DeveloperCaches.models(
+            in: SearchEnvironment(homeDirectory: directory.url, rootDirectory: directory.url)
+        )
+
+        let home = directory.url.path(percentEncoded: false)
+        let found = Set(models.map { String($0.url.path(percentEncoded: false).dropFirst(home.count)) })
+        #expect(found == [".ollama/models", ".cache/huggingface/hub"])
+        #expect(models.allSatisfy { $0.kind == .models && $0.size != nil })
+    }
+
+    /// Every folder the table offers names where its tool documents it: a page, or the file inside Xcode that names
+    /// it, for the folders Apple documents nowhere else.
+    @Test func everyFolderNamesItsSource() {
+        let isAPage = { (source: String) in source.hasPrefix("https://") && URL(string: source)?.host() != nil }
+        for definition in DeveloperCaches.definitions {
+            for folder in definition.folders {
+                #expect(isAPage(folder.source) || folder.source.hasPrefix("Xcode 27: "), "\(definition.id)'s \(folder.path) names \(folder.source)")
+                // What moves a folder is named too, except Xcode's setting, which its folder's source names.
+                if case .xcodeSetting? = folder.movedBy { continue }
+                let sources = folder.movedBy?.sources ?? []
+                #expect(folder.movedBy == nil || !sources.isEmpty, "\(definition.id)'s \(folder.path) moves unnamed")
+                #expect(sources.allSatisfy(isAPage), "\(definition.id)'s \(folder.path) moves by \(sources)")
+            }
+        }
+    }
+
+    /// A link into a repository's files names the commit it was read at: on a branch, the lines it points at move
+    /// with every commit.
+    @Test func everySourceInARepositoryNamesItsCommit() throws {
+        let directory = try TemporaryDirectory()
+        try directory.directory("Applications/Chat.app/Contents/Frameworks/Electron Framework.framework")
+        _ = try directory.file("home/Library/Application Support/Chat/Local State")
+        let chat = InstalledApp(
+            url: directory.url.appending(path: "Applications/Chat.app"), bundleIdentifier: "org.example.chat", name: "Chat",
+            bundleName: "Chat"
+        )
+        let electron = DeveloperCaches.electronDefinitions(for: [chat], home: directory.url.appending(path: "home"))
+        try #require(!electron.isEmpty)
+        let sources = (DeveloperCaches.definitions + electron).flatMap { $0.folders.map(\.source) }
+            + DeveloperCaches.definitions.flatMap { $0.folders.compactMap(\.movedBy).flatMap(\.sources) }
+            + ProjectArtifacts.definitions.map(\.source)
+
+        for source in sources {
+            #expect(Self.namesItsCommit(source), "\(source) follows a branch")
+        }
+    }
+
+    /// Where a repository's address carries the version of a file: GitHub's `blob/<ref>`, Gitiles' `+/<ref>` and
+    /// Gitea's `src/commit/<ref>`.
+    private static func namesItsCommit(_ source: String) -> Bool {
+        guard let url = URL(string: source), let host = url.host() else { return true }
+        let parts = url.path(percentEncoded: false).split(separator: "/").map(String.init)
+        let ref: String? = switch host {
+        case "github.com": parts.count > 3 && ["blob", "tree"].contains(parts[2]) ? parts[3] : nil
+        case "projects.blender.org", "codeberg.org": parts.count > 4 && parts[2] == "src" ? (parts[3] == "commit" ? parts[4] : parts[3]) : nil
+        case _ where host.hasSuffix(".googlesource.com"): parts.firstIndex(of: "+").flatMap { parts.dropFirst($0 + 1).first }
+        default: nil
+        }
+        guard let ref else { return true }
+        return ref.count == 40 && ref.allSatisfy(\.isHexDigit)
+    }
+
+    @Test func everyOwnFolderHoldsWhatItsToolLists() {
+        for definition in DeveloperCaches.definitions {
+            for own in definition.ownFolders {
+                let names = PathComponents.of(own)
+                let holds = definition.folders.contains { PathComponents.of($0.path).starts(with: names) }
+                #expect(holds, "\(definition.id)'s \(own) holds none of its folders")
+            }
+        }
+    }
+
+    @Test func everyDefinitionIsDistinctAndNoFolderIsCountedTwice() {
+        let identifiers = DeveloperCaches.definitions.map(\.id)
+        #expect(Set(identifiers).count == identifiers.count)
+        #expect(Set(DeveloperCaches.definitions.map(\.name)).count == identifiers.count)
+
+        var seen: [String: String] = [:]
+        for definition in DeveloperCaches.definitions {
+            #expect(!definition.name.isEmpty)
+            #expect(!definition.folders.isEmpty, "\(definition.id) has no folders")
+            for path in definition.folders.map(\.path) {
+                #expect(seen[path] == nil, "\(path) is listed by both \(seen[path] ?? "") and \(definition.id)")
+                seen[path] = definition.id
+            }
+        }
+    }
+
+    /// A path inside another would count the same bytes twice, and moving the outer folder would take the inner.
+    @Test func noPathIsInsideAnother() {
+        let paths = DeveloperCaches.definitions.flatMap { definition in
+            definition.folders.map { ($0.path, definition.id) }
+        }
+        for (path, owner) in paths {
+            for (other, otherOwner) in paths where other != path {
+                #expect(!path.hasPrefix(other + "/"), "\(owner) lists \(path) inside \(otherOwner)'s \(other)")
+            }
+        }
+    }
+
+    /// `~/Library/Caches/deno` is Deno's `DENO_DIR`. Beside its caches it keeps the REPL history
+    /// (`deno_history.txt`) and what scripts store (`location_data`, with `localStorage` and the database behind
+    /// `Deno.openKv()`), so only the caches are offered, whatever else is there.
+    @Test func offersDenosCachesAndNeverItsHistoryOrWhatScriptsKept() async throws {
+        let directory = try TemporaryDirectory()
+        for cache in ["remote/https/deno.land/x.ts", "npm/registry.npmjs.org/chalk/5.3.0/index.js", "deps/https/x.ts",
+                      "gen/file/x.js", "registries/deno.land.json", "dl/deno-2.0.0.zip", "check_cache_v2", "dep_analysis_cache_v1"] {
+            try directory.file("Library/Caches/deno/\(cache)", bytes: 400_000)
+        }
+        try directory.file("Library/Caches/deno/deno_history.txt", bytes: 4_096)
+        try directory.file("Library/Caches/deno/location_data/abc/kv.sqlite3", bytes: 4_096)
+        try directory.file("Library/Caches/deno/latest.txt", bytes: 64)
+        let deno = DeveloperCaches.definitions.filter { $0.id == "deno" }
+
+        let offered = Set(
+            await DeveloperCaches.scan(deno, homeDirectory: directory.url).flatMap(\.locations)
+                .map(\.url.lastPathComponent)
+        )
+
+        #expect(offered == ["remote", "npm", "deps", "gen", "registries", "dl", "check_cache_v2", "dep_analysis_cache_v1"])
+    }
+
+    /// The whole table at once: every folder is found, at its own size, and nothing beside it is.
+    @Test func findsEveryFolderItKnowsAndNothingElse() async throws {
+        let directory = try TemporaryDirectory()
+        var expected: Set<String> = []
+        for definition in DeveloperCaches.definitions {
+            for (index, folder) in definition.folders.enumerated() {
+                // A wildcard becomes a name it matches: `*` any folder, `[0-9a-f]` one of ccache's shards. A pattern
+                // that ends in `/` matches every folder beside, so what sits beside its match is a file.
+                let concrete = folder.path.replacingOccurrences(of: "*", with: "match").replacingOccurrences(of: "[0-9a-f]", with: "a")
+                let foldersOnly = concrete.hasSuffix("/")
+                let base = switch folder.base {
+                case .home: ""
+                case .userCache: "UserCache/"
+                case .userTemporary: "UserTemporary/"
+                }
+                let entry = base + (foldersOnly ? String(concrete.dropLast()) : concrete)
+                // A folder of versions lists those beside the one its launchers run.
+                if !folder.launchers.isEmpty {
+                    try directory.file("\(entry)/old/content", bytes: 400_000)
+                    try directory.file("\(entry)/current/content", bytes: 400_000)
+                    let current = directory.url.appending(path: "\(entry)/current").path(percentEncoded: false)
+                    for launcher in folder.launchers {
+                        try directory.directory((launcher as NSString).deletingLastPathComponent)
+                        try FileManager.default.createSymbolicLink(
+                            atPath: directory.url.appending(path: launcher).path(percentEncoded: false),
+                            withDestinationPath: current
+                        )
+                    }
+                    expected.insert("\(entry)/old")
+                    try directory.file("\(entry)/../elsewhere-\(definition.id)-\(index)/content", bytes: 400_000)
+                    continue
+                }
+                let row = entry + (0..<folder.rowsDepth).map { "/row \($0)" }.joined() + (folder.rowEnding ?? "")
+                try directory.file("\(row)/content", bytes: 400_000)
+                // An editor's state is listed only for a project that is gone.
+                if folder.rowsAreProjectState {
+                    let gone = directory.url.appending(path: "gone-\(definition.id)").absoluteString
+                    try directory.file("\(row)/workspace.json", contents: Data(#"{"folder": "\#(gone)"}"#.utf8))
+                }
+                expected.insert(row)
+                try directory.file(
+                    "\(entry)/../elsewhere-\(definition.id)-\(index)" + (foldersOnly ? "" : "/content"), bytes: 400_000
+                )
+            }
+        }
+
+        let userCache = directory.url.appending(path: "UserCache", directoryHint: .isDirectory)
+        let environment = SearchEnvironment(
+            homeDirectory: directory.url, rootDirectory: directory.url, userCacheDirectory: userCache,
+            userTemporaryDirectory: directory.url.appending(path: "UserTemporary", directoryHint: .isDirectory)
+        )
+        let environments = await DeveloperCaches.scan(in: environment)
+        let home = directory.url.path(percentEncoded: false)
+        let offered = environments.flatMap(\.locations).map { location in
+            String(location.url.path(percentEncoded: false).dropFirst(home.count))
+        }
+        let found = Set(offered)
+        #expect(found == expected, "missing \(expected.subtracting(found).sorted()), extra \(found.subtracting(expected).sorted())")
+        // Two entries whose patterns reach the same folder, or one inside the other, would count its bytes twice.
+        #expect(offered.count == found.count, "offered twice: \(offered.filter { path in offered.count { $0 == path } > 1 })")
+        let nested = offered.filter { path in offered.contains { $0 != path && path.hasPrefix($0 + "/") } }
+        #expect(nested.isEmpty, "offered inside another: \(nested.sorted())")
+        #expect(environments.count == DeveloperCaches.definitions.count)
+        #expect(environments.flatMap(\.locations).allSatisfy { ($0.size ?? 0) >= 400_000 })
+    }
+
+    /// A folder the guard refuses would be offered and then fail at the last step.
+    @Test func everyFolderInTheTableMayActuallyBeRemoved() throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        let environment = SearchEnvironment(homeDirectory: home, rootDirectory: directory.url.appending(path: "root"))
+        let guardian = RemovalGuard(environment: environment)
+
+        for definition in DeveloperCaches.definitions {
+            for path in definition.folders.map(\.path) {
+                let url = home.appending(path: path.replacingOccurrences(of: "*", with: "match"), directoryHint: .isDirectory)
+                #expect(guardian.allowsRemoval(of: url), "the guard refuses \(definition.id)'s \(path)")
+            }
+        }
+    }
+
+    @Test func modelsAndEnvironmentsAreListedButNeverPreselected() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".ollama/models/blobs/sha256-1", bytes: 400_000)
+        try directory.file("Library/Caches/pypoetry/virtualenvs/app/bin/python", bytes: 400_000)
+
+        let environments = await scanned(directory.url)
+        let locations = environments.flatMap(\.locations)
+        #expect(locations.count == 2)
+        #expect(locations.allSatisfy { !$0.isRecommended })
+        #expect(Set(locations.map(\.kind)) == [.models, .environments])
+    }
+
+    /// Xcode's hardware support installers, Unity's Asset Store packages and Vagrant's boxes are kept for the person
+    /// to install again.
+    @Test func downloadsKeptToInstallAgainAreListedButNeverSelected() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Developer/Packages/HardwareSupport.pkg", bytes: 400_000)
+        try directory.file("Library/Unity/Asset Store-5.x/Publisher/Tools/Package.unitypackage", bytes: 400_000)
+        try directory.file(".vagrant.d/boxes/hashicorp-VAGRANTSLASH-bionic64/0/virtualbox/box-disk001.vmdk", bytes: 400_000)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        #expect(locations.count == 3)
+        #expect(locations.allSatisfy { $0.kind == .keptDownloads && !$0.isRecommended })
+    }
+
+    /// The browsers and binaries test tools install are not fetched again when they are gone: `npx playwright
+    /// install`, Cypress's `postinstall` and `npx puppeteer browsers install` put them back. They are listed as
+    /// installed packages and never selected.
+    @Test func browsersATestToolInstalledAreNeverSelected() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Caches/ms-playwright/chromium-1200/chrome-mac/Chromium.bin", bytes: 400_000)
+        try directory.file("Library/Caches/ms-playwright-go/1.50.0/node", bytes: 400_000)
+        try directory.file("Library/Caches/Cypress/15.0.0/Cypress.bin", bytes: 400_000)
+        try directory.file(".cache/puppeteer/chrome/mac_arm-140.0/chrome.bin", bytes: 400_000)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        #expect(locations.count == 4)
+        #expect(locations.allSatisfy { $0.kind == .environments && !$0.isRecommended })
+    }
+
+    /// Xcode copies a device's symbols when the device connects. Most come back only from a device running that
+    /// system version, none comes back by itself, and crash reports need them: they are listed and never selected.
+    @Test func symbolsFromDevicesAreNeverSelected() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Developer/Xcode/iOS DeviceSupport/iPhone17,1 18.6 (22G86)/Symbols/dyld", bytes: 400_000)
+        try directory.file("Library/Developer/Xcode/watchOS DeviceSupport/Watch7,2 11.6 (22U80)/Symbols/dyld", bytes: 400_000)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        #expect(locations.count == 2)
+        #expect(locations.allSatisfy { $0.kind == .deviceSupport && !$0.isRecommended })
+    }
+
+    @Test func listsEachSystemVersionsSymbolsOnItsOwnAndSelectsNone() async throws {
+        let directory = try TemporaryDirectory()
+        let support = "Library/Developer/Xcode/iOS DeviceSupport"
+        try directory.file("\(support)/iPhone17,1 18.6 (22G86)/Symbols/dyld", bytes: 400_000)
+        try directory.file("\(support)/iPhone17,1 26.0 (23A341)/Symbols/dyld", bytes: 400_000)
+        try directory.file("\(support)/.DS_Store", bytes: 16)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["iPhone17,1 18.6 (22G86)", "iPhone17,1 26.0 (23A341)"])
+        #expect(locations.allSatisfy { $0.kind == .deviceSupport && !$0.isRecommended })
+    }
+
+    @Test func findsTheRegistryCacheHexKeepsSinceItsVersion26() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".hex/cache.bin", bytes: 4_000)
+
+        let locations = await scanned(directory.url).filter { $0.id == "hex" }.flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["cache.bin"])
+    }
+
+    @Test func listsEachJetBrainsProductsLogsOnTheirOwn() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Logs/JetBrains/IntelliJIdea2026.2/idea.log", bytes: 4_000)
+        try directory.file("Library/Logs/JetBrains/Toolbox/toolbox.log", bytes: 4_000)
+
+        let locations = await scanned(directory.url).filter { $0.id == "jetbrains" }.flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["IntelliJIdea2026.2", "Toolbox"])
+    }
+
+    @Test func listsEachArchiveWithTheVersionItHoldsAndSelectsNone() async throws {
+        let directory = try TemporaryDirectory()
+        let archives = "Library/Developer/Xcode/Archives"
+        let facts: [String: Any] = ["ApplicationProperties": ["CFBundleShortVersionString": "2.1", "CFBundleVersion": "45"]]
+        try directory.file(
+            "\(archives)/2026-09-01/App 01.09.2026, 10.00.xcarchive/Info.plist",
+            contents: try PropertyListSerialization.data(fromPropertyList: facts, format: .xml, options: 0)
+        )
+        try directory.file("\(archives)/2026-09-02/App 02.09.2026, 11.00.xcarchive/Products/Applications/App.app/App", bytes: 400_000)
+        try directory.file("\(archives)/2026-09-02/notes.txt", bytes: 16)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        #expect(locations.count == 2)
+        #expect(locations.allSatisfy { $0.kind == .archives && !$0.isRecommended })
+        let first = try #require(locations.first { $0.url.lastPathComponent.hasPrefix("App 01.09") })
+        #expect(first.archive == DeveloperEnvironment.Archive(version: "2.1", build: "45"))
+        #expect(first.archive?.label == "2.1 (45)")
+        #expect(DeveloperEnvironment.Archive(version: nil, build: "45").label == "45")
+        #expect(locations.first { $0.url.lastPathComponent.hasPrefix("App 02.09") }?.archive == nil)
+    }
+
+    @Test func anArchiveWithABlankVersionShowsItsBuild() throws {
+        let directory = try TemporaryDirectory()
+        for (name, properties) in [("Blank", ["CFBundleShortVersionString": "", "CFBundleVersion": "45"]), ("Nothing", ["CFBundleShortVersionString": " ", "CFBundleVersion": ""])] {
+            try directory.file(
+                "\(name).xcarchive/Info.plist",
+                contents: try PropertyListSerialization.data(fromPropertyList: ["ApplicationProperties": properties], format: .xml, options: 0)
+            )
+        }
+
+        #expect(DeveloperCaches.archive(at: directory.url.appending(path: "Blank.xcarchive"))?.label == "45")
+        #expect(DeveloperCaches.archive(at: directory.url.appending(path: "Nothing.xcarchive")) == nil)
+    }
+
+    @Test func listsEveryArchiveHoweverManyThereAre() async throws {
+        let directory = try TemporaryDirectory()
+        for day in 1...130 {
+            try directory.directory("Library/Developer/Xcode/Archives/day \(day)/App \(day).xcarchive")
+        }
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        #expect(locations.count == 130)
+    }
+
+    /// Peel reads cask definitions from Homebrew's `api` folder, which `brew cleanup` leaves alone too. It is
+    /// never offered: without it, the next Homebrew question would go to the network.
+    @Test func leavesHomebrewsCopyOfTheCaskDefinitions() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Caches/Homebrew/api/internal/packages.jws.json", bytes: 400_000)
+        try directory.file("Library/Caches/Homebrew/downloads/bottle.tar.gz", bytes: 400_000)
+
+        let offered = await scanned(directory.url).flatMap(\.locations)
+        #expect(offered.map { $0.url.lastPathComponent } == ["downloads"])
+        #expect(offered.allSatisfy { $0.isRecommended })
+    }
+
+    /// A store that installed packages link into is not a download cache. In setups that conda, uv, and pnpm
+    /// document, clearing it leaves every installed package linking to nothing, Yarn's Plug'n'Play projects load
+    /// every package from its global cache, and every Dart project names its packages' folders in pub's.
+    @Test func neverSelectsAStoreInstalledPackagesLinkInto() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("miniconda3/pkgs/numpy/info.json", bytes: 400_000)
+        try directory.file(".cache/uv/archive-v0/wheel", bytes: 400_000)
+        try directory.file("Library/pnpm/store/v10/files/00/abc", bytes: 400_000)
+        try directory.file("Library/Caches/pnpm/metadata/registry.json", bytes: 400_000)
+        try directory.file(".yarn/berry/cache/lodash-npm-4.17.21-6382451519-eb835a2e51.zip", bytes: 400_000)
+        try directory.file(".pub-cache/hosted/pub.dev/path-1.9.1/lib/path.dart", bytes: 400_000)
+        try directory.file(".pub-cache/git/path-0123456789abcdef0123456789abcdef01234567/lib/path.dart", bytes: 400_000)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+        let suggested = locations.filter(\.isRecommended).map(\.url).map { $0.lastPathComponent }
+        #expect(locations.count == 7)
+        #expect(suggested == ["pnpm"], "a store installed packages link into was suggested")
+    }
+
+    @Test func offersTheClojureCLIsOwnClasspathCacheAndNeverItsSettings() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".clojure/.cpcache/1234567890.cp", bytes: 400_000)
+        try directory.file(".clojure/deps.edn", bytes: 400_000)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        #expect(locations.map { $0.url.pathComponents.suffix(2).joined(separator: "/") } == [".clojure/.cpcache"])
+        #expect(locations.first?.isRecommended == true)
+    }
+
+    @Test func listsWhatTheXcodeBuildServerKeepsForEachWorkspaceAndNeverItsState() async throws {
+        let directory = try TemporaryDirectory()
+        let workspaces = [
+            "Library/Developer/MobileBuildMCP/workspaces/app-1234", "Library/Developer/XcodeBuildMCP/workspaces/app-5678",
+        ]
+        for workspace in workspaces {
+            for part in ["DerivedData/Build/x", "result-bundles/r.xcresult/x", "test-products/p/x", "logs/build.log",
+                         "state/marker", "locks/lock"] {
+                try directory.file("\(workspace)/\(part)", bytes: 4_096)
+            }
+        }
+        try directory.file("Library/Developer/XcodeBuildMCP/DerivedData/Build/x", bytes: 4_096)
+        try directory.file("Library/Developer/XcodeBuildMCP/logs/build.log", bytes: 4_096)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+
+        let listed = Set(locations.map {
+            $0.url.pathComponents.drop { $0 != "Developer" }.dropFirst().joined(separator: "/")
+        })
+        let kept = ["DerivedData", "result-bundles", "test-products", "logs"]
+        let expected = Set(workspaces.flatMap { workspace in
+            kept.map { "\(workspace.dropFirst("Library/Developer/".count))/\($0)" }
+        } + ["XcodeBuildMCP/DerivedData", "XcodeBuildMCP/logs"])
+        #expect(listed == expected)
+        #expect(locations.allSatisfy { $0.isRecommended })
+    }
+
+    @Test func neverSelectsMavensRepositoryAndOffersWhatOtherBuildToolsDownloadAgain() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".m2/repository/org/example/app/1.0/app-1.0.jar", bytes: 400_000)
+        try directory.file(".gradle/caches/modules-2/files-2.1/org.example/lib.jar", bytes: 400_000)
+        try directory.file(".ivy2/cache/org.example/lib/jars/lib.jar", bytes: 400_000)
+        try directory.file(".sbt/boot/scala-2.12.20/lib/scala-library.jar", bytes: 400_000)
+        try directory.file(".nuget/packages/org.example.lib/1.0.0/lib.nupkg", bytes: 400_000)
+
+        let locations = await scanned(directory.url).flatMap(\.locations)
+        let suggested = Set(
+            locations.filter { $0.isRecommended }.map { $0.url.pathComponents.suffix(2).joined(separator: "/") }
+        )
+
+        #expect(locations.count == 5)
+        #expect(suggested == [".gradle/caches", ".ivy2/cache", ".sbt/boot", ".nuget/packages"])
+    }
+
+    /// Of what Xcode keeps for previews, only the simulator devices it makes for them are offered: Xcode itself lists
+    /// that folder among the simulator device sets it removes.
+    @Test func offersOnlyTheSimulatorDevicesXcodeMakesForPreviews() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Developer/Xcode/UserData/Previews/Simulator Devices/device_set.plist", bytes: 400_000)
+        try directory.file("Library/Developer/Xcode/UserData/Previews/other/state", bytes: 400_000)
+        let xcode = DeveloperCaches.definitions.filter { $0.id == "xcode" }
+
+        let offered = await DeveloperCaches.scan(xcode, homeDirectory: directory.url).flatMap(\.locations)
+            .map(\.url.lastPathComponent)
+
+        #expect(offered == ["Simulator Devices"])
+    }
+
+    @Test func offersEverySimulatorDeviceSetXcodeRemovesItself() async throws {
+        let directory = try TemporaryDirectory()
+        let sets = [
+            "Library/Developer/XCTestDevices",
+            "Library/Developer/XCPGDevices",
+            "Library/Developer/Xcode/UserData/IB Support/Simulator Devices",
+            "Library/Developer/Xcode/UserData/Previews/Simulator Devices",
+            "Library/Developer/Xcode/UserData-Tests/Previews/Simulator Devices",
+            "Library/Developer/Xcode/UserData/RT Support/Simulator Devices",
+        ]
+        for set in sets {
+            try directory.file("\(set)/device_set.plist", bytes: 400_000)
+        }
+        try directory.file("Library/Developer/Xcode/UserData/IB Support/other/state", bytes: 400_000)
+        let xcode = DeveloperCaches.definitions.filter { $0.id == "xcode" }
+
+        let locations = await DeveloperCaches.scan(xcode, homeDirectory: directory.url).flatMap(\.locations)
+
+        let home = directory.url.path(percentEncoded: false)
+        #expect(Set(locations.map { String($0.url.path(percentEncoded: false).dropFirst(home.count)) }) == Set(sets))
+        #expect(locations.allSatisfy { $0.isRecommended })
+    }
+
+    @Test func offersTheDocumentationXcodeCaches() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Developer/Xcode/DocumentationCache/v27/index.db", bytes: 400_000)
+        try directory.file("Library/Developer/Xcode/DocumentationIndex/index.db", bytes: 400_000)
+        let xcode = DeveloperCaches.definitions.filter { $0.id == "xcode" }
+
+        let locations = await DeveloperCaches.scan(xcode, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["DocumentationCache", "DocumentationIndex"])
+        #expect(locations.allSatisfy { $0.kind == .cache })
+    }
+
+    @Test func offersTheLogsOfTheSimulatorsAndSpaceLeavesThemToDeveloper() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Logs/CoreSimulator/CoreSimulator.log", bytes: 400_000)
+        let xcode = DeveloperCaches.definitions.filter { $0.id == "xcode" }
+
+        let locations = await DeveloperCaches.scan(xcode, homeDirectory: directory.url).flatMap(\.locations)
+        let logs = directory.url.appending(path: "Library/Logs", directoryHint: .isDirectory)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["CoreSimulator"])
+        #expect(locations.first?.kind == .logs)
+        #expect(DeveloperCaches.FoldersLeftToDeveloper(home: directory.url).inside(logs).contains(["CoreSimulator"]))
+    }
+
+    @Test func listsDerivedDataByWorkspaceAndLeavesTheOnesUsedThisWeek() async throws {
+        let directory = try TemporaryDirectory()
+        let derived = "Library/Developer/Xcode/DerivedData"
+        func workspace(_ folder: String, path: String, lastUsed: Date) throws {
+            let info: [String: Any] = ["WorkspacePath": path, "LastAccessedDate": lastUsed]
+            let data = try PropertyListSerialization.data(fromPropertyList: info, format: .xml, options: 0)
+            try directory.file("\(derived)/\(folder)/info.plist", contents: data)
+            try directory.file("\(derived)/\(folder)/Build/Products/app", bytes: 400_000)
+        }
+        try workspace("Notes-abcdefghijklmnopqrstuvwxyzab", path: "/Code/Notes/Notes.xcodeproj", lastUsed: .now - 30 * 86_400)
+        try workspace("Chat-bcdefghijklmnopqrstuvwxyzabc", path: "/Code/Chat/Chat.xcworkspace", lastUsed: .now - 86_400)
+        try directory.file("\(derived)/ModuleCache.noindex/module.pcm", bytes: 400_000)
+        try directory.file("\(derived)/Notes Backup/Notes.swift", bytes: 400_000)
+        let xcode = DeveloperCaches.definitions.filter { $0.id == "xcode" }
+
+        let locations = await DeveloperCaches.scan(xcode, homeDirectory: directory.url).flatMap(\.locations)
+        let byName = Dictionary(uniqueKeysWithValues: locations.map { ($0.url.lastPathComponent, $0) })
+
+        #expect(Set(byName.keys) == [
+            "Notes-abcdefghijklmnopqrstuvwxyzab", "Chat-bcdefghijklmnopqrstuvwxyzabc", "ModuleCache.noindex", "Notes Backup",
+        ])
+        #expect(byName["Notes-abcdefghijklmnopqrstuvwxyzab"]?.workspace?.name == "Notes")
+        #expect(byName["Notes-abcdefghijklmnopqrstuvwxyzab"]?.isRecommended == true)
+        #expect(byName["Chat-bcdefghijklmnopqrstuvwxyzabc"]?.workspace?.name == "Chat")
+        #expect(byName["Chat-bcdefghijklmnopqrstuvwxyzabc"]?.isRecommended == false)
+        #expect(byName["ModuleCache.noindex"]?.isRecommended == true)
+        #expect(byName["Notes Backup"]?.isRecommended == false)
+    }
+
+    @Test func findsDerivedDataAndArchivesWhereXcodesSettingsMovedThem() async throws {
+        let directory = try TemporaryDirectory()
+        let info = try PropertyListSerialization.data(
+            fromPropertyList: ["WorkspacePath": "/Code/Notes/Notes.xcodeproj", "LastAccessedDate": Date.now - 30 * 86_400],
+            format: .xml, options: 0
+        )
+        try directory.file("Fast/DerivedData/Notes-abcdefghijklmnopqrstuvwxyzab/info.plist", contents: info)
+        try directory.file("Fast/DerivedData/Notes-abcdefghijklmnopqrstuvwxyzab/Build/app", bytes: 400_000)
+        try directory.file("Fast/DerivedData/Photos/beach.jpg", bytes: 400_000)
+        try directory.directory("Fast/Archives/2026-09-17/Notes 17.09.2026, 10.00.xcarchive")
+        try directory.file("Library/Developer/Xcode/DerivedData/ModuleCache.noindex/module.pcm", bytes: 400_000)
+        let moved = [
+            "IDECustomDerivedDataLocation": directory.url.appending(path: "Fast/DerivedData").path(percentEncoded: false),
+            "IDECustomDistributionArchivesLocation": directory.url.appending(path: "Fast/Archives").path(percentEncoded: false),
+        ]
+        let xcode = DeveloperCaches.definitions.filter { $0.id == "xcode" }
+
+        let locations = await DeveloperCaches.scan(xcode, homeDirectory: directory.url, preference: { moved[$0] })
+            .flatMap(\.locations)
+        let byName = Dictionary(uniqueKeysWithValues: locations.map { ($0.url.lastPathComponent, $0) })
+
+        #expect(Set(byName.keys) == [
+            "Notes-abcdefghijklmnopqrstuvwxyzab", "Photos", "Notes 17.09.2026, 10.00.xcarchive", "ModuleCache.noindex",
+        ])
+        #expect(byName["Notes-abcdefghijklmnopqrstuvwxyzab"]?.isRecommended == true)
+        #expect(byName["Photos"]?.isRecommended == false)
+        #expect(byName["Notes 17.09.2026, 10.00.xcarchive"]?.kind == .archives)
+    }
+
+    /// Developer reads each tool's own configuration file, never runs the tool, and finds the cache it moved.
+    @Test func findsTheCachesEachToolsOwnConfigurationMovedElsewhere() async throws {
+        let directory = try TemporaryDirectory()
+        let fast = directory.url.appending(path: "Fast", directoryHint: .isDirectory).path(percentEncoded: false)
+        try directory.file("home/.npmrc", contents: Data("registry=https://registry.npmjs.org/\ncache = \(fast)npm ; moved\n".utf8))
+        try directory.file("Fast/npm/_cacache/index-v5/00/entry")
+        try directory.file("home/.yarnrc", contents: Data("# yarn lockfile v1\ncache-folder \"\(fast)yarn\"\n".utf8))
+        try directory.file("Fast/yarn/v6/npm-left-pad-1.3.0/package.json")
+        try directory.file("home/.yarnrc.yml", contents: Data("globalFolder: \"\(fast)berry\"\n".utf8))
+        try directory.file("Fast/berry/cache/left-pad.zip")
+        try directory.file("home/Library/Preferences/pnpm/config.yaml", contents: Data("storeDir: \(fast)pnpm # moved\n".utf8))
+        try directory.file("Fast/pnpm/v11/index.db")
+        try directory.file("Fast/pnpm/Notes/todo.txt")
+        let goEnvironment = "GOMODCACHE=\(fast)gomod\nGOCACHE=\(fast)gobuild\n"
+        try directory.file("home/Library/Application Support/go/env", contents: Data(goEnvironment.utf8))
+        try directory.file("Fast/gomod/cache/download/example.com/@v/list")
+        let readme = "This directory holds cached build artifacts from the Go build system.\n"
+        try directory.file("Fast/gobuild/README", contents: Data(readme.utf8))
+        try directory.file("Fast/gobuild/00/0a1b-d")
+        let tools = DeveloperCaches.definitions.filter { ["npm", "yarn", "pnpm", "go"].contains($0.id) }
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+
+        let found = await DeveloperCaches.scan(tools, homeDirectory: home).flatMap(\.locations)
+
+        let temporary = directory.url.path(percentEncoded: false)
+        #expect(Set(found.map { $0.url.path(percentEncoded: false).replacingOccurrences(of: temporary, with: "") }) == [
+            "Fast/npm/_cacache", "Fast/yarn/v6", "Fast/berry/cache", "Fast/pnpm/v11", "Fast/gomod/cache/download",
+            "Fast/gobuild",
+        ])
+    }
+
+    @Test func findsJansModelsWhereItsSettingMovedItsDataFolder() async throws {
+        let directory = try TemporaryDirectory()
+        let moved = directory.url.appending(path: "Fast/jan").path(percentEncoded: false)
+        try directory.file("home/Library/Application Support/Jan/settings.json", contents: Data(#"{"data_folder":"\#(moved)"}"#.utf8))
+        try directory.file("Fast/jan/llamacpp/models/tiny/model.gguf", bytes: 400_000)
+        try directory.file("Fast/jan/mlx/models/small/weights.safetensors", bytes: 400_000)
+        try directory.file("Fast/jan/logs/app.log", bytes: 400_000)
+        let jan = DeveloperCaches.definitions.filter { $0.id == "jan" }
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+
+        let found = await DeveloperCaches.scan(jan, homeDirectory: home).flatMap(\.locations)
+
+        let temporary = directory.url.path(percentEncoded: false)
+        #expect(Set(found.map { $0.url.path(percentEncoded: false).replacingOccurrences(of: temporary, with: "") }) == [
+            "Fast/jan/llamacpp/models", "Fast/jan/mlx/models",
+        ])
+    }
+
+    /// A path that needs the tool's own environment, or a folder without the tool's mark, names no place.
+    @Test func aConfigurationThatNamesNoPlaceOfItsOwnMovesNothing() async throws {
+        let directory = try TemporaryDirectory()
+        let fast = directory.url.appending(path: "Fast", directoryHint: .isDirectory).path(percentEncoded: false)
+        try directory.file("home/.npmrc", contents: Data("cache = ${NPM_FAST}/npm\n[section]\ncache = \(fast)npm\n".utf8))
+        try directory.file("Fast/npm/_cacache/index-v5/00/entry")
+        try directory.file("home/npm/_cacache/index-v5/00/entry")
+        try directory.file("home/berry/cache/left-pad.zip")
+        try directory.file("home/.yarnrc.yml", contents: Data("globalFolder: ${YARN_FAST}/berry\n".utf8))
+        try directory.file("Fast/berry/cache/left-pad.zip")
+        try directory.file("home/.yarnrc", contents: Data("cache-folder \"\(fast)yarn\"\n".utf8))
+        try directory.file("Elsewhere/v6/npm-left-pad-1.3.0/package.json")
+        try directory.directory("Fast/yarn")
+        try FileManager.default.createSymbolicLink(
+            at: directory.url.appending(path: "Fast/yarn/v6"), withDestinationURL: directory.url.appending(path: "Elsewhere/v6")
+        )
+        let goEnvironment = "GOMODCACHE=gomod\nGOCACHE=\(fast)gobuild\n"
+        try directory.file("home/Library/Application Support/go/env", contents: Data(goEnvironment.utf8))
+        try directory.file("Fast/gobuild/00/0a1b-d")
+        let tools = DeveloperCaches.definitions.filter { ["npm", "yarn", "go"].contains($0.id) }
+
+        let found = await DeveloperCaches.scan(tools, homeDirectory: directory.url.appending(path: "home"))
+
+        #expect(found.isEmpty)
+    }
+
+    @Test func aSettingThatIsNotAnAbsolutePathMovesNothing() async throws {
+        let directory = try TemporaryDirectory()
+        let xcode = DeveloperCaches.definitions.filter { $0.id == "xcode" }
+
+        let environments = await DeveloperCaches.scan(xcode, homeDirectory: directory.url, preference: { _ in "." })
+
+        #expect(environments.isEmpty)
+    }
+
+    @Test func readsAnArchivesInfoOnlyWhenItIsAPlainFileOfASensibleSize() throws {
+        let directory = try TemporaryDirectory()
+        let facts: [String: Any] = [
+            "ApplicationProperties": ["CFBundleShortVersionString": "2.1", "CFBundleVersion": "45"],
+            "Padding": String(repeating: "x", count: BoundedRead.maximumBytes),
+        ]
+        let data = try PropertyListSerialization.data(fromPropertyList: facts, format: .binary, options: 0)
+        try directory.file("Huge.xcarchive/Info.plist", contents: data)
+        let pipe = try directory.directory("Pipe.xcarchive").appending(path: "Info.plist")
+        #expect(mkfifo(pipe.path(percentEncoded: false), 0o600) == 0)
+
+        #expect(DeveloperCaches.archive(at: directory.url.appending(path: "Huge.xcarchive")) == nil)
+        #expect(DeveloperCaches.archive(at: directory.url.appending(path: "Pipe.xcarchive")) == nil)
+    }
+
+    @Test func aCacheWithAWalletOrAPasswordDatabaseInsideIsNeverRecommended() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Caches/Homebrew/glide_home/coin/wallet.dat", bytes: 400_000)
+        try directory.file("Library/Caches/Homebrew/api-source/vault/passwords.kdbx", bytes: 400_000)
+        try directory.file("Library/Caches/Homebrew/go_cache/data", bytes: 400_000)
+        try directory.file("Library/Caches/Homebrew/gh-actions-artifact/clone/.git/HEAD", bytes: 400_000)
+        let homebrew = DeveloperCaches.definitions.filter { $0.id == "homebrew" }
+
+        let environment = try #require(await DeveloperCaches.scan(homebrew, homeDirectory: directory.url).first)
+        let location = { (name: String) in environment.locations.first { $0.url.lastPathComponent == name } }
+
+        for name in ["glide_home", "api-source"] {
+            #expect(location(name)?.isRecommended == false)
+        }
+        #expect(location("glide_home")?.heldBack == .holdsAWallet)
+        #expect(location("api-source")?.heldBack == .holdsAPasswordDatabase)
+        #expect(location("go_cache")?.isRecommended == true)
+        #expect(location("gh-actions-artifact")?.isRecommended == true)
+        let asked = Set(environment.selectableRows.notRecommendedAdded(by: []).map(\.lastPathComponent))
+        #expect(asked.isSuperset(of: ["glide_home", "api-source"]))
+    }
+
+    @Test func offersEveryCacheHomebrewNamesAndNeverItsCopyOfTheDefinitions() async throws {
+        let directory = try TemporaryDirectory()
+        for folder in ["glide_home", "api-source", "gh-actions-artifact", "go_cache", "api"] {
+            try directory.file("Library/Caches/Homebrew/\(folder)/data", bytes: 400_000)
+        }
+        let homebrew = DeveloperCaches.definitions.filter { $0.id == "homebrew" }
+
+        let offered = await DeveloperCaches.scan(homebrew, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(offered.map(\.url.lastPathComponent)) == ["glide_home", "api-source", "gh-actions-artifact", "go_cache"])
+    }
+
+    @Test func offersThePrebuiltBinariesNativeModulesDownloadedIntoNpmsFolder() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".npm/_prebuilds/b1f2-better-sqlite3-v12.0.0-node-v137-darwin-arm64.tar.gz", bytes: 400_000)
+        let npm = DeveloperCaches.definitions.filter { $0.id == "npm" }
+
+        let locations = await DeveloperCaches.scan(npm, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["_prebuilds"])
+        #expect(locations.first?.isRecommended == true)
+    }
+
+    @Test func offersThePackagesPyenvAndRbenvKeptAndNeverTheirInstalledVersions() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".pyenv/cache/Python-3.13.1.tar.xz", bytes: 400_000)
+        try directory.file(".pyenv/versions/3.13.1/bin/python3", bytes: 400_000)
+        try directory.file(".rbenv/cache/ruby-3.4.1.tar.gz", bytes: 400_000)
+        try directory.file(".rbenv/versions/3.4.1/bin/ruby", bytes: 400_000)
+        let tools = DeveloperCaches.definitions.filter { ["pyenv", "rbenv"].contains($0.id) }
+
+        let locations = await DeveloperCaches.scan(tools, homeDirectory: directory.url).flatMap(\.locations)
+
+        let home = directory.url.path(percentEncoded: false)
+        #expect(Set(locations.map { String($0.url.path(percentEncoded: false).dropFirst(home.count)) }) == [
+            ".pyenv/cache", ".rbenv/cache",
+        ])
+        #expect(locations.allSatisfy { $0.kind == .downloads })
+    }
+
+    @Test func offersOnlyTheBinaryCachesOfPyInstaller() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Application Support/pyinstaller/bincache00_py313_arm64/libpython.dylib", bytes: 400_000)
+        try directory.file("Library/Application Support/pyinstaller/other/state", bytes: 400_000)
+        let pyinstaller = DeveloperCaches.definitions.filter { $0.id == "pyinstaller" }
+
+        let locations = await DeveloperCaches.scan(pyinstaller, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["bincache00_py313_arm64"])
+    }
+
+    @Test func offersTheAndroidToolsCachesAndNothingElseOfTheirFolder() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".android/cache/sdkbin-1_4b3a.xml", bytes: 400_000)
+        try directory.file(".android/build-cache/3.6.1/output/classes.dex", bytes: 400_000)
+        try directory.file(".android/avd/Pixel.avd/userdata.img", bytes: 400_000)
+        try directory.file(".android/debug.keystore", bytes: 4_096)
+        let studio = DeveloperCaches.definitions.filter { $0.id == "androidstudio" }
+
+        let locations = await DeveloperCaches.scan(studio, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["cache", "build-cache"])
+    }
+
+    @Test func offersTheUpdatesGooglesUpdaterKeptAndNothingElseOfItsFolder() async throws {
+        let directory = try TemporaryDirectory()
+        let updater = "Library/Application Support/Google/GoogleUpdater"
+        try directory.file("\(updater)/crx_cache/1a7aef6023dd1d6f6d25ae2ff53a9d2956498bb8", bytes: 400_000)
+        try directory.file("\(updater)/crx_cache/metadata.json", bytes: 130)
+        try directory.file("\(updater)/156.0.8067.0/GoogleUpdater.app/Contents/MacOS/GoogleUpdater", bytes: 400_000)
+        try directory.file("\(updater)/prefs.json", bytes: 4_096)
+        try directory.file("\(updater)/updater.log", bytes: 4_096)
+        let googleUpdater = DeveloperCaches.definitions.filter { $0.id == "googleupdater" }
+
+        let locations = await DeveloperCaches.scan(googleUpdater, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["crx_cache"])
+        #expect(googleUpdater.first?.appBundleIdentifiers == ["com.google.GoogleUpdater"])
+    }
+
+    /// A spec repository is named by whoever adds it (`pod repo add <name> <url>`), so only the clone of CocoaPods'
+    /// own public specs, as its Git configuration says, is offered under the names CocoaPods gives it.
+    @Test func offersTheCloneOfCocoaPodsPublicSpecsAndNeverARepositoryThePersonAdded() async throws {
+        let directory = try TemporaryDirectory()
+        func clone(_ name: String, from origin: String) throws {
+            try directory.file(".cocoapods/repos/\(name)/Specs/0/0/0/Example/1.0/Example.podspec.json", bytes: 400_000)
+            try directory.file(
+                ".cocoapods/repos/\(name)/.git/config",
+                contents: Data("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = \(origin)\n".utf8)
+            )
+        }
+        try clone("master", from: "https://github.com/CocoaPods/Specs.git")
+        try clone("cocoapods", from: "https://github.com/example/private-specs.git")
+        try clone("example", from: "https://github.com/example/specs.git")
+        let cocoaPods = DeveloperCaches.definitions.filter { $0.id == "cocoapods" }
+
+        let locations = await DeveloperCaches.scan(cocoaPods, homeDirectory: directory.url).flatMap(\.locations)
+
+        let byName = Dictionary(uniqueKeysWithValues: locations.map { ($0.url.lastPathComponent, $0) })
+        #expect(Set(byName.keys) == ["master", "cocoapods"])
+        #expect(byName["master"]?.isRecommended == true)
+        #expect(byName["cocoapods"]?.isRecommended == false)
+        #expect(byName["master"]?.heldBack == nil)
+        #expect(byName["cocoapods"]?.heldBack == .holdsRepository, "a clone of another repository may be the person's")
+    }
+
+    @Test func offersTheImagesTartKeepsAndNeverItsMachines() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".tart/cache/OCIs/ghcr.io/cirruslabs/macos/disk.img", bytes: 400_000)
+        try directory.file(".tart/vms/builder/disk.img", bytes: 400_000)
+        let tart = DeveloperCaches.definitions.filter { $0.id == "tart" }
+
+        let locations = await DeveloperCaches.scan(tart, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["cache"])
+        #expect(locations.first?.kind == .downloads)
+    }
+
+    @Test func offersZshsCompletionDumpsAndOhMyZshsCompletionsAndNotTheChoicesKeptBeside() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".zcompdump", bytes: 4_096)
+        try directory.file(".zcompdump-Mac-5.9", bytes: 4_096)
+        try directory.file(".oh-my-zsh/cache/completions/_gh", bytes: 4_096)
+        try directory.file(".oh-my-zsh/cache/dotenv-allowed.list", bytes: 64)
+        let shells = DeveloperCaches.definitions.filter { ["zsh", "ohmyzsh"].contains($0.id) }
+
+        let locations = await DeveloperCaches.scan(shells, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == [".zcompdump", ".zcompdump-Mac-5.9", "completions"])
+    }
+
+    @Test func offersGradlesMarkersAndWorkerFolderAndNeverItsSettings() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".gradle/notifications/9.1.0/release-features.rendered", bytes: 64)
+        try directory.file(".gradle/workers/classpath.jar", bytes: 400_000)
+        try directory.file(".gradle/gradle.properties", bytes: 64)
+        try directory.file(".gradle/init.d/mirror.gradle", bytes: 64)
+        let gradle = DeveloperCaches.definitions.filter { $0.id == "gradle" }
+
+        let locations = await DeveloperCaches.scan(gradle, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["notifications", "workers"])
+    }
+
+    @Test func offersGradlesNativeLibrariesAndTemporaryFiles() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".gradle/native/3b8e0c1d/osx-aarch64/libnative-platform.dylib", bytes: 400_000)
+        try directory.file(".gradle/.tmp/gradle_download7.bin", bytes: 400_000)
+        try directory.file(".gradle/gradle.properties", bytes: 64)
+        let gradle = DeveloperCaches.definitions.filter { $0.id == "gradle" }
+
+        let locations = await DeveloperCaches.scan(gradle, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["native", ".tmp"])
+        #expect(locations.allSatisfy { $0.kind == .cache && $0.isRecommended })
+    }
+
+    @Test func offersTheArtifactsSbtsLauncherCopiedForOfflineUse() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".sbt/preloaded/org/scala-sbt/sbt/1.11.7/sbt-1.11.7.jar", bytes: 400_000)
+        try directory.file(".sbt/1.0/global.sbt", bytes: 64)
+        let sbt = DeveloperCaches.definitions.filter { $0.id == "sbt" }
+
+        let locations = await DeveloperCaches.scan(sbt, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["preloaded"])
+        #expect(locations.allSatisfy { $0.kind == .downloads && $0.isRecommended })
+    }
+
+    @Test func offersCabalsDownloadsInItsOldFolderAndNeverWhatItInstalled() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".cabal/packages/hackage.haskell.org/text/2.1.2/text-2.1.2.tar.gz", bytes: 400_000)
+        try directory.file(".cabal/script-builds/9f2c/cache/plan.json", bytes: 400_000)
+        try directory.file(".cabal/config", bytes: 64)
+        try directory.file(".cabal/store/ghc-9.10.1/text-2.1.2-a1b2/lib/Data/Text.hi", bytes: 400_000)
+        try directory.file(".cabal/bin/pandoc", bytes: 400_000)
+        let cabal = DeveloperCaches.definitions.filter { $0.id == "cabal" }
+
+        let locations = await DeveloperCaches.scan(cabal, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["packages", "script-builds"])
+        #expect(locations.allSatisfy(\.isRecommended) == true)
+    }
+
+    @Test func offersTheElectronDownloadsAnOlderToolKeptInTheHomeFolder() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".electron/electron-v3.1.13-darwin-x64.zip", bytes: 400_000)
+        try directory.file(".electron/SHASUMS256.txt-3.1.13", bytes: 4_096)
+        let electron = DeveloperCaches.definitions.filter { $0.id == "electron" }
+
+        let locations = await DeveloperCaches.scan(electron, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == [".electron"])
+        #expect(locations.allSatisfy { $0.kind == .downloads && $0.isRecommended })
+    }
+
+    @Test func offersWhatRustupDownloadedOrLeftInItsTemporaryFolderAndNeverItsToolchains() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".rustup/downloads/4b1c.partial", bytes: 400_000)
+        try directory.file(".rustup/tmp/7d2e_dir/lib/librustc_driver.dylib", bytes: 400_000)
+        try directory.file(".rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc", bytes: 400_000)
+        let rustup = DeveloperCaches.definitions.filter { $0.id == "rustup" }
+
+        let locations = await DeveloperCaches.scan(rustup, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["downloads", "tmp"])
+    }
+
+    @Test func offersCpansBuildFolderAndNeverItsPreferences() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".cpan/build/Moose-2.2207-0/Makefile", bytes: 400_000)
+        try directory.file(".cpan/prefs/Moose.yml", bytes: 64)
+        try directory.file(".cpan/CPAN/MyConfig.pm", bytes: 64)
+        let cpan = DeveloperCaches.definitions.filter { $0.id == "cpan" }
+
+        let locations = await DeveloperCaches.scan(cpan, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["build"])
+    }
+
+    @Test func listsStacksSnapshotsWithoutEverSelectingThem() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".stack/snapshots/aarch64-osx/2f1c/9.8.4/lib/package.conf", bytes: 400_000)
+        let stack = DeveloperCaches.definitions.filter { $0.id == "stack" }
+
+        let locations = await DeveloperCaches.scan(stack, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["snapshots"])
+        #expect(locations.first?.isRecommended == false)
+    }
+
+    @Test func offersTheRegistryHexCachesAndNeverItsAccountKey() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".hex/cache.ets", bytes: 400_000)
+        try directory.file(".hex/hex.config", bytes: 64)
+        let hex = DeveloperCaches.definitions.filter { $0.folders.contains { $0.path.hasPrefix(".hex/") } }
+
+        let locations = await DeveloperCaches.scan(hex, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["cache.ets"])
+    }
+
+    @Test func offersOpencodesCacheAndNeverItsData() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".cache/opencode/models.json", bytes: 400_000)
+        try directory.file(".local/share/opencode/storage/session.json", bytes: 400_000)
+        let opencode = DeveloperCaches.definitions.filter { $0.id == "opencode" }
+
+        let locations = await DeveloperCaches.scan(opencode, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["opencode"])
+        #expect(locations.first?.kind == .cache)
+    }
+
+    @Test func offersTheConfigurationAndProfileCachesOfEveryEditorBuiltOnVSCode() async throws {
+        let directory = try TemporaryDirectory()
+        let apps = ["Code", "VSCodium", "Cursor", "Windsurf", "Devin"]
+        for app in apps {
+            try directory.file("Library/Application Support/\(app)/CachedConfigurations/folder/key/configuration.json", bytes: 4_096)
+            try directory.file("Library/Application Support/\(app)/CachedProfilesData/__default__profile__/extensions.user.cache", bytes: 4_096)
+            try directory.file("Library/Application Support/\(app)/Backups/1/untitled", bytes: 4_096)
+        }
+        let editors = DeveloperCaches.definitions.filter { ["vscode", "vscodium", "cursor", "windsurf"].contains($0.id) }
+
+        let locations = await DeveloperCaches.scan(editors, homeDirectory: directory.url).flatMap(\.locations)
+
+        let support = directory.url.appending(path: "Library/Application Support").path(percentEncoded: false)
+        #expect(Set(locations.map { String($0.url.path(percentEncoded: false).dropFirst(support.count + 1)) }) == Set(
+            apps.flatMap { ["\($0)/CachedConfigurations", "\($0)/CachedProfilesData"] }
+        ))
+    }
+
+    @Test func offersWhatWindsurfAndDevinCacheAsVSCodeDoesAndNeverTheirBackups() async throws {
+        let directory = try TemporaryDirectory()
+        let cached = ["Code Cache/js/index", "GPUCache/data_0", "DawnWebGPUCache/data_0", "CachedExtensionVSIXs/x.vsix",
+                      "logs/20261011T120000/main.log"]
+        for app in ["Windsurf", "Devin"] {
+            for path in cached + ["Backups/1/untitled"] {
+                try directory.file("Library/Application Support/\(app)/\(path)", bytes: 4_096)
+            }
+        }
+        let windsurf = DeveloperCaches.definitions.filter { $0.id == "windsurf" }
+
+        let locations = await DeveloperCaches.scan(windsurf, homeDirectory: directory.url).flatMap(\.locations)
+
+        let support = directory.url.appending(path: "Library/Application Support").path(percentEncoded: false)
+        let folders = cached.map { String($0.split(separator: "/").first!) }
+        #expect(Set(locations.map { String($0.url.path(percentEncoded: false).dropFirst(support.count + 1)) }) == Set(
+            ["Windsurf", "Devin"].flatMap { app in folders.map { "\(app)/\($0)" } }
+        ))
+    }
+
+    @Test func offersTheNpmCacheOfZedsNodeAndNeverTheNodeItself() async throws {
+        let directory = try TemporaryDirectory()
+        let node = "Library/Application Support/Zed/node/node-v24.11.0-darwin-arm64"
+        try directory.file("\(node)/cache/_cacache/index-v5/00/data", bytes: 400_000)
+        try directory.file("\(node)/bin/node", bytes: 400_000)
+        let zed = DeveloperCaches.definitions.filter { $0.id == "zed" }
+
+        let locations = await DeveloperCaches.scan(zed, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map { $0.url.path(percentEncoded: false).hasSuffix("\(node)/cache") } == [true])
+    }
+
+    @Test func offersClangsModuleCacheFromTheUsersCacheFolder() async throws {
+        let directory = try TemporaryDirectory()
+        let userCache = try directory.directory("var/C")
+        try directory.file("var/C/clang/ModuleCache/1WXVCUBR7B7FT/Foundation-3DFYNEBRQSXST.pcm", bytes: 400_000)
+        try directory.file("home/clang/ModuleCache/mine.txt", bytes: 400_000)
+        let clang = DeveloperCaches.definitions.filter { $0.id == "clang" }
+
+        let locations = await DeveloperCaches.scan(
+            clang, homeDirectory: directory.url.appending(path: "home"), userCacheDirectory: userCache
+        ).flatMap(\.locations)
+
+        #expect(locations.map { PathPattern.comparablePath(of: $0.url) } == [
+            PathPattern.comparablePath(of: userCache.appending(path: "clang/ModuleCache")),
+        ])
+        #expect(locations.first?.kind == .cache)
+    }
+
+    /// The newest write inside a folder is shown beside it and decides nothing: an old cache and a fresh one are
+    /// selected alike.
+    @Test func tellsTheNewestWriteInsideAndSelectsAlikeWhateverItsAge() async throws {
+        let directory = try TemporaryDirectory()
+        let old = try directory.file("Library/Caches/org.swift.swiftpm/repositories/a/pack", bytes: 400_000)
+        let fresh = try directory.file("Library/Caches/org.swift.swiftpm/repositories/b/pack", bytes: 400_000)
+        let written = Date(timeIntervalSince1970: 1_700_000_000)
+        let repositories = directory.url.appending(path: "Library/Caches/org.swift.swiftpm/repositories")
+        for item in [old, fresh, repositories, repositories.appending(path: "a"), repositories.appending(path: "b")] {
+            let path = item.path(percentEncoded: false)
+            try FileManager.default.setAttributes([.modificationDate: written], ofItemAtPath: path)
+        }
+        let swiftpm = DeveloperCaches.definitions.filter { $0.id == "swiftpm" }
+
+        let before = await DeveloperCaches.scan(swiftpm, homeDirectory: directory.url).flatMap(\.locations)
+        let freshPath = fresh.path(percentEncoded: false)
+        let rewritten = Date(timeIntervalSince1970: Date.now.timeIntervalSince1970.rounded(.down))
+        try FileManager.default.setAttributes([.modificationDate: rewritten], ofItemAtPath: freshPath)
+        let after = await DeveloperCaches.scan(swiftpm, homeDirectory: directory.url).flatMap(\.locations)
+
+        let first = try #require(before.first)
+        let second = try #require(after.first)
+        #expect(first.lastWritten == written)
+        #expect(second.lastWritten == rewritten)
+        #expect(first.isRecommended == second.isRecommended)
+    }
+
+    /// GitHub documents the CLI's cache folder and its logs as safe to delete, and its sessions, secrets, and
+    /// history beside the logs as the person's.
+    @Test func offersCopilotCLIsCacheAndLogsAndNothingElseOfIt() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Caches/copilot/pkg/1.0.0/index.js", bytes: 400_000)
+        try directory.file(".copilot/logs/session.log", bytes: 400_000)
+        try directory.file(".copilot/session-state/history.json", bytes: 400_000)
+        try directory.file(".copilot/mcp-secrets/index.json", bytes: 400_000)
+        let copilot = DeveloperCaches.definitions.filter { $0.id == "copilotcli" }
+
+        let locations = await DeveloperCaches.scan(copilot, homeDirectory: directory.url).flatMap(\.locations)
+
+        let home = directory.url.path(percentEncoded: false)
+        #expect(Set(locations.map { String($0.url.path(percentEncoded: false).dropFirst(home.count)) }) == [
+            "Library/Caches/copilot", ".copilot/logs",
+        ])
+        #expect(locations.allSatisfy { $0.isRecommended })
+    }
+
+    /// The editor downloads its export templates again, so they are listed and never selected, and its settings
+    /// beside them are never listed.
+    @Test func listsGodotsExportTemplatesWithoutSelectingThem() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file("Library/Application Support/Godot/export_templates/4.4.stable/macos.zip", bytes: 400_000)
+        try directory.file("Library/Application Support/Godot/editor_settings-4.4.tres", bytes: 400_000)
+        let godot = DeveloperCaches.definitions.filter { $0.id == "godot" }
+
+        let locations = await DeveloperCaches.scan(godot, homeDirectory: directory.url).flatMap(\.locations)
+
+        let templates = try #require(locations.first { $0.url.lastPathComponent == "export_templates" })
+        #expect(locations.count == 1)
+        #expect(templates.kind == .keptDownloads)
+        #expect(!templates.isRecommended)
+    }
+
+    /// Playwright removes the folders it makes in the temporary folder when the browser closes, so one that is still
+    /// there was left by a run that ended early, unless a browser still has it open.
+    @Test func offersWhatPlaywrightLeftInTheTemporaryFolderAndNothingInUse() async throws {
+        let directory = try TemporaryDirectory()
+        let temporary = try directory.directory("var/T")
+        try directory.file("var/T/playwright_chromiumdev_profile-a1b2c3/Default/Cookies", bytes: 400_000)
+        try directory.file("var/T/playwright-artifacts-d4e5f6/trace.zip", bytes: 400_000)
+        let live = try directory.file("var/T/playwright_firefoxdev_profile-g7h8i9/places.sqlite", bytes: 400_000)
+        try directory.file("var/T/other-tool-profile/data", bytes: 400_000)
+        let browser = try FileHandle(forWritingTo: live)
+        defer { try? browser.close() }
+        let playwright = DeveloperCaches.definitions.filter { $0.id == "playwright" }
+
+        let locations = await DeveloperCaches.scan(
+            playwright, homeDirectory: directory.url.appending(path: "home"), userTemporaryDirectory: temporary,
+            openFiles: OpenFiles(excluding: nil)
+        ).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == [
+            "playwright_chromiumdev_profile-a1b2c3", "playwright-artifacts-d4e5f6",
+        ])
+        #expect(locations.allSatisfy { $0.kind == .cache && $0.isRecommended })
+    }
+
+    @Test func offersWhatSpringBootsServersLeftInTheTemporaryFolderAndHoldsBackOneStillWritten() async throws {
+        let directory = try TemporaryDirectory()
+        let temporary = try directory.directory("var/T")
+        let anHourAgo = Date.now.addingTimeInterval(-3600)
+        for name in [
+            "tomcat.8080.10018690101673077448", "tomcat-docbase.8080.10054962961815905490",
+            "jetty-docbase.8080.10339006057543989247", "tomcat-native",
+        ] {
+            let file = try directory.file("var/T/\(name)/work/SESSIONS.ser", bytes: 400_000)
+            let work = file.deletingLastPathComponent()
+            for url in [file, work, work.deletingLastPathComponent()] {
+                try FileManager.default.setAttributes(
+                    [.modificationDate: anHourAgo], ofItemAtPath: url.path(percentEncoded: false)
+                )
+            }
+        }
+        try directory.file("var/T/tomcat.8081.10600000000000000000/work/upload.tmp", bytes: 400_000)
+        let springBoot = DeveloperCaches.definitions.filter { $0.id == "springboot" }
+
+        let locations = await DeveloperCaches.scan(
+            springBoot, homeDirectory: directory.url.appending(path: "home"), userTemporaryDirectory: temporary,
+            openFiles: OpenFiles(excluding: nil)
+        ).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == [
+            "tomcat.8080.10018690101673077448", "tomcat-docbase.8080.10054962961815905490",
+            "jetty-docbase.8080.10339006057543989247", "tomcat.8081.10600000000000000000",
+        ])
+        let running = try #require(locations.first { $0.url.lastPathComponent.hasPrefix("tomcat.8081.") })
+        #expect(running.heldBack == .writtenRecently && !running.isRecommended)
+        #expect(locations.filter { $0.url != running.url }.allSatisfy { $0.kind == .cache && $0.isRecommended })
+    }
+
+    @Test func holdsBackTheNewestFolderOfAServerThatStillListensOnItsPort() async throws {
+        let (socket, port) = try ListeningPortsTests.listeningSocket()
+        defer { close(socket) }
+        let directory = try TemporaryDirectory()
+        let temporary = try directory.directory("var/T")
+        let anHourAgo = Date.now.addingTimeInterval(-3600)
+        let names = ["tomcat.\(port).1", "tomcat.\(port).2", "tomcat-docbase.\(port).3", "tomcat.1.4"]
+        for (index, name) in names.enumerated() {
+            let file = try directory.file("var/T/\(name)/work/SESSIONS.ser", bytes: 400_000)
+            let work = file.deletingLastPathComponent()
+            // macOS keeps a birth date no later than the last change, so both are set to when the server started.
+            let made = anHourAgo.addingTimeInterval(TimeInterval(index * 60))
+            for url in [file, work, work.deletingLastPathComponent()] {
+                try FileManager.default.setAttributes(
+                    [.creationDate: made, .modificationDate: made], ofItemAtPath: url.path(percentEncoded: false)
+                )
+            }
+        }
+
+        let locations = await DeveloperCaches.scan(
+            DeveloperCaches.definitions.filter { $0.id == "springboot" },
+            homeDirectory: directory.url.appending(path: "home"), userTemporaryDirectory: temporary,
+            openFiles: OpenFiles(excluding: nil)
+        ).flatMap(\.locations)
+
+        let held = locations.filter { $0.heldBack == .serverStillListens }.map(\.url.lastPathComponent).sorted()
+        #expect(held == ["tomcat-docbase.\(port).3", "tomcat.\(port).2"])
+        let recommended = Set(locations.filter(\.isRecommended).map(\.url.lastPathComponent))
+        #expect(recommended == ["tomcat.\(port).1", "tomcat.1.4"])
+    }
+
+    @Test func offersMetrosCachesInTheTemporaryFolderAndNothingInUse() async throws {
+        let directory = try TemporaryDirectory()
+        let temporary = try directory.directory("var/T")
+        try directory.file("var/T/metro-cache/4f/2a/9e1c0d", bytes: 400_000)
+        try directory.file("var/T/metro-file-map-0a1b2c-3d4e5f", bytes: 400_000)
+        let live = try directory.file("var/T/metro-file-map-6a7b8c-9d0e1f", bytes: 400_000)
+        try directory.file("var/T/metro-bundles/main.js", bytes: 400_000)
+        let bundler = try FileHandle(forWritingTo: live)
+        defer { try? bundler.close() }
+        let metro = DeveloperCaches.definitions.filter { $0.id == "metro" }
+
+        let locations = await DeveloperCaches.scan(
+            metro, homeDirectory: directory.url.appending(path: "home"), userTemporaryDirectory: temporary,
+            openFiles: OpenFiles(excluding: nil)
+        ).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["metro-cache", "metro-file-map-0a1b2c-3d4e5f"])
+        #expect(locations.allSatisfy { $0.kind == .cache && $0.isRecommended })
+    }
+
+    @Test func offersNodesCompileCacheInTheTemporaryFolder() async throws {
+        let directory = try TemporaryDirectory()
+        let temporary = try directory.directory("var/T")
+        try directory.file("var/T/node-compile-cache/v24.10.0-arm64-5a7b9c-501/2f9e1c0d", bytes: 400_000)
+        try directory.file("var/T/node-cache-other/data", bytes: 400_000)
+        let node = DeveloperCaches.definitions.filter { $0.id == "nodejs" }
+
+        let locations = await DeveloperCaches.scan(
+            node, homeDirectory: directory.url.appending(path: "home"), userTemporaryDirectory: temporary
+        ).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["node-compile-cache"])
+        #expect(locations.allSatisfy { $0.kind == .cache && $0.isRecommended })
+    }
+
+    @Test func listsTensorFlowHubsModelsInTheTemporaryFolderWithoutSelectingThem() async throws {
+        let directory = try TemporaryDirectory()
+        let temporary = try directory.directory("var/T")
+        try directory.file("var/T/tfhub_modules/5a3e9c1b/saved_model.pb", bytes: 400_000)
+        let hub = DeveloperCaches.definitions.filter { $0.id == "tfhub" }
+
+        let locations = await DeveloperCaches.scan(
+            hub, homeDirectory: directory.url.appending(path: "home"), userTemporaryDirectory: temporary
+        ).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["tfhub_modules"])
+        #expect(locations.allSatisfy { $0.kind == .models && !$0.isRecommended })
+    }
+
+    @Test func listsChromasDownloadedModelWithoutSelectingIt() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx/model.onnx", bytes: 400_000)
+        try directory.file(".cache/chroma/telemetry_user_id", bytes: 64)
+        let chroma = DeveloperCaches.definitions.filter { $0.id == "chroma" }
+
+        let locations = await DeveloperCaches.scan(chroma, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["onnx_models"])
+        #expect(locations.allSatisfy { $0.kind == .models && !$0.isRecommended })
+    }
+
+    @Test func listsJavaWebStartsCacheWithoutSelectingItAndOffersItsLogs() async throws {
+        let directory = try TemporaryDirectory()
+        let deployment = "Library/Application Support/Oracle/Java/Deployment"
+        try directory.file("\(deployment)/cache/6.0/12/4a1b2c3d-5e6f7a8b", bytes: 400_000)
+        try directory.file("\(deployment)/log/plugin.trace", bytes: 4_096)
+        try directory.file("\(deployment)/deployment.properties", bytes: 64)
+        let java = DeveloperCaches.definitions.filter { $0.id == "oraclejava" }
+
+        let locations = await DeveloperCaches.scan(java, homeDirectory: directory.url).flatMap(\.locations)
+
+        let kinds = Dictionary(uniqueKeysWithValues: locations.map { ($0.url.lastPathComponent, $0.kind) })
+        #expect(kinds == ["cache": .environments, "log": .logs])
+        #expect(locations.allSatisfy { $0.isRecommended == ($0.kind == .logs) })
+    }
+
+    @Test func offersTheSonarScannersCacheAndNeverItsCertificates() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".sonar/cache/0f2e/sonar-scanner-engine-shaded-10.jar", bytes: 400_000)
+        try directory.file(".sonar/ssl/keystore.p12", bytes: 4_096)
+        let sonar = DeveloperCaches.definitions.filter { $0.id == "sonar" }
+
+        let locations = await DeveloperCaches.scan(sonar, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == ["cache"])
+    }
+
+    @Test func listsTheStoreOlderPnpmKeptInTheHomeFolderWithoutSelectingIt() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".pnpm-store/v3/files/00/abc", bytes: 400_000)
+        let pnpm = DeveloperCaches.definitions.filter { $0.id == "pnpm" }
+
+        let locations = await DeveloperCaches.scan(pnpm, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.map(\.url.lastPathComponent) == [".pnpm-store"])
+        #expect(locations.first?.isRecommended == false)
+    }
+
+    @Test func listsTheVersionsANativeInstallKeptAndNeverTheOneItsLauncherRuns() async throws {
+        let directory = try TemporaryDirectory()
+        let claude = ".local/share/claude/versions"
+        let cursor = ".local/share/cursor-agent/versions"
+        try directory.file("\(claude)/2.1.200", bytes: 400_000)
+        try directory.file("\(claude)/2.1.211", bytes: 400_000)
+        try directory.file("\(cursor)/2026.09.20-a1b2c3d/cursor-agent", bytes: 400_000)
+        try directory.file("\(cursor)/2026.09.26-dd393fe/cursor-agent", bytes: 400_000)
+        try directory.directory(".local/bin")
+        let link = { (name: String, target: String) in
+            try FileManager.default.createSymbolicLink(
+                atPath: directory.url.appending(path: ".local/bin/\(name)").path(percentEncoded: false),
+                withDestinationPath: directory.url.appending(path: target).path(percentEncoded: false)
+            )
+        }
+        try link("claude", "\(claude)/2.1.211")
+        try link("agent", "\(cursor)/2026.09.26-dd393fe/cursor-agent")
+        try link("cursor-agent", "\(cursor)/2026.09.26-dd393fe/cursor-agent")
+        let tools = DeveloperCaches.definitions.filter { $0.folders.contains { !$0.launchers.isEmpty } }
+
+        let locations = await DeveloperCaches.scan(tools, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(Set(locations.map(\.url.lastPathComponent)) == ["2.1.200", "2026.09.20-a1b2c3d"])
+        #expect(locations.allSatisfy { $0.kind == .environments && !$0.isRecommended })
+    }
+
+    @Test func aLauncherThatIsNotTheInstallersLinkKeepsEveryVersion() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".local/share/claude/versions/2.1.200", bytes: 400_000)
+        try directory.file(".local/share/claude/versions/2.1.211", bytes: 400_000)
+        let script = "#!/bin/sh\nexec ~/.local/share/claude/versions/2.1.200\n"
+        try directory.file(".local/bin/claude", contents: Data(script.utf8))
+        let tools = DeveloperCaches.definitions.filter { $0.folders.contains { !$0.launchers.isEmpty } }
+
+        let locations = await DeveloperCaches.scan(tools, homeDirectory: directory.url).flatMap(\.locations)
+
+        #expect(locations.isEmpty)
+    }
+
+    /// virtualenvwrapper keeps the user's hook scripts beside the environments in `~/.virtualenvs`, so only the
+    /// environments are offered, and a link among them is left where it is, never followed.
+    /// VS Code writes `workspace.json` in each folder of `workspaceStorage`, naming the folder or workspace file it
+    /// was made for. One whose project is gone from a folder that is still there is listed, never selected, since it
+    /// keeps that project's chat history. A project on a disk that is not connected, or on another machine, is not
+    /// known to be gone.
+    @Test func listsTheStateAnEditorKeptForAProjectThatIsGoneWithoutSelectingIt() async throws {
+        let directory = try TemporaryDirectory()
+        let storage = "Library/Application Support/Code/User/workspaceStorage"
+        let projects = directory.url.appending(path: "Projects", directoryHint: .isDirectory)
+        try directory.directory("Projects/kept")
+        func state(_ id: String, _ meta: String) throws {
+            try directory.file("\(storage)/\(id)/workspace.json", contents: Data(meta.utf8))
+            try directory.file("\(storage)/\(id)/state.vscdb", bytes: 4_096)
+        }
+        try state("a1", #"{"folder": "\#(projects.appending(path: "gone").absoluteString)"}"#)
+        try state("b2", #"{"folder": "\#(projects.appending(path: "kept").absoluteString)"}"#)
+        try state("c3", #"{"workspace": "\#(projects.appending(path: "team.code-workspace").absoluteString)"}"#)
+        try state("d4", #"{"folder": "file:///Volumes/org-example-disk/project"}"#)
+        try state("e5", #"{"folder": "vscode-remote://ssh-remote%2Bhost/home/me/project"}"#)
+        try directory.file("\(storage)/f6/state.vscdb", bytes: 4_096)
+
+        let rows = await scanned(directory.url).flatMap(\.locations).filter { $0.kind == .projectState }
+
+        #expect(rows.map(\.url.lastPathComponent).sorted() == ["a1", "c3"])
+        #expect(Set(rows.compactMap(\.project)) == ["gone", "team"])
+        #expect(rows.allSatisfy { !$0.isRecommended })
+    }
+
+    @Test func offersDockerDesktopsLogsAndNeverItsDiskImage() async throws {
+        let directory = try TemporaryDirectory()
+        let data = "Library/Containers/com.docker.docker/Data"
+        try directory.file("\(data)/log/vm/init.log", bytes: 400_000)
+        try directory.file("\(data)/vms/0/data/Docker.raw", bytes: 400_000)
+
+        let docker = try #require(await scanned(directory.url).first { $0.id == "docker" })
+
+        #expect(docker.locations.map(\.url.lastPathComponent) == ["log"])
+        #expect(docker.appBundleIdentifiers == ["com.docker.docker"])
+    }
+
+    @Test func offersVirtualenvwrappersEnvironmentsAndNotItsHooks() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".virtualenvs/web/bin/python", bytes: 400_000)
+        try directory.file(".virtualenvs/postactivate", bytes: 64)
+        try directory.file(".virtualenvs/hook.log", bytes: 64)
+        let elsewhere = try directory.directory("Volumes/Fast/env")
+        try directory.file("Volumes/Fast/env/bin/python", bytes: 400_000)
+        try FileManager.default.createSymbolicLink(at: directory.url.appending(path: ".virtualenvs/fast"), withDestinationURL: elsewhere)
+        let wrapper = DeveloperCaches.definitions.filter { $0.id == "virtualenvwrapper" }
+
+        let offered = await DeveloperCaches.scan(wrapper, homeDirectory: directory.url).flatMap(\.locations)
+            .map(\.url.lastPathComponent)
+
+        #expect(offered == ["web"])
+    }
+
+    /// Nx answers a cache hit from its database alone, so a workspace's `cache` and `databases` go together: the
+    /// folder that holds both is offered as one, and nothing else in `~/.nx` is.
+    @Test func offersNxsCacheAndDatabaseOnlyTogether() async throws {
+        let directory = try TemporaryDirectory()
+        try directory.file(".nx/5d41402abc4b2a76/cache/12345/outputs/dist.js", bytes: 400_000)
+        try directory.file(".nx/5d41402abc4b2a76/databases/workspace.db", bytes: 400_000)
+        try directory.file(".nx/sockets/daemon", bytes: 16)
+        let nx = DeveloperCaches.definitions.filter { $0.id == "nx" }
+
+        let offered = await DeveloperCaches.scan(nx, homeDirectory: directory.url).flatMap(\.locations)
+            .map(\.url.lastPathComponent)
+
+        #expect(offered == ["5d41402abc4b2a76"])
+    }
+
+    /// Bun's cache is a plain download cache until its global store is turned on: then `links` inside it is what
+    /// every project's `node_modules` points into, and the whole folder is listed without a checkmark. A store
+    /// moved to another disk leaves `links` as a link, which projects still reach through the cache.
+    @Test func bunsCacheIsSelectedOnlyWhileNoProjectLinksIntoIt() async throws {
+        for (hasStore, storeIsALink) in [(false, false), (true, false), (true, true)] {
+            let directory = try TemporaryDirectory()
+            try directory.file(".bun/install/cache/react@18.3.1@@@1/package.json", bytes: 400_000)
+            if storeIsALink {
+                let elsewhere = try directory.directory("Volumes/Fast/bun-links")
+                try FileManager.default.createSymbolicLink(
+                    at: directory.url.appending(path: ".bun/install/cache/links"),
+                    withDestinationURL: elsewhere
+                )
+            } else if hasStore {
+                try directory.file(".bun/install/cache/links/react@18.3.1-5664d3cd670b3205/node_modules/react/index.js", bytes: 4_096)
+            }
+
+            let bun = try #require(await scanned(directory.url).first { $0.id == "bun" })
+
+            #expect(bun.locations.count == 1)
+            #expect(bun.locations.first?.isRecommended == !hasStore, "links inside: \(hasStore)")
+            #expect(bun.locations.first?.kind == (hasStore ? .environments : .downloads))
+        }
+    }
+
+    @Test func aScanOnlyEverReturnsFoldersInsideTheHomeItIsGiven() async throws {
+        let directory = try TemporaryDirectory()
+        let outside = try TemporaryDirectory()
+        try outside.file("Library/Caches/pip/wheels/wheel", bytes: 400_000)
+        try directory.file(".cache/uv/archive/file", bytes: 400_000)
+        try directory.file("Documents/notes.txt", bytes: 400_000)
+        try directory.file("Library/Caches/pip-not-really/file", bytes: 400_000)
+
+        let environments = await scanned(directory.url)
+        let home = directory.url.path(percentEncoded: false)
+        #expect(environments.map(\.id) == ["uv"])
+        for url in environments.flatMap(\.locations).map(\.url) {
+            #expect(url.path(percentEncoded: false).hasPrefix(home))
+        }
+    }
+
+    @Test func honorsExclusions() async throws {
+        let directory = try TemporaryDirectory()
+        let cache = try directory.directory(".cache/uv")
+        try directory.file(".cache/uv/archive/file", bytes: 400_000)
+
+        let kept = await scanned(directory.url, exclusions: Exclusions(paths: [cache]))
+        #expect(kept.isEmpty)
+    }
+
+    /// A JetBrains IDE keeps the edits it recorded for an open project in `LocalHistory`, beside its caches.
+    /// They are in no repository, so no offered folder may reach one. The home folder is made up, so the test
+    /// works on a Mac with no such IDE installed.
+    @Test func neverOffersAnIDEsLocalHistory() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        for folder in ["caches", "index", "tmp", "LocalHistory"] {
+            try directory.file("home/Library/Caches/JetBrains/IntelliJIdea2026.1/\(folder)/file.bin", bytes: 4_096)
+        }
+
+        let offered = await scanned(home).flatMap(\.locations).map { $0.url.path(percentEncoded: false) }
+
+        #expect(!offered.isEmpty, "the fabricated IDE folders were not found at all")
+        #expect(!offered.contains { $0.contains("/LocalHistory") })
+        #expect(!offered.contains { FileManager.default.fileExists(atPath: $0 + "/LocalHistory") })
+        #expect(offered.contains { $0.hasSuffix("/caches") })
+    }
+
+    /// A cache folder that is a link to another disk is left alone. Moving the link frees nothing, and the tool
+    /// would quietly start a new folder on the internal disk.
+    @Test func leavesAloneACacheFolderThatIsALink() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        try directory.file("elsewhere/hub/blob.bin", bytes: 400_000)
+        try directory.directory("home/.cache/huggingface")
+        try FileManager.default.createSymbolicLink(
+            at: home.appending(path: ".cache/huggingface/hub"),
+            withDestinationURL: directory.url.appending(path: "elsewhere/hub")
+        )
+
+        let offered = await scanned(home).flatMap(\.locations).map { $0.url.lastPathComponent }
+
+        #expect(!offered.contains("hub"))
+    }
+
+    /// Nothing offered may sit inside something else offered: removing the outer one would take the inner.
+    @Test func offersNoPathInsideAnother() async throws {
+        let directory = try TemporaryDirectory()
+        let home = directory.url.appending(path: "home", directoryHint: .isDirectory)
+        for path in ["Library/Caches/JetBrains/IntelliJIdea2026.1/caches/a", "Library/Caches/Homebrew/downloads/b", ".npm/_cacache/c"] {
+            try directory.file("home/\(path)", bytes: 16)
+        }
+
+        let offered = await scanned(home).flatMap(\.locations)
+            .map { PathPattern.comparablePath(of: $0.url).lowercased() }
+
+        for path in offered {
+            #expect(!offered.contains { $0 != path && path.hasPrefix($0 + "/") }, "\(path) sits inside another offered folder")
+        }
+    }
+
+    /// Limited, `glob` stops at 128 paths, and Playwright alone leaves a folder for every run that ended early.
+    @Test func eachPatternFindsEveryMatch() throws {
+        let count = 200
+        for definition in DeveloperCaches.definitions {
+            for folder in definition.folders {
+                let names = (0..<count).compactMap { Self.name(matching: folder.path, number: $0) }
+                guard names.count == count else {
+                    #expect(names.count < 128, "\(folder.path) names \(names.count) at most and was not checked")
+                    continue
+                }
+                let directory = try TemporaryDirectory()
+                let root = directory.url.appending(path: "root", directoryHint: .isDirectory)
+                for name in names {
+                    try directory.directory("root/\(name)")
+                }
+
+                let places = folder.places(
+                    home: root, userCache: root, userTemporary: root, preference: { _ in nil },
+                    settings: ToolSettings(home: root)
+                )
+
+                #expect(places.count == count, "\(folder.path) found \(places.count) of \(count)")
+            }
+        }
+    }
+
+    /// A path `pattern` matches, made distinct by `number`; nil when its classes cannot spell that many.
+    private static func name(matching pattern: String, number: Int) -> String? {
+        let pattern = pattern.hasSuffix("/") ? String(pattern.dropLast()) : pattern
+        guard pattern.contains(where: { "*?[".contains($0) }) else { return nil }
+        let placesTheNumber = pattern.contains("*")
+        let characters = Array(pattern)
+        var name = ""
+        var remaining = number
+        var numbered = false
+        // The classes are filled from the last one, so the digits read in order.
+        var spelled: [Int: Character] = [:]
+        if !placesTheNumber {
+            var index = characters.count - 1
+            while index >= 0 {
+                if characters[index] == "?" {
+                    spelled[index] = Character(String(remaining % 16, radix: 16))
+                    remaining /= 16
+                } else if characters[index] == "]", let open = characters[..<index].lastIndex(of: "[") {
+                    let choices = Self.classMembers(String(characters[(open + 1)..<index]))
+                    spelled[open] = choices[remaining % choices.count]
+                    remaining /= choices.count
+                    index = open
+                }
+                index -= 1
+            }
+            guard remaining == 0 else { return nil }
+        }
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            if character == "*" {
+                name += numbered ? "x" : "m\(number)"
+                numbered = true
+            } else if character == "?" {
+                name.append(spelled[index] ?? "a")
+            } else if character == "[", let close = characters[index...].firstIndex(of: "]") {
+                name.append(spelled[index] ?? Self.classMembers(String(characters[(index + 1)..<close]))[0])
+                index = close
+            } else {
+                name.append(character)
+            }
+            index += 1
+        }
+        return name
+    }
+
+    /// The characters a bracket class such as `0-9a-f` stands for.
+    private static func classMembers(_ members: String) -> [Character] {
+        let characters = Array(members)
+        var result: [Character] = []
+        var index = 0
+        while index < characters.count {
+            if index + 2 < characters.count, characters[index + 1] == "-",
+               let low = characters[index].unicodeScalars.first?.value,
+               let high = characters[index + 2].unicodeScalars.first?.value, low <= high {
+                result += (low...high).compactMap { Unicode.Scalar($0).map(Character.init) }
+                index += 3
+            } else {
+                result.append(characters[index])
+                index += 1
+            }
+        }
+        return result
+    }
+}

@@ -1,0 +1,91 @@
+import Darwin
+public import Foundation
+internal import PeelPrivileged
+
+public enum FileAccess {
+    /// True when the current user can't move `url` to the Trash without administrator rights.
+    public static func requiresPrivilegesToRemove(_ url: URL) -> Bool {
+        ParentAccess(url.deletingLastPathComponent()).requiresPrivileges(toRemove: url)
+    }
+
+    /// True when macOS's privacy protection, rather than the permissions or a lock, keeps this process from
+    /// changing `url`: `access(2)` then fails with `EPERM`, as it does for another developer's app while the process
+    /// has no App Management. A lock fails with `EPERM` too, and the permissions with `EACCES`.
+    public static func isProtectedByPrivacy(_ url: URL) -> Bool {
+        let path = url.path(percentEncoded: false)
+        let error = access(path, W_OK) == 0 ? nil : errno
+        return isProtectedByPrivacy(accessError: error, isLocked: isLocked(url))
+    }
+
+    static func isProtectedByPrivacy(accessError: Int32?, isLocked: Bool) -> Bool {
+        accessError == EPERM && !isLocked
+    }
+
+    /// How many of `items` their permissions keep this account from reading. A task of its own, since a disk that
+    /// stopped answering holds the question.
+    @concurrent public static func closedByPermissions(among items: [URL]) async -> Int {
+        items.count(where: isClosedByItsPermissions)
+    }
+
+    /// Whether the permissions keep this account from reading `url`: `access(2)` then fails with `EACCES`, while
+    /// macOS's privacy protection, which Full Disk Access lifts, fails with `EPERM`. A folder is read by going in too.
+    public static func isClosedByItsPermissions(_ url: URL) -> Bool {
+        let path = url.path(percentEncoded: false)
+        var info = stat()
+        let needed = stat(path, &info) == 0 && info.st_mode & S_IFMT == S_IFDIR ? R_OK | X_OK : R_OK
+        return access(path, needed) != 0 && errno == EACCES
+    }
+
+    /// Whether `url` is there and this process may not read it, as a file only its owner reads (`access(2)`).
+    static func isClosedToReading(_ url: URL) -> Bool {
+        access(url.path(percentEncoded: false), R_OK) != 0 && (errno == EACCES || errno == EPERM)
+    }
+
+    /// The folder that kept Peel out of `folder`: `folder` itself when Peel can see it but not list it, or the folder
+    /// around it Peel can't look into. Nil when nothing is there, or a file is, which hides nothing.
+    static func refusedFolder(_ folder: URL) -> URL? {
+        var info = stat()
+        if stat(folder.path(percentEncoded: false), &info) == 0 {
+            return info.st_mode & S_IFMT == S_IFDIR ? folder : nil
+        }
+        guard ![ENOENT, ENOTDIR, ELOOP].contains(errno) else { return nil }
+        let around = folder.deletingLastPathComponent()
+        return around.path(percentEncoded: false) == folder.path(percentEncoded: false) ? nil : refusedFolder(around)
+    }
+
+    static func isARealFolder(_ url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path(percentEncoded: false), &info) == 0 && info.st_mode & S_IFMT == S_IFDIR
+    }
+
+    /// Whether `url` is locked (`chflags uchg` or `schg`), which blocks a move whatever the permissions say.
+    static func isLocked(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path(percentEncoded: false), &info) == 0 else { return false }
+        return info.st_flags & (UInt32(UF_IMMUTABLE) | UInt32(SF_IMMUTABLE)) != 0
+    }
+
+    /// Whether `url` is in `/Users/Shared`, which belongs to every account on this Mac.
+    static func isSharedWithEveryone(_ url: URL) -> Bool {
+        let path = PathPattern.comparablePath(of: url).lowercased()
+        return ["/users/shared", "/system/volumes/data/users/shared"].contains {
+            PathComponents.isPath(path, atOrInside: $0)
+        }
+    }
+
+    /// Whether `url` is marked so that nothing removes or renames it (`SF_NOUNLINK`, `sys/stat.h`), so it can't go to
+    /// the Trash, whoever asks.
+    static func cannotBeRemoved(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path(percentEncoded: false), &info) == 0 else { return false }
+        return info.st_flags & UInt32(SF_NOUNLINK) != 0
+    }
+
+    /// True when `url` itself is locked as Finder's Get Info locks it (`UF_IMMUTABLE`, `chflags(2)`): the file
+    /// may not be changed until its owner takes the lock off.
+    static func isLockedInFinder(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path(percentEncoded: false), &info) == 0 else { return false }
+        return info.st_flags & UInt32(UF_IMMUTABLE) != 0
+    }
+}

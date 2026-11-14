@@ -1,0 +1,295 @@
+import Darwin
+import Foundation
+internal import PeelPrivileged
+
+/// Why `RemovalGuard` refuses to move an item.
+public enum GuardRefusal: Sendable, Hashable, CaseIterable {
+    /// The exclusions have not been read yet, or cannot be read, so nothing moves.
+    case exclusionsNotKnown
+    /// The person excluded it, or something inside it.
+    case excluded
+    /// A folder that stays itself, such as the home folder or one Space empties, though what is inside may go.
+    case staysItself
+    /// It is part of macOS, or it sits inside something Peel protects.
+    case protectedLocation
+    /// Something Peel protects is inside, such as a keychain, a wallet's keys, or a browser profile with a wallet.
+    case holdsProtectedData
+    /// It syncs to the person's other devices, through iCloud or File Provider or in a folder another app keeps in
+    /// step (`SyncedFolders`), as Desktop and Documents do in iCloud Drive.
+    case inTheCloud(SyncKeeper)
+    /// A sandboxed app's documents are inside.
+    case holdsDocuments
+    /// A photo, music, or video library is inside.
+    case holdsALibrary
+    /// Work an app keeps only in a cache folder is inside, such as an editor's local history.
+    case holdsWorkKeptInACache
+    /// macOS would not let Peel list a folder inside it, so whether something Peel never moves is there is not known.
+    case couldNotLookInside
+
+    /// Each kind of refusal once, the cloud standing for every keeper.
+    public static let allCases: [GuardRefusal] = [
+        .exclusionsNotKnown, .excluded, .staysItself, .protectedLocation, .holdsProtectedData, .inTheCloud(.cloud),
+        .holdsDocuments, .holdsALibrary, .holdsWorkKeptInACache, .couldNotLookInside,
+    ]
+
+    /// A fixed word for the reason, which the refusal log stores, so a record still reads in a later version.
+    public var name: String {
+        switch self {
+        case .exclusionsNotKnown: "exclusions-not-known"
+        case .excluded: "excluded"
+        case .staysItself: "stays-in-place"
+        case .protectedLocation: "protected-place"
+        case .holdsProtectedData: "holds-protected-data"
+        case .inTheCloud: "in-the-cloud"
+        case .holdsDocuments: "holds-documents"
+        case .holdsALibrary: "holds-a-library"
+        case .holdsWorkKeptInACache: "holds-work-kept-in-a-cache"
+        case .couldNotLookInside: "could-not-look-inside"
+        }
+    }
+
+    /// What a refusal log keeps beside the word, when the word alone doesn't say it all.
+    var detail: String? {
+        guard case .inTheCloud(let keeper) = self else { return nil }
+        return keeper.detail
+    }
+
+    public init?(name: String, detail: String? = nil) {
+        guard let refusal = Self.allCases.first(where: { $0.name == name }) else { return nil }
+        if case .inTheCloud = refusal {
+            self = .inTheCloud(SyncKeeper(detail: detail))
+        } else {
+            self = refusal
+        }
+    }
+}
+
+struct RemovalGuard: Sendable {
+    /// Nothing inside these may be removed. `/Library/Updates` is where Software Update stages macOS updates.
+    /// Lower-cased, because the spellings they are compared against are.
+    private static let protectedPrefixes = ["/system", "/usr", "/bin", "/sbin", "/library/updates"]
+    /// The folders command-line tools and their shell completions are linked into. A link directly in one may go from
+    /// under `/usr`: what an app's tool leaves there, which Peel's helper takes only once it leads nowhere.
+    private static let toolLinkFolders = PrivilegedPathPolicy.linkLocations.map { PathComponents.of($0.lowercased()) }
+    /// Homebrew's Caskroom where its prefix is `/usr/local`, as on an Intel Mac. A folder directly in it is Homebrew's
+    /// record of a cask, which goes with the cask's app.
+    private static let caskroom = PathComponents.of("/usr/local/caskroom")
+
+    private let protectedPaths: Set<String>
+    private let protectedTrees: [[String]]
+    private let protectedObjects: ProtectedObjects
+    private let exclusions: Exclusions
+    private let syncKeeper: @Sendable (URL) -> SyncKeeper?
+
+    var knowsTheExclusions: Bool { exclusions.isKnown }
+    var whyExclusionsAreUnreadable: FileProblem? { exclusions.whyUnreadable }
+
+    func excludes(_ app: InstalledApp) -> Bool { exclusions.excludes(app) }
+    func excludes(ownerOf item: BackgroundItem) -> Bool { item.isOfAnApp(excludedBy: exclusions) }
+    private let home: String
+
+    init(
+        environment: SearchEnvironment,
+        exclusions: Exclusions = .none,
+        syncKeeper: @escaping @Sendable (URL) -> SyncKeeper? = SyncedFolders().keeper(of:)
+    ) {
+        self.exclusions = exclusions
+        self.syncKeeper = syncKeeper
+        let home = environment.homeDirectory
+        self.home = home.path(percentEncoded: false)
+        var paths: [String] = [
+            "/", "/Applications", "/Library", "/Library/Updates", "/System", "/Users", "/Users/Shared", "/Volumes", "/opt", "/usr",
+            "/private", "/private/var", "/private/tmp", "/private/etc", "/var", "/tmp", "/etc", "/cores",
+        ]
+        // The home folder and the folders every account starts with are the user's own, whatever they contain,
+        // so they are never removed themselves.
+        let homeDirectories: [URL] = [home] + ProtectedData.accountFolders.map { home.appending(path: $0) }
+        paths += homeDirectories.map { $0.path(percentEncoded: false) }
+        let locations = environment.locations
+        paths += locations.filter { !$0.kind.sitsInABrowsersOwnData }.map { $0.url.path(percentEncoded: false) }
+        paths += SpaceInventory.emptiedFolders(in: environment).map { $0.path(percentEncoded: false) }
+        paths += ProtectedData.sharedHomeItems.map { home.appending(path: $0).path(percentEncoded: false) }
+        // Every folder on the way to one of these stays as well, since moving it would take the place along.
+        paths += Set(paths).flatMap(ProtectedObjects.ancestors)
+        paths += locations.filter { $0.kind.sitsInABrowsersOwnData }.map { $0.url.path(percentEncoded: false) }
+        let trees = ProtectedData.homeTrees.map { home.appending(path: $0).path(percentEncoded: false) }
+        // Many of these paths repeat, and every spelling of one is read from the disk, so each is read once.
+        var named: [String: Set<String>] = [:]
+        func names(_ path: String) -> Set<String> {
+            if let known = named[path] { return known }
+            let found = Self.names(of: path)
+            named[path] = found
+            return found
+        }
+        protectedPaths = Set(paths.flatMap(names))
+        protectedTrees = Set((trees + ProtectedData.systemFolders).flatMap(names)).map(PathComponents.of)
+        protectedObjects = ProtectedObjects(trees: trees + ProtectedData.systemFolders, folders: paths)
+    }
+
+    /// Every lower-cased spelling of `path`, as written and as located on disk. A home kept on another disk is
+    /// reached through a link, and Spotlight names files by the disk they are on, so both forms must match.
+    private static func names(of path: String) -> Set<String> {
+        let path = normalized(path)
+        var names = ProtectedData.spellings(of: path)
+        if let located = PathPattern.locatedWithoutOpening(path), located != path {
+            names.formUnion(ProtectedData.spellings(of: located))
+        }
+        return names
+    }
+
+    func allowsRemoval(of url: URL) -> Bool {
+        refusal(of: url) == nil
+    }
+
+    func refusal(of url: URL) -> GuardRefusal? {
+        refusal(of: url, typeOf: nil)
+    }
+
+    /// Why `trashed` may not go back to `destination`, judged as a removal from there would be, for the kind of item
+    /// `trashed` is: nothing is there yet to tell.
+    func refusal(ofPuttingBack trashed: URL, at destination: URL) -> GuardRefusal? {
+        refusal(of: destination, typeOf: trashed)
+    }
+
+    /// Whether a folder `path` sits in is an app, which Peel moves only whole: nothing moves out of one, and nothing
+    /// goes back into one.
+    private static func isInsideAnApp(_ path: String) -> Bool {
+        // Most paths name no app, and the guard is asked about thousands of them.
+        guard let app = PathComponents.outermostApp(of: path), PathComponents.isPath(path, inside: app) else {
+            return false
+        }
+        var folder = URL(filePath: path).deletingLastPathComponent()
+        while folder.pathComponents.count > 1 {
+            if AppBundleLayout.isAnApp(folder) { return true }
+            folder = folder.deletingLastPathComponent()
+        }
+        return false
+    }
+
+    /// True for the lower-cased spelling of a link directly in a folder tools or their completions are linked into.
+    static func isAToolsLink(_ spelling: String, isALink: Bool) -> Bool {
+        isALink && toolLinkFolders.contains(Array(PathComponents.of(spelling).dropLast()))
+    }
+
+    private static func isACasksRecord(_ spelling: String, isAFolder: Bool) -> Bool {
+        isAFolder && Array(PathComponents.of(spelling).dropLast()) == caskroom
+    }
+
+    /// Whether a regular file at `path` sits inside `protectedPrefixes`, read from the name alone.
+    static func neverMovesAFile(at path: String) -> Bool {
+        let lowered = path.lowercased()
+        return protectedPrefixes.contains { PathComponents.isPath(lowered, inside: $0) }
+    }
+
+    private static func type(of path: String) -> mode_t? {
+        var info = stat()
+        return lstat(path, &info) == 0 ? info.st_mode & S_IFMT : nil
+    }
+
+    /// `item`, when given, is what would sit at `url`: an item coming back from the Trash.
+    private func refusal(of url: URL, typeOf item: URL?) -> GuardRefusal? {
+        // A question reads the disk through Foundation, which leaves objects for the caller's autorelease pool, and
+        // callers ask about thousands of items in one loop.
+        autoreleasepool { judgement(of: url, typeOf: item) }
+    }
+
+    private func judgement(of url: URL, typeOf item: URL?) -> GuardRefusal? {
+        guard url.isFileURL else { return .protectedLocation }
+        // Warren: the host app's own veto (see `ExternalRemovalGate`).
+        guard ExternalRemovalGate.allows(url) else { return .protectedLocation }
+        guard exclusions.isKnown else { return .exclusionsNotKnown }
+        let path = Self.normalized(url.path(percentEncoded: false))
+        // A path can be written several ways (`/var` for `/private/var`, a different case), and a Put Back
+        // destination does not exist yet. `located` names the part that exists the way the kernel does.
+        guard let located = PathPattern.located(path) else { return .protectedLocation }
+        guard !Self.isInsideAnApp(located) else { return .protectedLocation }
+        let type = Self.type(of: item?.path(percentEncoded: false) ?? located)
+        // The kernel's own name for the item is judged too: `/.vol/<device>/<inode>` names a file by its numbers
+        // alone and shows none of the folders it sits in.
+        let inOrder = [path, located, PathPattern.kernelName(of: path, followingLinks: false)].compactMap(\.self)
+        let names = Set(inOrder)
+        // Worked out once per name, since each resolves links on disk. The names are standardized already, so these
+        // are the spellings the exclusions would work out themselves.
+        let spelled = Dictionary(uniqueKeysWithValues: names.map { ($0, ProtectedData.spellings(of: $0)) })
+        for (name, spellings) in spelled {
+            guard !exclusions.excludes(spellings: spellings), !exclusions.holds(spellings: spellings) else {
+                return .excluded
+            }
+            if !ProtectedData.isAMailPlugIn(name, home: home), let refusal = protectedObjects.refusal(of: name) {
+                return refusal
+            }
+            // The rules the helper follows. They protect every account's keychain and mail, not only those of the
+            // account Peel runs in.
+            guard !ProtectedData.refuses(spellings: spellings, home: home) else { return .protectedLocation }
+            guard !ProtectedData.holds(spellings: spellings, home: home) else { return .holdsProtectedData }
+        }
+
+        // A folder that stays itself never moves, though one that is gone may come back as the folder it was.
+        let comesBackAsAFolder = item != nil && type == S_IFDIR
+        for spelling in spelled.values.reduce(into: Set<String>(), { $0.formUnion($1) }) {
+            let isUnderAPrefix = Self.protectedPrefixes.contains { PathComponents.isPath(spelling, inside: $0) }
+            guard comesBackAsAFolder || !protectedPaths.contains(spelling) else { return .staysItself }
+            let mayGo = Self.isAToolsLink(spelling, isALink: type == S_IFLNK)
+                || Self.isACasksRecord(spelling, isAFolder: type == S_IFDIR)
+            guard !isUnderAPrefix || mayGo else { return .protectedLocation }
+
+            let parts = PathComponents.of(spelling)
+            let isATree = protectedTrees.contains { parts.starts(with: $0) }
+            guard !isATree || ProtectedData.isAMailPlugIn(spelling, home: home) else { return .protectedLocation }
+            // Also refuse a folder with a protected tree inside, since removing it would take the tree along.
+            guard !protectedTrees.contains(where: { $0.count > parts.count && $0.starts(with: parts) }) else {
+                return .holdsProtectedData
+            }
+            guard !Self.isInsideAUserLibrary(spelling), !ProtectedData.isGlobalPreferences(spelling) else {
+                return .protectedLocation
+            }
+            guard !ProtectedData.isInAnApplesGroupContainer(spelling) else { return .protectedLocation }
+            // A sandboxed app's own documents sit inside its container, beside the settings.
+            guard !ProtectedData.isInAContainersDocuments(spelling) else { return .protectedLocation }
+        }
+        // System Integrity Protection guards an item marked restricted, and nothing may remove or rename one marked
+        // no-unlink (`sys/stat.h`).
+        var info = stat()
+        let protectedFlags = UInt32(SF_RESTRICTED) | UInt32(SF_NOUNLINK)
+        guard lstat(path, &info) != 0 || info.st_flags & protectedFlags == 0 else { return .protectedLocation }
+        // Not for Put Back, which removes nothing from the other devices.
+        // Asked of the name as written first, so the marker is named the way the item was.
+        if item == nil, let keeper = inOrder.lazy.compactMap({ syncKeeper(URL(filePath: $0)) }).first {
+            return .inTheCloud(keeper)
+        }
+
+        // Last, since each reads what is a level or two inside the folder, and a name refused above needs none of it.
+        guard !exclusions.isAnExcludedApp(item ?? URL(filePath: path)) else { return .excluded }
+        var couldNotLookInside = false
+        for name in names {
+            // The helper knows nothing of the exclusions, so a folder that can't be looked into for one stays.
+            guard let excluded = exclusions.appFolders(inside: URL(filePath: name, directoryHint: .isDirectory)) else {
+                return .couldNotLookInside
+            }
+            guard excluded.isEmpty else { return .excluded }
+            // An uninstall lists a whole container, and the documents inside would go with it. Space lists a
+            // vendor's whole cache folder, and work kept only there (an IDE's local history) would go with it.
+            guard !ProtectedData.holdsAContainersDocuments(name) else { return .holdsDocuments }
+            let work = ProtectedData.holdsWorkKeptInACache(name)
+            guard work != .found else { return .holdsWorkKeptInACache }
+            let library = ProtectedData.holdsALibrary(name)
+            guard library != .found else { return .holdsALibrary }
+            let wallet = ProtectedData.holdsABrowserWallet(name)
+            guard wallet != .found else { return .holdsProtectedData }
+            couldNotLookInside = couldNotLookInside || [work, library, wallet].contains(.notKnown)
+        }
+        // A folder the person can't change moves only through the helper, which looks inside as root first.
+        guard !couldNotLookInside || FileAccess.requiresPrivilegesToRemove(url) else { return .couldNotLookInside }
+        return nil
+    }
+
+    /// True for anything at or inside a photo, music or video library package. The path arrives lower-cased.
+    private static func isInsideAUserLibrary(_ path: String) -> Bool {
+        PathComponents.of(path).contains(where: ProtectedData.isALibrary)
+    }
+
+    private static func normalized(_ path: String) -> String {
+        let standardized = (path as NSString).standardizingPath
+        return standardized.count > 1 && standardized.hasSuffix("/") ? String(standardized.dropLast()) : standardized
+    }
+}
