@@ -13,7 +13,6 @@ final class AppModel: ObservableObject {
         static let menuBarCompanionEnabled = "skmole.menuBarCompanionEnabled"
         static let showFullDiskAccessReminders = "skmole.showFullDiskAccessReminders"
         static let hasCompletedOnboarding = "skmole.hasCompletedOnboarding"
-        static let uninstallSensitivity = "skmole.uninstallSensitivity"
         static let cleanupSafetyProfile = "skmole.cleanupSafetyProfile"
         static let storageInspectionMode = "skmole.storageInspectionMode"
         static let storageFocusMode = "skmole.storageFocusMode"
@@ -122,15 +121,6 @@ final class AppModel: ObservableObject {
 
     @Published var pendingCleanupDeletion: PendingCleanupDeletion?
 
-    @Published var uninstallSensitivity: UninstallSensitivityLevel = .enhanced {
-        didSet {
-            UserDefaults.standard.set(uninstallSensitivity.rawValue, forKey: PreferenceKey.uninstallSensitivity)
-        }
-    }
-    @Published var selectedApp: InstalledApp?
-    @Published var uninstallPreview: UninstallPreview?
-    @Published var uninstallBusy = false
-    @Published var uninstallError: String?
     @Published var applicationDiscoveryProgress: ScanProgress?
 
     @Published var storageReport: StorageReport?
@@ -283,7 +273,11 @@ final class AppModel: ObservableObject {
     private let sizer = DirectorySizer()
     private lazy var cleanupScanner = CleanupScanner(guardService: guardService, sizer: sizer)
     private lazy var storageAnalyzer = StorageAnalyzer(guardService: guardService, sizer: sizer)
-    private lazy var appInventory = AppInventoryService(guardService: guardService, sizer: sizer)
+    private(set) lazy var appLibrary: AppLibrary = {
+        let library = AppLibrary(removal: guardService)
+        library.onRemoved = { [weak self] in await self?.refreshAfterAppRemoval() }
+        return library
+    }()
     private lazy var orphanedFileScanner = OrphanedFileScanner(guardService: guardService, sizer: sizer)
     private lazy var networkInspector = NetworkInspectorService()
     private lazy var processInspector = ProcessInspectorService(guardService: guardService)
@@ -702,7 +696,6 @@ final class AppModel: ObservableObject {
         self.hasCompletedOnboarding = defaults.object(forKey: PreferenceKey.hasCompletedOnboarding) as? Bool ?? false
         self.showOnboarding = !self.hasCompletedOnboarding
         self.cleanupSafetyProfile = defaults.string(forKey: PreferenceKey.cleanupSafetyProfile).flatMap(CleanupSafetyProfile.init(rawValue:)) ?? .balanced
-        self.uninstallSensitivity = defaults.string(forKey: PreferenceKey.uninstallSensitivity).flatMap(UninstallSensitivityLevel.init(rawValue:)) ?? .enhanced
         self.storageInspectionMode = defaults.string(forKey: PreferenceKey.storageInspectionMode).flatMap(StorageInspectionMode.init(rawValue:)) ?? .visible
         self.storageFocusMode = defaults.string(forKey: PreferenceKey.storageFocusMode).flatMap(StorageFocusMode.init(rawValue:)) ?? .balanced
         self.storageMinimumSize = defaults.string(forKey: PreferenceKey.storageMinimumSize).flatMap(StorageMinimumSizeFilter.init(rawValue:)) ?? .all
@@ -1030,168 +1023,32 @@ final class AppModel: ObservableObject {
         quarantineBusyActionID = nil
     }
 
+    /// Refreshes what a removal can change elsewhere in Warren.
+    func refreshAfterAppRemoval() async {
+        hasLoadedApplications = false
+        if hasLoadedCleanup { await loadCleanup(force: true) }
+        if hasLoadedStorage { await loadStorage(force: true) }
+        await loadApplications(force: true)
+    }
+
     func selectApp(_ app: InstalledApp) async {
         selection = .uninstall
-        selectedApp = app
-        uninstallBusy = true
-        uninstallError = nil
-        uninstallPreview = await defaultPreview(for: app)
-        uninstallBusy = false
+        appLibrary.mode = .uninstall
+        await appLibrary.select(url: app.url)
     }
 
     func reviewTrashedApp(_ app: InstalledApp) async {
-        selection = .uninstall
-        selectedApp = app
-        uninstallBusy = true
-        uninstallError = nil
-        uninstallPreview = await appInventory.previewSmartDelete(for: app, sensitivity: uninstallSensitivity)
-        uninstallBusy = false
-    }
-
-    func previewDefaultRemovalForSelectedApp() async {
-        guard let selectedApp else { return }
-        uninstallBusy = true
-        uninstallError = nil
-        uninstallPreview = await defaultPreview(for: selectedApp)
-        uninstallBusy = false
-    }
-
-    func previewResetForSelectedApp() async {
-        guard let selectedApp, !selectedApp.isInTrash else { return }
-        uninstallBusy = true
-        uninstallError = nil
-        uninstallPreview = await appInventory.previewReset(for: selectedApp, sensitivity: uninstallSensitivity)
-        uninstallBusy = false
-    }
-
-    func refreshSelectedAppPreviewForSensitivity() async {
-        guard let selectedApp else {
-            return
-        }
-
-        uninstallBusy = true
-        uninstallError = nil
-
-        switch uninstallPreview?.mode {
-        case .resetApp:
-            uninstallPreview = await appInventory.previewReset(for: selectedApp, sensitivity: uninstallSensitivity)
-        case .removeLeftoversOnly:
-            uninstallPreview = await appInventory.previewSmartDelete(for: selectedApp, sensitivity: uninstallSensitivity)
-        case .removeAppAndRemnants, .none:
-            uninstallPreview = await defaultPreview(for: selectedApp)
-        }
-
-        uninstallBusy = false
-    }
-
-    func previewDroppedApplication(at url: URL) async {
-        uninstallError = nil
-        selection = .uninstall
-
-        guard let app = await appInventory.inspectApplication(at: url) else {
-            uninstallError = "Drop an installed .app bundle from /Applications or ~/Applications to preview removal safely."
-            return
-        }
-
-        mergeApplication(app)
         await selectApp(app)
     }
 
-    func removeSelectedApp() async {
-        guard let preview = uninstallPreview else { return }
-
-        uninstallBusy = true
-        uninstallError = nil
-
-        do {
-            try await appInventory.remove(preview)
-            selectedApp = nil
-            uninstallPreview = nil
-
-            async let refreshApps: Void = loadApplications(force: true)
-            async let refreshCleanup: Void = loadCleanup(force: true)
-            async let refreshStorage: Void = hasLoadedStorage ? loadStorage(force: true) : ()
-            _ = await (refreshApps, refreshCleanup, refreshStorage)
-        } catch {
-            uninstallError = error.localizedDescription
-        }
-
-        uninstallBusy = false
+    func previewResetForSelectedApp() async {
+        await appLibrary.setMode(.reset)
     }
 
-    func removeApplications(_ apps: [InstalledApp]) async {
-        let uniqueApps = Array(Dictionary(grouping: apps, by: \.id).compactMap(\.value.first))
-        guard !uniqueApps.isEmpty else { return }
-
-        uninstallBusy = true
-        uninstallError = nil
-
-        var failures: [String] = []
-
-        for app in uniqueApps {
-            do {
-                let preview = await defaultPreview(for: app)
-                try await appInventory.remove(preview)
-            } catch {
-                failures.append("\(app.name): \(error.localizedDescription)")
-            }
-        }
-
-        async let refreshApps: Void = loadApplications(force: true)
-        async let refreshCleanup: Void = loadCleanup(force: true)
-        async let refreshStorage: Void = hasLoadedStorage ? loadStorage(force: true) : ()
-        _ = await (refreshApps, refreshCleanup, refreshStorage)
-
-        if failures.isEmpty {
-            optimizationLogs.insert(
-                OptimizationLog(
-                    actionTitle: "Bulk App Removal",
-                    output: "Removed \(uniqueApps.count) app\(uniqueApps.count == 1 ? "" : "s") using preview-safe uninstall flows.",
-                    succeeded: true,
-                    timestamp: .now
-                ),
-                at: 0
-            )
-        } else {
-            uninstallError = failures.joined(separator: "\n")
-            optimizationLogs.insert(
-                OptimizationLog(
-                    actionTitle: "Bulk App Removal",
-                    output: uninstallError ?? "Bulk removal failed.",
-                    succeeded: false,
-                    timestamp: .now
-                ),
-                at: 0
-            )
-        }
-
-        uninstallBusy = false
-    }
-
-    func resetSelectedApp() async {
-        guard let selectedApp else { return }
-
-        uninstallBusy = true
-        uninstallError = nil
-
-        do {
-            let preview: UninstallPreview
-            if let uninstallPreview, uninstallPreview.app.id == selectedApp.id, uninstallPreview.mode == .resetApp {
-                preview = uninstallPreview
-            } else {
-                preview = await appInventory.previewReset(for: selectedApp, sensitivity: uninstallSensitivity)
-            }
-            try await appInventory.remove(preview)
-            uninstallPreview = await defaultPreview(for: selectedApp)
-            await loadCleanup(force: true)
-            if hasLoadedStorage {
-                await loadStorage(force: true)
-            }
-        } catch {
-            uninstallError = error.localizedDescription
-        }
-
-        uninstallBusy = false
+    func previewDroppedApplication(at url: URL) async {
+        selection = .uninstall
+        appLibrary.mode = .uninstall
+        await appLibrary.select(url: url)
     }
 
     func reviewFirstTrashedApplication() async {
@@ -2722,13 +2579,6 @@ final class AppModel: ObservableObject {
             }
         }
 
-        applicationsTask?.cancel()
-        let requestID = UUID()
-        applicationsRequestID = requestID
-
-        uninstallBusy = true
-        uninstallError = nil
-        SKMoleLog.scans.info("Starting application inventory scan")
         applicationDiscoveryProgress = ScanProgress(
             title: "App inventory",
             detail: "Discovering installed apps",
@@ -2736,40 +2586,15 @@ final class AppModel: ObservableObject {
             totalUnits: 1
         )
 
-        let inventory = appInventory
-        let task = Task { [requestID] in
-            await inventory.discoverApplications { progress in
-                await MainActor.run {
-                    guard self.applicationsRequestID == requestID else { return }
-                    self.applicationDiscoveryProgress = progress
-                }
-            }
-        }
-        applicationsTask = task
+        SKMoleLog.scans.info("Starting application inventory scan")
+        let scanned = await appLibrary.rescan()
+        let trashed = AppLibrary.discoverTrashedApplications()
 
-        let discovered = await task.value
-        guard applicationsRequestID == requestID else { return }
-
-        let trashed = await inventory.discoverTrashedApplications()
-        guard applicationsRequestID == requestID else { return }
-
-        applications = discovered
+        applications = scanned.map { InstalledApp(peel: $0) }
         trashedApplications = trashed
-        uninstallBusy = false
-        SKMoleLog.scans.info("Finished application inventory scan with \(discovered.count, privacy: .public) managed apps and \(trashed.count, privacy: .public) trashed apps")
+        SKMoleLog.scans.info("Finished application inventory scan with \(scanned.count, privacy: .public) apps and \(trashed.count, privacy: .public) trashed apps")
         applicationDiscoveryProgress = nil
-        applicationsTask = nil
         hasLoadedApplications = true
-
-        if let selectedApp {
-            if let refreshedSelection = (applications + trashedApplications).first(where: { $0.id == selectedApp.id }) {
-                self.selectedApp = refreshedSelection
-            } else {
-                self.selectedApp = nil
-                self.uninstallPreview = nil
-            }
-        }
-
         updateRecommendedActions()
     }
 
@@ -3618,29 +3443,6 @@ final class AppModel: ObservableObject {
         }
 
         refreshMenuBarCompanionState()
-    }
-
-    private func mergeApplication(_ app: InstalledApp) {
-        var merged = applications.filter { $0.id != app.id }
-        merged.append(app)
-        applications = merged.sorted {
-            let nameComparison = $0.name.localizedCaseInsensitiveCompare($1.name)
-            if nameComparison != .orderedSame {
-                return nameComparison == .orderedAscending
-            }
-
-            return $0.url.path.localizedCaseInsensitiveCompare($1.url.path) == .orderedAscending
-        }
-
-        updateRecommendedActions()
-    }
-
-    private func defaultPreview(for app: InstalledApp) async -> UninstallPreview {
-        if app.isInTrash {
-            return await appInventory.previewSmartDelete(for: app, sensitivity: uninstallSensitivity)
-        }
-
-        return await appInventory.previewRemoval(for: app, sensitivity: uninstallSensitivity)
     }
 
     private func maintenanceReport() -> MaintenanceReport {

@@ -1,11 +1,37 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
+import PeelCore
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// The Uninstaller: the app inventory on the left, the evidence-based removal plan for one app on the right.
 struct UninstallView: View {
     @ObservedObject var model: AppModel
+    @State private var search = ""
+    @State private var filter: AppFilter = .all
+    @State private var sort: AppSort = .name
+    @State private var checkedURLs: Set<URL> = []
     @State private var isDropTargeted = false
-    @State private var selectedAppIDs: Set<String> = []
+    @State private var confirmingRemoval = false
+    @State private var confirmingBulk = false
+
+    private var library: AppLibrary { model.appLibrary }
+
+    enum AppFilter: String, CaseIterable, Identifiable {
+        case all = "All"
+        case intel = "Intel only"
+        case unused = "Unused 90 days"
+        case appStore = "App Store"
+
+        var id: String { rawValue }
+    }
+
+    enum AppSort: String, CaseIterable, Identifiable {
+        case name = "Name"
+        case lastOpened = "Last opened"
+
+        var id: String { rawValue }
+    }
 
     var body: some View {
         HStack(spacing: 22) {
@@ -13,591 +39,566 @@ struct UninstallView: View {
             detailPane
         }
         .padding(28)
-        .onChange(of: (model.applications + model.trashedApplications).map(\.id)) { _, ids in
-            selectedAppIDs = selectedAppIDs.intersection(Set(ids))
+        .task {
+            if library.apps.isEmpty { await model.refreshApplications() }
         }
+        .confirmationDialog(
+            "Move \(library.selection.count) item\(library.selection.count == 1 ? "" : "s") to the Trash?",
+            isPresented: $confirmingRemoval,
+            titleVisibility: .visible
+        ) {
+            Button(library.mode == .reset ? "Reset" : "Move to Trash", role: .destructive) {
+                Task { await library.removeSelection() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(removalMessage)
+        }
+        .confirmationDialog(
+            "Uninstall \(checkedURLs.count) app\(checkedURLs.count == 1 ? "" : "s")?",
+            isPresented: $confirmingBulk,
+            titleVisibility: .visible
+        ) {
+            Button("Move to Trash", role: .destructive) {
+                let urls = Array(checkedURLs)
+                checkedURLs = []
+                Task { await library.removeMany(urls) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Each app and its recommended leftovers move to the Trash. Anything that needs review is kept. You can put everything back from the Trash.")
+        }
+    }
+
+    private var removalMessage: String {
+        let size = library.selectedSize
+        let text = ByteFormatting.format(UInt64(max(0, size.known)))
+        return "About \(size.isComplete ? "" : "at least ")\(text) moves to the Trash. You can put it back from there."
+    }
+
+    // MARK: App list
+
+    private var filteredApps: [PeelCore.InstalledApp] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cutoff = Calendar.current.date(byAdding: .day, value: -90, to: .now) ?? .distantPast
+
+        let matching = library.apps.filter { app in
+            switch filter {
+            case .all: true
+            case .intel: app.isIntelOnly
+            case .unused: (app.lastUsedDate ?? .distantPast) < cutoff && app.isUseRecorded
+            case .appStore: app.isFromAppStore
+            }
+        }.filter { app in
+            query.isEmpty
+                || app.name.localizedCaseInsensitiveContains(query)
+                || (app.bundleIdentifier?.localizedCaseInsensitiveContains(query) ?? false)
+                || (app.developer?.localizedCaseInsensitiveContains(query) ?? false)
+        }
+
+        switch sort {
+        case .name:
+            return matching.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .lastOpened:
+            return matching.sorted { ($0.lastUsedDate ?? .distantPast) < ($1.lastUsedDate ?? .distantPast) }
+        }
+    }
+
+    private var filteredTrashed: [InstalledApp] {
+        let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard filter == .all else { return [] }
+        return model.trashedApplications.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
     }
 
     private var appsPane: some View {
         SectionCard(
-            title: "App inventory",
-            subtitle: "Alphabetized installed apps, plus apps already in Trash for SmartDelete-style leftover review.",
+            title: "Applications",
+            subtitle: "Every installed app with its version, architecture and when you last opened it.",
             symbol: "square.grid.2x2"
         ) {
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    TextField("Search apps", text: $model.appSearch)
+                    TextField("Search apps", text: $search)
                         .textFieldStyle(.roundedBorder)
 
                     Button("Refresh") {
                         Task { await model.refreshApplications() }
                     }
                     .buttonStyle(.bordered)
-                    .disabled(model.uninstallBusy)
+                    .disabled(library.isScanning)
                 }
 
                 HStack {
-                    Text("\(selectedApps.count) selected")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                    Picker("Show", selection: $filter) {
+                        ForEach(AppFilter.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .labelsHidden()
+
+                    Picker("Sort", selection: $sort) {
+                        ForEach(AppSort.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .labelsHidden()
 
                     Spacer()
 
-                    Button("Clear Selection") {
-                        selectedAppIDs.removeAll()
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(selectedAppIDs.isEmpty)
-
-                    Button {
-                        Task {
-                            await model.removeApplications(selectedApps)
-                            selectedAppIDs.removeAll()
-                        }
-                    } label: {
-                        Label("Remove Selected", systemImage: "trash")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(selectedApps.isEmpty || model.uninstallBusy)
+                    if library.isScanning { ProgressView().controlSize(.small) }
                 }
 
-                if let applicationDiscoveryProgress = model.applicationDiscoveryProgress {
-                    InlineScanProgressView(progress: applicationDiscoveryProgress, tint: AppPalette.sky)
+                if !checkedURLs.isEmpty {
+                    HStack {
+                        Text("\(checkedURLs.count) checked")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Clear") { checkedURLs = [] }
+                            .buttonStyle(.bordered)
+                        Button {
+                            confirmingBulk = true
+                        } label: {
+                            Label("Uninstall Checked", systemImage: "trash")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(library.isRemoving)
+                    }
+                }
+
+                if let note = library.scanNote {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(AppPalette.amber)
                 }
 
                 dropZone
 
-                if let uninstallError = model.uninstallError {
-                    Text(uninstallError)
-                        .foregroundStyle(AppPalette.rose)
-                        .font(.subheadline)
-                }
-
-                if model.filteredApplications.isEmpty && model.filteredTrashedApplications.isEmpty {
-                    ContentUnavailableView(
-                        "No Matching Apps",
-                        systemImage: "xmark.app",
-                        description: Text("Try a different search or refresh the app inventory.")
-                    )
-                    .frame(minHeight: 320)
-                } else {
-                    List {
-                        if !model.filteredApplications.isEmpty {
-                            Section("Installed") {
-                                ForEach(model.filteredApplications) { app in
-                                    appRow(app)
-                                }
-                            }
+                List {
+                    Section("Installed (\(filteredApps.count))") {
+                        ForEach(filteredApps) { app in
+                            appRow(app)
                         }
+                    }
 
-                        if !model.filteredTrashedApplications.isEmpty {
-                            Section("Apps Already in Trash") {
-                                ForEach(model.filteredTrashedApplications) { app in
-                                    appRow(app)
-                                }
+                    if !filteredTrashed.isEmpty {
+                        Section("Apps already in the Trash") {
+                            ForEach(filteredTrashed) { app in
+                                trashedRow(app)
                             }
                         }
                     }
-                    .frame(minHeight: 420)
                 }
+                .frame(minHeight: 420)
             }
         }
-        .frame(minWidth: 390)
+        .frame(minWidth: 400)
     }
 
-    private var detailPane: some View {
-        SectionCard(
-            title: "Removal preview",
-            subtitle: "Preview a full uninstall, a SmartDelete leftover pass, or a reset that only clears user-domain app data.",
-            symbol: "magnifyingglass.circle"
-        ) {
-            Group {
-                if selectedApps.count > 1 {
-                    bulkSelectionSummary
-                } else if let app = model.selectedApp {
-                    VStack(alignment: .leading, spacing: 16) {
-                        HStack(alignment: .top) {
-                            HStack(alignment: .top, spacing: 14) {
-                                AppIconThumbnail(url: app.url, size: 58, cornerRadius: 14)
-
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(app.name)
-                                        .font(.system(size: 28, weight: .bold, design: .rounded))
-                                    Text(app.bundleIdentifier ?? "No bundle identifier found")
-                                        .foregroundStyle(.secondary)
-                                    Text(app.url.path)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-
-                            Spacer()
-
-                            Pill(
-                                title: app.location.title,
-                                tint: app.isInTrash ? AppPalette.amber : AppPalette.accent
-                            )
-
-                            Button {
-                                model.reveal(app.url)
-                            } label: {
-                                Label("Reveal App", systemImage: "eye")
-                            }
-                            .buttonStyle(.bordered)
-                        }
-
-                        if let preview = model.uninstallPreview {
-                            if !app.isInTrash {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    Picker(
-                                        "Uninstall depth",
-                                        selection: Binding(
-                                            get: { model.uninstallSensitivity },
-                                            set: { newValue in
-                                                model.uninstallSensitivity = newValue
-                                                Task { await model.refreshSelectedAppPreviewForSensitivity() }
-                                            }
-                                        )
-                                    ) {
-                                        ForEach(UninstallSensitivityLevel.allCases) { level in
-                                            Text(level.title).tag(level)
-                                        }
-                                    }
-                                    .pickerStyle(.segmented)
-
-                                    Text(model.uninstallSensitivity.subtitle)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-
-                                    HStack(spacing: 10) {
-                                        previewModeButton(
-                                            title: "Uninstall Preview",
-                                            symbol: "xmark.app",
-                                            isSelected: preview.mode == .removeAppAndRemnants
-                                        ) {
-                                            Task { await model.previewDefaultRemovalForSelectedApp() }
-                                        }
-                                        .disabled(model.uninstallBusy)
-
-                                        previewModeButton(
-                                            title: "Reset Preview",
-                                            symbol: "arrow.counterclockwise",
-                                            isSelected: preview.mode == .resetApp
-                                        ) {
-                                            Task { await model.previewResetForSelectedApp() }
-                                        }
-                                        .disabled(model.uninstallBusy)
-                                    }
-                                }
-                            } else {
-                                Text("This app is already in Trash, so Warren will only review and remove leftovers that still live outside Trash.")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            HStack(spacing: 20) {
-                                metricBlock(ByteFormatting.format(preview.removableBytes), primaryMetricSubtitle(for: preview))
-                                metricBlock("\(preview.remnants.count)", remnantsMetricSubtitle(for: preview))
-                                metricBlock("\(preview.associatedItems.count)", "related items")
-                                metricBlock(preview.sensitivity.title, "preview depth")
-                                Spacer()
-                            }
-
-                            if !preview.associatedItems.isEmpty {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    Text("Related extensions and login items")
-                                        .font(.headline)
-
-                                    ForEach(preview.associatedItems) { item in
-                                        HStack(alignment: .center, spacing: 14) {
-                                            Image(systemName: item.symbol)
-                                                .foregroundStyle(item.disposition == .removedWithAppBundle ? AppPalette.accent : AppPalette.amber)
-                                                .frame(width: 28)
-
-                                            VStack(alignment: .leading, spacing: 4) {
-                                                Text(item.displayName)
-                                                    .font(.headline)
-                                                Text("\(ByteFormatting.format(item.sizeBytes)) • \(item.rationale)")
-                                                    .font(.subheadline)
-                                                    .foregroundStyle(.secondary)
-                                            }
-
-                                            Spacer()
-
-                                            Pill(
-                                                title: item.disposition.title,
-                                                tint: item.disposition == .removedWithAppBundle ? AppPalette.accent : AppPalette.amber
-                                            )
-
-                                            ActionIconButton(symbol: "eye", label: "Reveal \(item.displayName)") {
-                                                model.reveal(item.url)
-                                            }
-                                        }
-                                        .padding(14)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                                .fill(AppPalette.secondaryCard.opacity(0.7))
-                                        )
-                                    }
-                                }
-                            }
-
-                            if preview.remnants.isEmpty {
-                                Text("No user-domain remnants were found for this app.")
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    Text("User-domain remnants")
-                                        .font(.headline)
-
-                                    ForEach(preview.remnants) { remnant in
-                                        HStack {
-                                            VStack(alignment: .leading, spacing: 4) {
-                                                Text(remnant.displayName)
-                                                    .font(.headline)
-                                                Text("\(ByteFormatting.format(remnant.sizeBytes)) • \(remnant.rationale)")
-                                                    .font(.subheadline)
-                                                    .foregroundStyle(.secondary)
-                                            }
-
-                                            Spacer()
-
-                                            ActionIconButton(symbol: "eye", label: "Reveal \(remnant.displayName)") {
-                                                model.reveal(remnant.url)
-                                            }
-                                        }
-                                        .padding(14)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                                                .fill(AppPalette.secondaryCard.opacity(0.7))
-                                        )
-                                    }
-                                }
-                            }
-
-                            HStack {
-                                Button {
-                                    Task { await model.removeSelectedApp() }
-                                } label: {
-                                    Label(preview.mode.actionTitle, systemImage: primaryActionSymbol(for: preview.mode))
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(!canApply(preview) || model.uninstallBusy)
-
-                                if !app.isInTrash && preview.mode == .removeAppAndRemnants {
-                                    Button {
-                                        Task {
-                                            await model.previewResetForSelectedApp()
-                                        }
-                                    } label: {
-                                        Label("Preview Reset Instead", systemImage: "arrow.counterclockwise")
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .disabled(model.uninstallBusy)
-                                }
-
-                                if model.uninstallBusy {
-                                    ProgressView()
-                                }
-                            }
-                        } else {
-                            ProgressView("Resolving remnants...")
-                        }
-                    }
-                } else {
-                    Text("Select an app or drop an installed `.app` bundle to inspect its removable support files.")
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-    }
-
-    private var dropZone: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: "square.and.arrow.down.on.square")
-                    .foregroundStyle(isDropTargeted ? AppPalette.accent : .secondary)
-                Text("Drop an installed `.app` here to preview uninstall")
-                .font(.subheadline.weight(.semibold))
-                Spacer()
-            }
-
-            Text("This mirrors the fast AppCleaner-style workflow, Finder can send `.app` bundles here through `Open With Warren`, and apps already in Trash show up separately for SmartDelete review.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(
-                    isDropTargeted ? AppPalette.accent : Color.primary.opacity(0.12),
-                    style: StrokeStyle(lineWidth: 1.5, dash: [8, 6])
-                )
-                .background(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(isDropTargeted ? AppPalette.accent.opacity(0.08) : AppPalette.secondaryCard.opacity(0.45))
-                )
-        )
-        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $isDropTargeted, perform: handleDrop(providers:))
-    }
-
-    private func metricBlock(_ value: String, _ subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(value)
-                .font(.title2.weight(.bold))
-            Text(subtitle)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private func appRow(_ app: InstalledApp) -> some View {
-        HStack(spacing: 12) {
+    private func appRow(_ app: PeelCore.InstalledApp) -> some View {
+        HStack(spacing: 10) {
             SelectionCircleButton(
-                isSelected: selectedAppIDs.contains(app.id),
-                accessibilityLabel: "Select \(app.name)",
-                action: {
-                    toggleSelection(for: app)
-                }
-            )
-            .disabled(app.isProtected)
+                isSelected: checkedURLs.contains(app.url),
+                accessibilityLabel: "Check \(app.name)"
+            ) {
+                if checkedURLs.contains(app.url) { checkedURLs.remove(app.url) } else { checkedURLs.insert(app.url) }
+            }
+            .disabled(app.isSystemProtected)
 
             Button {
-                Task { await model.selectApp(app) }
+                Task { await library.select(url: app.url) }
             } label: {
-                HStack(spacing: 12) {
-                    AppIconThumbnail(url: app.url, size: 42, cornerRadius: 11)
+                HStack(spacing: 10) {
+                    AppIconThumbnail(url: app.url, size: 34, cornerRadius: 8)
 
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(app.name)
-                            .font(.headline)
-                        Text(ByteFormatting.format(app.sizeBytes))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(app.name).font(.headline)
+                        Text(subtitle(for: app))
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
                     }
 
                     Spacer()
+
+                    if app.isIntelOnly {
+                        Pill(title: "Intel", tint: AppPalette.amber)
+                    } else if app.prefersIntel {
+                        Pill(title: "Rosetta", tint: AppPalette.sky)
+                    }
+
+                    if app.isSystemProtected {
+                        Pill(title: "macOS", tint: AppPalette.rose)
+                    }
                 }
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-
-            if app.isInTrash {
-                Pill(title: "Trash", tint: AppPalette.amber)
-            }
-
-            if app.isRunning {
-                Pill(title: "Running", tint: AppPalette.sky)
-            }
-
-            if app.isProtected {
-                Pill(title: "Protected", tint: AppPalette.rose)
-            }
         }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 8)
+        .padding(.vertical, 2)
+        .listRowBackground(library.selectedURL == app.url ? AppPalette.accent.opacity(0.16) : Color.clear)
+    }
+
+    private func trashedRow(_ app: InstalledApp) -> some View {
+        Button {
+            Task { await library.select(url: app.url) }
+        } label: {
+            HStack(spacing: 10) {
+                AppIconThumbnail(url: app.url, size: 34, cornerRadius: 8)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(app.name).font(.headline)
+                    Text("In the Trash. Review what it left behind.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .listRowBackground(library.selectedURL == app.url ? AppPalette.accent.opacity(0.16) : Color.clear)
+    }
+
+    private func subtitle(for app: PeelCore.InstalledApp) -> String {
+        var parts: [String] = []
+        if let version = app.version { parts.append(version) }
+        if let date = app.lastUsedDate, app.isUseRecorded {
+            parts.append("opened \(DateFormatting.relativeString(from: date))")
+        } else if app.isUseRecorded == false {
+            parts.append("no open recorded")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var dropZone: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.down.app")
+            Text("Drop an app here to review its removal")
+                .font(.subheadline)
+        }
+        .foregroundStyle(isDropTargeted ? AppPalette.accent : .secondary)
+        .frame(maxWidth: .infinity)
+        .padding(12)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(rowHighlight(for: app))
+                .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [5]))
+                .foregroundStyle(isDropTargeted ? AppPalette.accent : Color.secondary.opacity(0.4))
         )
+        .onDrop(of: [UTType.fileURL], isTargeted: $isDropTargeted) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.pathExtension.lowercased() == "app" else { return }
+                Task { @MainActor in await library.select(url: url) }
+            }
+            return true
+        }
     }
 
-    private var selectedApps: [InstalledApp] {
-        let allApps = model.applications + model.trashedApplications
-        return allApps.filter { selectedAppIDs.contains($0.id) }
+    // MARK: Detail
+
+    private var detailPane: some View {
+        SectionCard(
+            title: library.mode == .reset ? "Reset plan" : "Removal plan",
+            subtitle: "Every file is listed with the reason Warren ties it to the app. Nothing is deleted: items move to the Trash.",
+            symbol: "trash.slash"
+        ) {
+            if let app = library.selectedApp {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        header(for: app)
+                        messages
+                        if library.isPreparing {
+                            HStack { ProgressView(); Text("Looking for everything this app left on your Mac…").foregroundStyle(.secondary) }
+                        } else if let plan = library.uninstallation, library.mode == .uninstall {
+                            uninstallPlan(plan)
+                        } else if let plan = library.reset, library.mode == .reset {
+                            resetPlan(plan)
+                        }
+                    }
+                }
+                .frame(minHeight: 480)
+            } else {
+                ContentUnavailableView(
+                    "Select an App",
+                    systemImage: "xmark.app",
+                    description: Text("Choose an app to see its files, why each belongs to it, and what is safe to move to the Trash.")
+                )
+                .frame(minHeight: 480)
+            }
+        }
+        .frame(minWidth: 520)
     }
 
-    private var bulkSelectionSummary: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("\(selectedApps.count)")
-                        .font(.system(size: 30, weight: .bold, design: .rounded))
-                    Text("apps selected for bulk removal")
+    @ViewBuilder
+    private var messages: some View {
+        if let message = library.resultMessage {
+            Label(message, systemImage: "checkmark.circle.fill")
+                .font(.subheadline)
+                .foregroundStyle(AppPalette.mint)
+        }
+
+        if let error = library.errorMessage {
+            Text(error)
+                .font(.subheadline)
+                .foregroundStyle(AppPalette.rose)
+        }
+    }
+
+    private func header(for app: PeelCore.InstalledApp) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 14) {
+                AppIconThumbnail(url: app.url, size: 56, cornerRadius: 14)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(app.name).font(.title2.weight(.bold))
+                    Text([app.version.map { "Version \($0)" }, app.developer].compactMap(\.self).joined(separator: " · "))
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
+                    Text(app.url.path)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
 
                 Spacer()
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(ByteFormatting.format(selectedApps.reduce(into: UInt64(0)) { $0 += $1.sizeBytes }))
-                        .font(.system(size: 24, weight: .bold, design: .rounded))
-                    Text("combined app bundle size")
-                        .foregroundStyle(.secondary)
+                ActionIconButton(symbol: "eye", label: "Reveal \(app.name)") { model.reveal(app.url) }
+            }
+
+            HStack(spacing: 8) {
+                Pill(title: architectureTitle(app), tint: app.isIntelOnly ? AppPalette.amber : AppPalette.mint)
+                if app.prefersIntel { Pill(title: "Runs through Rosetta", tint: AppPalette.sky) }
+                if app.isFromAppStore { Pill(title: "App Store", tint: AppPalette.accent) }
+                if app.isSystemProtected { Pill(title: "Part of macOS", tint: AppPalette.rose) }
+                if !library.runningInstances.isEmpty { Pill(title: "Running", tint: AppPalette.amber) }
+                if let date = app.lastUsedDate, app.isUseRecorded {
+                    Pill(title: "Opened \(DateFormatting.relativeString(from: date))", tint: AppPalette.sky)
                 }
             }
 
-            Text("Bulk removal still uses the same preview-safe uninstall flow under the hood for each selected app. Protected apps cannot be selected here, and apps already in Trash will only have leftovers removed.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+            if library.selectedApp.map({ !library.isInTrash($0) }) ?? true {
+                Picker("Mode", selection: Binding(
+                    get: { library.mode },
+                    set: { newValue in Task { await library.setMode(newValue) } }
+                )) {
+                    Text("Uninstall").tag(AppLibrary.Mode.uninstall)
+                    Text("Reset settings").tag(AppLibrary.Mode.reset)
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 320)
+            }
+        }
+    }
 
-            Text("Current depth: \(model.uninstallSensitivity.title) — \(model.uninstallSensitivity.subtitle)")
+    private func architectureTitle(_ app: PeelCore.InstalledApp) -> String {
+        if app.isIntelOnly { return "Intel only" }
+        if app.architectures.contains(.arm64) && app.architectures.contains(.x86_64) { return "Universal" }
+        return "Apple silicon"
+    }
+
+    // MARK: Uninstall plan
+
+    @ViewBuilder
+    private func uninstallPlan(_ plan: Uninstallation) -> some View {
+        if plan.appStays(canUseHelper: false) {
+            Label(stayReason(plan), systemImage: "hand.raised")
+                .font(.subheadline)
+                .foregroundStyle(AppPalette.amber)
+        }
+
+        if plan.uninstallsItself != nil {
+            Label("This app has its own uninstaller that Warren lets run, so it may remove more than listed here.", systemImage: "info.circle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(selectedApps.prefix(10)) { app in
-                    HStack {
-                        AppIconThumbnail(url: app.url, size: 30, cornerRadius: 8)
-                        Text(app.name)
-                            .font(.headline)
-                        Spacer()
-                        Text(ByteFormatting.format(app.sizeBytes))
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            HStack(spacing: 12) {
-                Button {
-                    Task {
-                        await model.removeApplications(selectedApps)
-                        selectedAppIDs.removeAll()
-                    }
-                } label: {
-                    Label("Move Selected Apps to Trash", systemImage: "trash")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(selectedApps.isEmpty || model.uninstallBusy)
-
-                Button("Clear Selection") {
-                    selectedAppIDs.removeAll()
-                }
-                .buttonStyle(.bordered)
-                .disabled(model.uninstallBusy)
-
-                if model.uninstallBusy {
-                    ProgressView()
-                }
-            }
         }
+
+        let recommended = plan.scan.leftovers.filter { $0.match.isRecommended && $0.match.heldBack?.cannotBeMoved != true }
+        let review = plan.scan.leftovers.filter { !$0.match.isRecommended && $0.match.heldBack?.cannotBeMoved != true }
+        let kept = plan.scan.leftovers.filter { $0.match.heldBack?.cannotBeMoved == true }
+
+        VStack(alignment: .leading, spacing: 10) {
+            Text("The app")
+                .font(.headline)
+            itemRow(
+                url: plan.app.url,
+                title: plan.app.name + ".app",
+                detail: "The app itself.",
+                size: plan.isAppMeasured ? plan.appSize : nil,
+                confidence: nil,
+                note: plan.isAppInTheTrash ? "Already in the Trash." : nil,
+                selectable: library.selectableURLs.contains(plan.app.url)
+            )
+        }
+
+        leftoverSection("Recommended leftovers", subtitle: "Certainly or very likely this app's own files.", items: recommended)
+        leftoverSection("Review before removing", subtitle: "Only the name or a shared place ties these to the app. Tick what you recognise.", items: review)
+        leftoverSection("Kept", subtitle: "Warren will not move these.", items: kept)
+
+        if recommended.isEmpty && review.isEmpty && kept.isEmpty {
+            Text("No leftover files were found. Only the app itself is listed.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+
+        actionBar(buttonTitle: "Move to Trash")
     }
 
-    private func toggleSelection(for app: InstalledApp) {
-        if selectedAppIDs.contains(app.id) {
-            selectedAppIDs.remove(app.id)
-        } else {
-            selectedAppIDs.insert(app.id)
-        }
-    }
-
-    private func rowHighlight(for app: InstalledApp) -> Color {
-        if selectedAppIDs.contains(app.id) {
-            return AppPalette.accent.opacity(0.16)
-        }
-
-        if model.selectedApp?.id == app.id {
-            return AppPalette.sky.opacity(0.12)
-        }
-
-        return .clear
-    }
-
-    private func primaryMetricSubtitle(for preview: UninstallPreview) -> String {
-        switch preview.mode {
-        case .removeAppAndRemnants:
-            "bundle + removable remnants"
-        case .resetApp:
-            "resettable app data"
-        case .removeLeftoversOnly:
-            "leftovers outside Trash"
-        }
-    }
-
-    private func remnantsMetricSubtitle(for preview: UninstallPreview) -> String {
-        switch preview.mode {
-        case .removeLeftoversOnly:
-            "leftover items"
-        case .removeAppAndRemnants, .resetApp:
-            "user-domain remnants"
-        }
-    }
-
-    private func primaryActionSymbol(for mode: UninstallPreviewMode) -> String {
-        switch mode {
-        case .resetApp:
-            "arrow.counterclockwise"
-        case .removeAppAndRemnants, .removeLeftoversOnly:
-            "trash"
-        }
-    }
-
-    private func canApply(_ preview: UninstallPreview) -> Bool {
-        guard !preview.app.isProtected else {
-            return false
-        }
-
-        switch preview.mode {
-        case .removeAppAndRemnants:
-            return true
-        case .resetApp, .removeLeftoversOnly:
-            return !preview.remnants.isEmpty
-        }
+    private func stayReason(_ plan: Uninstallation) -> String {
+        if plan.app.isSystemProtected { return "This app is part of macOS, so Warren leaves it in place." }
+        if plan.isExcluded { return "You excluded this app, so Warren leaves it in place." }
+        if plan.app.enclosingPackage != nil { return "This app belongs to another package, so Warren leaves it in place." }
+        return "Warren leaves this app in place; its files are not offered as leftovers."
     }
 
     @ViewBuilder
-    private func previewModeButton(
+    private func leftoverSection(_ title: String, subtitle: String, items: [Leftover]) -> some View {
+        if !items.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(title).font(.headline)
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+
+                ForEach(items) { leftover in
+                    itemRow(
+                        url: leftover.url,
+                        title: leftover.url.lastPathComponent,
+                        detail: "\(LeftoverText.kind(leftover.kind)) · \(LeftoverText.why(leftover.match))",
+                        size: leftover.isMeasured ? leftover.size : nil,
+                        confidence: LeftoverText.confidence(leftover.match),
+                        note: leftover.match.heldBack.map(LeftoverText.heldBack),
+                        selectable: library.selectableURLs.contains(leftover.url)
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: Reset plan
+
+    @ViewBuilder
+    private func resetPlan(_ plan: AppReset) -> some View {
+        Text("Clears the app's saved state so it starts fresh. Your settings are backed up first, and everything moves to the Trash.")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+
+        ForEach(AppReset.Group.allCases, id: \.self) { group in
+            let items = plan.items(in: group)
+            if !items.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(resetTitle(group)).font(.headline)
+                    ForEach(items) { item in
+                        itemRow(
+                            url: item.url,
+                            title: item.url.lastPathComponent,
+                            detail: LeftoverText.kind(item.kind),
+                            size: item.size,
+                            confidence: nil,
+                            note: nil,
+                            selectable: true
+                        )
+                    }
+                }
+            }
+        }
+
+        if plan.items.isEmpty {
+            Text("There is nothing to reset for this app.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+
+        Toggle("Also reset this app's privacy permissions", isOn: Binding(get: { library.resetPrivacy }, set: { library.resetPrivacy = $0 }))
+            .font(.subheadline)
+
+        actionBar(buttonTitle: "Reset")
+    }
+
+    private func resetTitle(_ group: AppReset.Group) -> String {
+        switch group {
+        case .settings: "Settings and saved state"
+        case .webData: "Web data"
+        case .appData: "App data"
+        }
+    }
+
+    // MARK: Rows and actions
+
+    private func itemRow(
+        url: URL,
         title: String,
-        symbol: String,
-        isSelected: Bool,
-        action: @escaping () -> Void
+        detail: String,
+        size: Int64?,
+        confidence: String?,
+        note: String?,
+        selectable: Bool
     ) -> some View {
-        if isSelected {
-            Button(action: action) {
-                Label(title, systemImage: symbol)
+        HStack(alignment: .top, spacing: 12) {
+            SelectionCircleButton(
+                isSelected: library.selection.contains(url),
+                accessibilityLabel: "Select \(title)"
+            ) {
+                library.toggle(url)
             }
-            .buttonStyle(.borderedProminent)
-        } else {
-            Button(action: action) {
-                Label(title, systemImage: symbol)
+            .disabled(!selectable)
+
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 8) {
+                    Text(title).font(.headline)
+                    if let confidence { Pill(title: confidence, tint: confidence == "Certain" ? AppPalette.mint : AppPalette.amber) }
+                }
+                Text(detail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Text(url.path)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let note {
+                    Text(note).font(.caption).foregroundStyle(AppPalette.amber)
+                }
             }
-            .buttonStyle(.bordered)
+
+            Spacer()
+
+            Text(size.map { ByteFormatting.format(UInt64(max(0, $0))) } ?? "unknown")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            ActionIconButton(symbol: "eye", label: "Reveal \(title)") { model.reveal(url) }
         }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(library.selection.contains(url) ? AppPalette.accent.opacity(0.14) : AppPalette.secondaryCard.opacity(0.7))
+        )
     }
 
-    private func handleDrop(providers: [NSItemProvider]) -> Bool {
-        let candidates = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
-        guard !candidates.isEmpty else {
-            return false
-        }
+    private func actionBar(buttonTitle: String) -> some View {
+        let size = library.selectedSize
+        return VStack(alignment: .leading, spacing: 10) {
+            Divider()
 
-        Task {
-            for provider in candidates {
-                if let url = await loadDroppedFileURL(from: provider) {
-                    await model.previewDroppedApplication(at: url)
-                    break
+            HStack {
+                Text("\(library.selection.count) selected · \(size.isComplete ? "" : "at least ")\(ByteFormatting.format(UInt64(max(0, size.known))))")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button("Recommended") { library.selectRecommended() }.buttonStyle(.bordered)
+                Button("All") { library.selectAll() }.buttonStyle(.bordered)
+                Button("None") { library.selectNone() }.buttonStyle(.bordered)
+
+                Button {
+                    confirmingRemoval = true
+                } label: {
+                    Label(buttonTitle, systemImage: "trash")
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(library.selection.isEmpty || library.isRemoving)
+
+                if library.isRemoving { ProgressView().controlSize(.small) }
             }
-        }
 
-        return true
-    }
-
-    private func loadDroppedFileURL(from provider: NSItemProvider) async -> URL? {
-        await withCheckedContinuation { continuation in
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-                if let url = item as? URL {
-                    continuation.resume(returning: url)
-                    return
-                }
-
-                if let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    continuation.resume(returning: url)
-                    return
-                }
-
-                if let nsURL = item as? NSURL, let url = nsURL as URL? {
-                    continuation.resume(returning: url)
-                    return
-                }
-
-                if let string = item as? String, let url = URL(string: string) {
-                    continuation.resume(returning: url)
-                    return
-                }
-
-                continuation.resume(returning: nil)
+            if !library.runningInstances.isEmpty {
+                Text("The app is running. Warren quits it first.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
     }

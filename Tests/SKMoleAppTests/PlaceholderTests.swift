@@ -281,11 +281,6 @@ import SKMoleShared
     #expect(store.filteredDeferredItems.map(\.id) == [manual.id])
 }
 
-@Test func uninstallSensitivityCatalogRemainsStable() async throws {
-    #expect(UninstallSensitivityLevel.allCases.map(\.rawValue) == ["strict", "enhanced", "deep"])
-    #expect(UninstallSensitivityLevel.deep.subtitle.contains("wider"))
-}
-
 @Test func scheduledMaintenanceFormatMapsToExporter() async throws {
     #expect(ScheduledMaintenanceExportFormat.markdown.pluginID == .overviewMarkdown)
     #expect(ScheduledMaintenanceExportFormat.json.pluginID == .dryRunJSON)

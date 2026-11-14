@@ -98,46 +98,6 @@ struct SettingsView: View {
                 }
 
                 SectionCard(
-                    title: "Uninstall Depth",
-                    subtitle: "Choose how aggressively Warren should look for related app leftovers before it builds an uninstall preview.",
-                    symbol: "xmark.app"
-                ) {
-                    VStack(alignment: .leading, spacing: 14) {
-                        Picker(
-                            "Preview depth",
-                            selection: Binding(
-                                get: { model.uninstallSensitivity },
-                                set: { newValue in
-                                    model.uninstallSensitivity = newValue
-                                    Task { await model.refreshSelectedAppPreviewForSensitivity() }
-                                }
-                            )
-                        ) {
-                            ForEach(UninstallSensitivityLevel.allCases) { level in
-                                Text(level.title).tag(level)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(UninstallSensitivityLevel.allCases) { level in
-                                HStack(alignment: .top, spacing: 10) {
-                                    Image(systemName: level == model.uninstallSensitivity ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(level == model.uninstallSensitivity ? AppPalette.accent : .secondary)
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(level.title)
-                                            .font(.headline)
-                                        Text(level.subtitle)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                SectionCard(
                     title: "Sidebar",
                     subtitle: "Choose which tools appear in the sidebar. Hidden tools stay reachable from the menu bar, the Sections menu and links.",
                     symbol: "sidebar.left"

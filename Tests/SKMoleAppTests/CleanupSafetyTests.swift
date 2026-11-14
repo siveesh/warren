@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import PeelCore
 @testable import SKMoleApp
 
 private func candidate(_ path: String, safety: SafetyLevel) -> CleanupCandidate {
@@ -197,4 +198,9 @@ private let sparkleFixture = """
     #expect(restored.isExpanded(.apps))
     #expect(!restored.visibleSections(in: .storage, selection: .dashboard).contains(.cleanup))
     #expect(restored.visibleSections(in: .storage, selection: .cleanup).contains(.cleanup))
+}
+
+@Test func leftoverTextHumanizesEngineNames() {
+    #expect(LeftoverText.humanize("applicationSupport") == "Application support")
+    #expect(LeftoverText.humanize("holdsALibrary") == "Holds a library")
 }

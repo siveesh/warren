@@ -104,7 +104,7 @@ struct MenuBarPanelView: View {
             quickStatCard(
                 title: "Apps",
                 value: "\(model.uninstallableAppsCount)",
-                subtitle: model.uninstallBusy ? "refreshing..." : "tracked",
+                subtitle: model.applicationDiscoveryProgress != nil ? "refreshing..." : "tracked",
                 symbol: "xmark.app"
             )
         }

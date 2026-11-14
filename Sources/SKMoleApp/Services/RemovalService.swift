@@ -12,7 +12,7 @@ struct GuardedFileIdentity: Equatable, Sendable {
 /// guard: it decides what is never removed, journals every move for History and Put Back, and checks each item again
 /// right before it moves. `RemovalScope` only limits where a feature may look.
 final class RemovalService: Sendable {
-    private let engine: TrashService
+    let engine: TrashService
     private let scope: RemovalScope
     private let profile = Mutex<CleanupSafetyProfile>(.balanced)
 
