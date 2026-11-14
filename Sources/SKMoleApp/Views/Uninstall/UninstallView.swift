@@ -47,7 +47,7 @@ struct UninstallView: View {
             isPresented: $confirmingRemoval,
             titleVisibility: .visible
         ) {
-            Button(library.mode == .reset ? "Reset" : "Move to Trash", role: .destructive) {
+            Button(confirmTitle, role: .destructive) {
                 Task { await library.removeSelection() }
             }
             Button("Cancel", role: .cancel) {}
@@ -70,10 +70,23 @@ struct UninstallView: View {
         }
     }
 
+    private var confirmTitle: String {
+        if library.mode == .reset { return "Reset" }
+        return library.selectedPrivilegedURLs.isEmpty ? "Move to Trash" : "Approve and Move to Trash"
+    }
+
     private var removalMessage: String {
         let size = library.selectedSize
         let text = ByteFormatting.format(UInt64(max(0, size.known)))
-        return "About \(size.isComplete ? "" : "at least ")\(text) moves to the Trash. You can put it back from there."
+        var message = "About \(size.isComplete ? "" : "at least ")\(text) moves to the Trash. You can put it back from there."
+
+        let privileged = library.selectedPrivilegedURLs
+        if !privileged.isEmpty {
+            let names = privileged.prefix(5).map(\.lastPathComponent).joined(separator: ", ")
+            message += "\n\n\(privileged.count) item\(privileged.count == 1 ? "" : "s") need administrator rights (\(names)\(privileged.count > 5 ? ", ..." : "")). macOS will ask for your password or Touch ID before they move."
+        }
+
+        return message
     }
 
     // MARK: App list
@@ -461,12 +474,19 @@ struct UninstallView: View {
                         detail: "\(LeftoverText.kind(leftover.kind)) · \(LeftoverText.why(leftover.match))",
                         size: leftover.isMeasured ? leftover.size : nil,
                         confidence: LeftoverText.confidence(leftover.match),
-                        note: leftover.match.heldBack.map(LeftoverText.heldBack),
+                        note: leftover.match.heldBack.map(LeftoverText.heldBack) ?? adminNote(for: leftover),
                         selectable: library.selectableURLs.contains(leftover.url)
                     )
                 }
             }
         }
+    }
+
+    private func adminNote(for leftover: Leftover) -> String? {
+        guard leftover.requiresPrivileges else { return nil }
+        return AdministratorRights.current == .askEachTime
+            ? "Needs administrator rights. You will be asked to approve it."
+            : "Needs administrator rights, which are turned off in Settings."
     }
 
     // MARK: Reset plan

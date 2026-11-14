@@ -236,11 +236,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    @Published var orphanedFiles: [OrphanedFileCandidate] = []
-    @Published var orphanedFilesBusy = false
-    @Published var orphanedFilesError: String?
-    @Published var orphanedFilesProgress: ScanProgress?
-    @Published var orphanedFilesSearch = ""
 
     @Published var startupItems: [StartupItem] = []
     @Published var startupItemsBusy = false
@@ -278,7 +273,7 @@ final class AppModel: ObservableObject {
         library.onRemoved = { [weak self] in await self?.refreshAfterAppRemoval() }
         return library
     }()
-    private lazy var orphanedFileScanner = OrphanedFileScanner(guardService: guardService, sizer: sizer)
+    private(set) lazy var orphanLibrary: OrphanLibrary = makeOrphanLibrary()
     private lazy var networkInspector = NetworkInspectorService()
     private lazy var processInspector = ProcessInspectorService(guardService: guardService)
     private lazy var quarantineAudit = QuarantineAuditService(guardService: guardService, sizer: sizer)
@@ -318,7 +313,6 @@ final class AppModel: ObservableObject {
     private var cleanupRequestID = UUID()
     private var applicationsRequestID = UUID()
     private var updatesRequestID = UUID()
-    private var orphanedFilesRequestID = UUID()
     private var storageRequestID = UUID()
     private var networkRequestID = UUID()
     private var processRequestID = UUID()
@@ -332,7 +326,6 @@ final class AppModel: ObservableObject {
     private var cleanupTask: Task<[CleanupCategorySummary], Never>?
     private var applicationsTask: Task<[InstalledApp], Never>?
     private var updatesTask: Task<AppUpdateReport, Never>?
-    private var orphanedFilesTask: Task<[OrphanedFileCandidate], Never>?
     private var storageTask: Task<StorageReport, Never>?
     private var networkTask: Task<NetworkInspectorReport, Never>?
     private var processTask: Task<[NativeProcessActivity], Never>?
@@ -633,19 +626,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    var filteredOrphanedFiles: [OrphanedFileCandidate] {
-        let query = orphanedFilesSearch.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return orphanedFiles }
-
-        return orphanedFiles.filter {
-            $0.displayName.localizedCaseInsensitiveContains(query)
-                || $0.identifierToken.localizedCaseInsensitiveContains(query)
-                || $0.url.path.localizedCaseInsensitiveContains(query)
-        }
-    }
-
     var orphanedFileBytes: UInt64 {
-        orphanedFiles.reduce(into: 0) { $0 += $1.sizeBytes }
+        orphanLibrary.movableBytes
     }
 
     var startupItemsByKind: [(StartupItemKind, [StartupItem])] {
@@ -896,27 +878,6 @@ final class AppModel: ObservableObject {
         await loadApplications(force: true)
     }
 
-    func removeOrphanedFiles(_ candidates: [OrphanedFileCandidate]) async {
-        orphanedFilesBusy = true
-        orphanedFilesError = nil
-
-        for candidate in candidates {
-            do {
-                try await guardService.moveToTrash(candidate.url, purpose: .uninstall)
-            } catch {
-                orphanedFilesError = error.localizedDescription
-            }
-        }
-
-        await loadOrphanedFiles(force: true)
-        if hasLoadedCleanup {
-            await loadCleanup(force: true)
-        }
-        if hasLoadedStorage {
-            await loadStorage(force: true)
-        }
-    }
-
     func refreshStartupItems() async {
         await loadStartupItems(force: true)
     }
@@ -1024,6 +985,17 @@ final class AppModel: ObservableObject {
     }
 
     /// Refreshes what a removal can change elsewhere in Warren.
+    private func makeOrphanLibrary() -> OrphanLibrary {
+        let library = OrphanLibrary(apps: appLibrary, removal: guardService)
+        library.onRemoved = { [weak self] in
+            guard let self else { return }
+            if self.hasLoadedCleanup { await self.loadCleanup(force: true) }
+            if self.hasLoadedStorage { await self.loadStorage(force: true) }
+            self.updateRecommendedActions()
+        }
+        return library
+    }
+
     func refreshAfterAppRemoval() async {
         hasLoadedApplications = false
         if hasLoadedCleanup { await loadCleanup(force: true) }
@@ -2289,7 +2261,7 @@ final class AppModel: ObservableObject {
         async let refreshProcesses: Void = loadProcesses(force: true)
         _ = await (refreshCleanup, refreshApplications, refreshStorage, refreshProcesses)
 
-        if hasLoadedOrphanedFiles || !orphanedFiles.isEmpty {
+        if hasLoadedOrphanedFiles {
             await loadOrphanedFiles(force: true)
         }
 
@@ -2677,46 +2649,11 @@ final class AppModel: ObservableObject {
             guard !hasLoadedOrphanedFiles else {
                 return
             }
-
-            guard orphanedFilesTask == nil else {
-                return
-            }
         }
 
-        orphanedFilesTask?.cancel()
-        let requestID = UUID()
-        orphanedFilesRequestID = requestID
-
-        orphanedFilesBusy = true
-        orphanedFilesError = nil
         SKMoleLog.scans.info("Starting orphan review scan")
-        orphanedFilesProgress = ScanProgress(
-            title: "Orphan review",
-            detail: "Preparing orphan scan",
-            completedUnits: 0,
-            totalUnits: 1
-        )
-
-        let scanner = orphanedFileScanner
-        let installedApps = applications
-        let task = Task { [requestID] in
-            await scanner.scan(installedApps: installedApps) { progress in
-                await MainActor.run {
-                    guard self.orphanedFilesRequestID == requestID else { return }
-                    self.orphanedFilesProgress = progress
-                }
-            }
-        }
-        orphanedFilesTask = task
-
-        let discovered = await task.value
-        guard orphanedFilesRequestID == requestID else { return }
-
-        orphanedFiles = discovered
-        orphanedFilesBusy = false
-        SKMoleLog.scans.info("Finished orphan review scan with \(discovered.count, privacy: .public) candidates")
-        orphanedFilesProgress = nil
-        orphanedFilesTask = nil
+        await orphanLibrary.rescan()
+        SKMoleLog.scans.info("Finished orphan review scan with \(self.orphanLibrary.groups.count, privacy: .public) groups")
         hasLoadedOrphanedFiles = true
         updateRecommendedActions()
     }

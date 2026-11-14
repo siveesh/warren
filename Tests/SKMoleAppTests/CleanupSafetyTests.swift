@@ -204,3 +204,18 @@ private let sparkleFixture = """
     #expect(LeftoverText.humanize("applicationSupport") == "Application support")
     #expect(LeftoverText.humanize("holdsALibrary") == "Holds a library")
 }
+
+@Test func administratorRightsDefaultToAskingEachTime() {
+    UserDefaults.standard.removeObject(forKey: AdministratorRights.defaultsKey)
+    #expect(AdministratorRights.current == .askEachTime)
+
+    UserDefaults.standard.set(AdministratorRights.never.rawValue, forKey: AdministratorRights.defaultsKey)
+    #expect(AdministratorRights.current == .never)
+    UserDefaults.standard.removeObject(forKey: AdministratorRights.defaultsKey)
+}
+
+@Test func orphanTextNamesEveryConfidenceLevel() {
+    #expect(OrphanText.level(.certain) == "Certain")
+    #expect(OrphanText.level(.unsure) == "Unsure")
+    #expect(OrphanText.reason(.nothingClaimsIt) == "No installed app claims it.")
+}

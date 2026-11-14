@@ -4,6 +4,7 @@ import SKMoleShared
 struct SettingsView: View {
     @ObservedObject var model: AppModel
     @AppStorage(SidebarPreferences.hiddenSectionsKey) private var hiddenSidebarSections = ""
+    @AppStorage(AdministratorRights.defaultsKey) private var administratorRights = AdministratorRights.askEachTime.rawValue
 
     var body: some View {
         ScrollView {
@@ -94,6 +95,25 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                    }
+                }
+
+                SectionCard(
+                    title: "Administrator Rights",
+                    subtitle: "Decide whether Warren may ask for administrator rights to move system-owned items to the Trash.",
+                    symbol: "lock.shield"
+                ) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Picker("Administrator rights", selection: $administratorRights) {
+                            ForEach(AdministratorRights.allCases) { option in
+                                Text(option.title).tag(option.rawValue)
+                            }
+                        }
+                        .pickerStyle(.radioGroup)
+
+                        Text((AdministratorRights(rawValue: administratorRights) ?? .askEachTime).subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
 

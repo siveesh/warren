@@ -37,12 +37,12 @@ final class AppLibrary {
     var resetPrivacy = false
 
     /// Run after something was removed, so the rest of Warren (inventory, Cleanup, Storage) can refresh.
-    var onRemoved: (() async -> Void)?
+    var onRemoved: ( () async -> Void)?
 
     private let removal: RemovalService
     var removalEngine: TrashService { removal.engine }
-    /// Without the privileged helper (a later round), nothing that needs administrator rights is moved.
-    private let canUseHelper = false
+    /// Whether items that need administrator rights can be selected: only when the user allows asking for them.
+    private var canUseHelper: Bool { AdministratorRights.current == .askEachTime }
 
     init(removal: RemovalService) {
         self.removal = removal
@@ -51,6 +51,12 @@ final class AppLibrary {
     var selectedApp: PeelCore.InstalledApp? {
         guard let selectedURL else { return nil }
         return apps.first { $0.url == selectedURL } ?? uninstallation?.app ?? reset?.app
+    }
+
+    /// What in the current selection needs administrator rights.
+    var selectedPrivilegedURLs: [URL] {
+        guard mode == .uninstall, let plan = uninstallation, canUseHelper else { return [] }
+        return plan.privilegedURLs.intersection(selection).sorted { $0.path < $1.path }
     }
 
     /// Instances of the selected app that are running now.
@@ -206,8 +212,37 @@ final class AppLibrary {
         switch mode {
         case .uninstall:
             guard let plan = uninstallation else { break }
-            let result = await plan.move(selection, using: removal.engine, throughTheHelper: false)
-            report(result, appName: app.name)
+            let privileged = Set(selectedPrivilegedURLs)
+            let ownSelection = selection.subtracting(privileged)
+            var result = TrashResult()
+            var adminLines: [String] = []
+
+            // A root-owned app goes first, as the engine does: its files only follow once it has moved.
+            let appNeedsAdmin = privileged.contains(plan.app.url)
+            var adminMoved: [URL] = []
+            var adminFailures: [(url: URL, reason: String)] = []
+
+            if appNeedsAdmin {
+                let outcome = await AdministratorRemoval.moveToTrash([plan.app.url], engine: removal.engine)
+                adminMoved += outcome.moved
+                adminFailures += outcome.failures
+                if outcome.cancelled { adminLines.append("Administrator approval was cancelled, so nothing was moved.") }
+            }
+
+            let appStillThere = appNeedsAdmin && adminMoved.isEmpty
+            if !appStillThere {
+                result = await plan.move(ownSelection, using: removal.engine, throughTheHelper: false)
+
+                let leftovers = privileged.subtracting([plan.app.url])
+                if !leftovers.isEmpty {
+                    let outcome = await AdministratorRemoval.moveToTrash(Array(leftovers), engine: removal.engine)
+                    adminMoved += outcome.moved
+                    adminFailures += outcome.failures
+                    if outcome.cancelled { adminLines.append("Administrator approval was cancelled for the system-owned items.") }
+                }
+            }
+
+            report(result, appName: app.name, adminMoved: adminMoved.count, adminFailures: adminFailures, adminLines: adminLines)
         case .reset:
             guard let plan = reset else { break }
             let outcome = await plan.run(selection, resettingPrivacy: resetPrivacy, exclusions: .none, isOpen: { false })
@@ -224,18 +259,28 @@ final class AppLibrary {
         }
     }
 
-    private func report(_ result: TrashResult, appName: String, stop: String? = nil) {
-        let moved = result.trashed.count
+    private func report(
+        _ result: TrashResult,
+        appName: String,
+        stop: String? = nil,
+        adminMoved: Int = 0,
+        adminFailures: [(url: URL, reason: String)] = [],
+        adminLines: [String] = []
+    ) {
+        let moved = result.trashed.count + adminMoved
+        var extra = adminLines
+        extra += adminFailures.prefix(4).map { "\($0.url.lastPathComponent): \($0.reason)" }
         if let stop {
             errorMessage = "Nothing was changed for \(appName): \(LeftoverText.humanize(stop))."
             return
         }
 
-        if !result.failures.isEmpty {
+        let failed = result.failures.count + adminFailures.count
+        if failed > 0 || !extra.isEmpty {
             let lines = result.failures.prefix(5).map {
                 "\($0.url.lastPathComponent): \(RemovalFailureText.describe($0.reason))"
-            }
-            errorMessage = "\(result.failures.count) item\(result.failures.count == 1 ? "" : "s") stayed.\n" + lines.joined(separator: "\n")
+            } + extra
+            errorMessage = (failed > 0 ? "\(failed) item\(failed == 1 ? "" : "s") stayed.\n" : "") + lines.joined(separator: "\n")
         }
 
         if moved > 0 {
@@ -269,7 +314,7 @@ extension AppLibrary {
             }
 
             let plan = await Uninstallation.prepare(app, installedApps: apps)
-            let selection = plan.suggestedSelection(canUseHelper: false)
+            let selection = plan.suggestedSelection(canUseHelper: false)  // bulk never asks for administrator rights
             guard !selection.isEmpty else {
                 failures.append("\(app.name): nothing could be removed.")
                 continue

@@ -1,246 +1,264 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+import PeelCore
 import SwiftUI
 
+/// Files that apps left behind, grouped by the app they belonged to and rated by how sure Warren is.
 struct OrphanedFilesView: View {
     @ObservedObject var model: AppModel
-    @State private var selectedIDs: Set<String> = []
+    @State private var confirming = false
+
+    private var library: OrphanLibrary { model.orphanLibrary }
+    private var administratorAllowed: Bool { AdministratorRights.current == .askEachTime }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 header
 
-                if let orphanedFilesError = model.orphanedFilesError {
-                    errorBanner(orphanedFilesError)
+                if let message = library.resultMessage {
+                    Label(message, systemImage: "checkmark.circle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(AppPalette.mint)
                 }
 
-                ForEach(groupedCandidates, id: \.0) { category, candidates in
-                    OrphanedFileCategoryCard(
-                        category: category,
-                        candidates: candidates,
-                        selectedIDs: selectedIDs,
-                        isBusy: model.orphanedFilesBusy,
-                        onReveal: model.reveal,
-                        onToggleSelection: toggleSelection,
-                        onClearSelection: {
-                            clearSelection(in: candidates)
-                        },
-                        onTrashCandidate: { candidate in
-                            Task {
-                                await model.removeOrphanedFiles([candidate])
-                                selectedIDs.remove(candidate.id)
-                            }
-                        },
-                        onTrashSelected: {
-                            Task {
-                                let selected = candidates.filter { selectedIDs.contains($0.id) }
-                                await model.removeOrphanedFiles(selected)
-                                clearSelection(in: candidates)
-                            }
-                        }
+                if let error = library.errorMessage {
+                    Text(error).font(.subheadline).foregroundStyle(AppPalette.rose)
+                }
+
+                notices
+
+                if library.scan == nil {
+                    HStack { ProgressView(); Text("Comparing your Library with the apps you have installed…").foregroundStyle(.secondary) }
+                } else if library.groups.isEmpty {
+                    ContentUnavailableView(
+                        "No Leftovers Found",
+                        systemImage: "checkmark.shield",
+                        description: Text("Nothing in your Library looks like it belongs to an app that is gone.")
                     )
+                } else {
+                    ForEach(library.groups) { group in
+                        groupCard(group)
+                    }
                 }
             }
             .padding(28)
         }
-        .onChange(of: model.orphanedFiles.map(\.id)) { _, ids in
-            selectedIDs = selectedIDs.intersection(Set(ids))
+        .safeAreaInset(edge: .bottom) { selectionBar }
+        .task {
+            if library.scan == nil { await model.refreshOrphanedFiles() }
         }
+        .confirmationDialog(
+            "Move \(library.selection.count) item\(library.selection.count == 1 ? "" : "s") to the Trash?",
+            isPresented: $confirming,
+            titleVisibility: .visible
+        ) {
+            Button(library.selectedPrivilegedURLs.isEmpty ? "Move to Trash" : "Approve and Move to Trash", role: .destructive) {
+                Task { await library.removeSelection() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(confirmMessage)
+        }
+    }
+
+    private var confirmMessage: String {
+        let size = library.selectedSize
+        var text = "About \(size.isComplete ? "" : "at least ")\(ByteFormatting.format(UInt64(max(0, size.known)))) moves to the Trash. Warren checks again that no installed app owns these files. You can put them back from the Trash."
+        let privileged = library.selectedPrivilegedURLs
+        if !privileged.isEmpty {
+            let names = privileged.prefix(5).map(\.lastPathComponent).joined(separator: ", ")
+            text += "\n\n\(privileged.count) item\(privileged.count == 1 ? "" : "s") need administrator rights (\(names)\(privileged.count > 5 ? ", ..." : "")). macOS will ask for your password or Touch ID."
+        }
+        return text
     }
 
     private var header: some View {
         SectionCard(
-            title: "Orphaned files review",
-            subtitle: "Find user-domain support files, containers, and launch agents whose owning apps no longer appear installed.",
+            title: "Orphaned files",
+            subtitle: "Leftovers of apps that are no longer installed. Each group shows how sure Warren is and why. Nothing is ever selected for you.",
             symbol: "questionmark.folder"
         ) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 14) {
-                    TextField("Search orphaned files", text: $model.orphanedFilesSearch)
-                        .textFieldStyle(.roundedBorder)
-
-                    Button("Scan Again") {
-                        Task { await model.refreshOrphanedFiles() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.orphanedFilesBusy)
-
-                    if model.orphanedFilesBusy {
-                        ProgressView()
-                    }
-                }
-
-                HStack(spacing: 18) {
-                    metricBlock(ByteFormatting.format(model.orphanedFileBytes), subtitle: "reclaimable review set")
-                    metricBlock("\(model.orphanedFiles.count)", subtitle: "leftover candidates")
-                    Spacer()
-                }
-
-                if let orphanedFilesProgress = model.orphanedFilesProgress {
-                    InlineScanProgressView(progress: orphanedFilesProgress, tint: AppPalette.amber)
-                }
-            }
-        }
-    }
-
-    private var groupedCandidates: [(OrphanedFileCategory, [OrphanedFileCandidate])] {
-        OrphanedFileCategory.allCases.compactMap { category in
-            let matches = model.filteredOrphanedFiles.filter { $0.category == category }
-            guard !matches.isEmpty else {
-                return nil
-            }
-
-            return (category, matches)
-        }
-    }
-
-    private func metricBlock(_ value: String, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(value)
-                .font(.title2.weight(.bold))
-            Text(subtitle)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    private func toggleSelection(_ candidate: OrphanedFileCandidate) {
-        if selectedIDs.contains(candidate.id) {
-            selectedIDs.remove(candidate.id)
-        } else {
-            selectedIDs.insert(candidate.id)
-        }
-    }
-
-    private func clearSelection(in candidates: [OrphanedFileCandidate]) {
-        selectedIDs.subtract(candidates.map(\.id))
-    }
-
-    private func errorBanner(_ text: String) -> some View {
-        Text(text)
-            .font(.subheadline)
-            .foregroundStyle(.white)
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(AppPalette.rose)
-            )
-    }
-}
-
-private struct OrphanedFileCategoryCard: View {
-    let category: OrphanedFileCategory
-    let candidates: [OrphanedFileCandidate]
-    let selectedIDs: Set<String>
-    let isBusy: Bool
-    let onReveal: (URL) -> Void
-    let onToggleSelection: (OrphanedFileCandidate) -> Void
-    let onClearSelection: () -> Void
-    let onTrashCandidate: (OrphanedFileCandidate) -> Void
-    let onTrashSelected: () -> Void
-
-    var body: some View {
-        SectionCard(
-            title: category.title,
-            subtitle: category.subtitle,
-            symbol: category.symbol
-        ) {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack {
-                    Text(ByteFormatting.format(totalBytes))
-                        .font(.headline)
-
-                    Spacer()
-
-                    Text("\(selectedCount) selected")
-                        .font(.subheadline.weight(.semibold))
+            HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(ByteFormatting.format(library.movableBytes))
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                    Text("could be moved now · \(library.groups.count) group\(library.groups.count == 1 ? "" : "s")")
                         .foregroundStyle(.secondary)
-
-                    Button("Clear Selection", action: onClearSelection)
-                        .buttonStyle(.bordered)
-                        .disabled(selectedCount == 0)
-
-                    Button(action: onTrashSelected) {
-                        Label("Move Selected to Trash", systemImage: "trash")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(selectedCount == 0 || isBusy)
                 }
 
-                ForEach(candidates) { candidate in
-                    OrphanedFileRow(
-                        candidate: candidate,
-                        isSelected: selectedIDs.contains(candidate.id),
-                        isBusy: isBusy,
-                        onReveal: {
-                            onReveal(candidate.url)
-                        },
-                        onToggleSelection: {
-                            onToggleSelection(candidate)
-                        },
-                        onTrash: {
-                            onTrashCandidate(candidate)
-                        }
-                    )
+                Spacer()
+
+                TextField("Search leftovers", text: Binding(get: { library.search }, set: { library.search = $0 }))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 240)
+
+                Button("Scan Again") {
+                    Task { await model.refreshOrphanedFiles() }
                 }
+                .buttonStyle(.borderedProminent)
+                .disabled(library.isScanning)
+
+                if library.isScanning { ProgressView().controlSize(.large) }
             }
         }
     }
 
-    private var selectedCount: Int {
-        candidates.filter { selectedIDs.contains($0.id) }.count
-    }
-
-    private var totalBytes: UInt64 {
-        candidates.reduce(into: 0) { $0 += $1.sizeBytes }
-    }
-}
-
-private struct OrphanedFileRow: View {
-    let candidate: OrphanedFileCandidate
-    let isSelected: Bool
-    let isBusy: Bool
-    let onReveal: () -> Void
-    let onToggleSelection: () -> Void
-    let onTrash: () -> Void
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            SelectionCircleButton(
-                isSelected: isSelected,
-                accessibilityLabel: "Select \(candidate.displayName)",
-                action: onToggleSelection
-            )
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(candidate.displayName)
-                    .font(.headline)
-                Text("\(ByteFormatting.format(candidate.sizeBytes)) • \(candidate.rationale)")
+    @ViewBuilder
+    private var notices: some View {
+        if let scan = library.scan {
+            if scan.needsFullDiskAccess {
+                Label("Some folders could not be read. Grant Warren Full Disk Access to find every leftover.", systemImage: "lock.shield")
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Text(candidate.url.path)
+                    .foregroundStyle(AppPalette.amber)
+            }
+
+            if !scan.appsOnOtherDisks.isEmpty {
+                Label("\(scan.appsOnOtherDisks.count) app\(scan.appsOnOtherDisks.count == 1 ? "" : "s") on other disks are treated as installed.", systemImage: "externaldrive")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if scan.otherAccountsMayOwn {
+                Label("Other accounts on this Mac may own some of these files.", systemImage: "person.2")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if !scan.forAnAdministrator.isEmpty {
+                Label("\(scan.forAnAdministrator.count) system-level item\(scan.forAnAdministrator.count == 1 ? "" : "s") are left for an administrator to review in Finder.", systemImage: "person.badge.key")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // MARK: Groups
+
+    private func groupCard(_ group: OrphanGroup) -> some View {
+        let tint = tint(for: group.confidence.level)
+
+        return SectionCard(
+            title: group.title,
+            subtitle: group.confidence.reasons.map(OrphanText.reason).joined(separator: " "),
+            symbol: "folder.badge.questionmark"
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 10) {
+                    Pill(title: OrphanText.level(group.confidence.level), tint: tint)
+                    Text(sizeText(group.total))
+                        .font(.headline)
+                    if let date = group.lastModified {
+                        Text("last written \(DateFormatting.relativeString(from: date))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+
+                    if group.isLeftAlone {
+                        Text("Warren leaves these alone").font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Button("Select Recommended") { library.selectRecommended(in: group) }
+                            .buttonStyle(.bordered)
+                            .disabled(group.confidence.level == .unsure)
+                        Button("Select All") { library.selectAll(in: group) }
+                            .buttonStyle(.bordered)
+                        Button("None") { library.deselect(group: group) }
+                            .buttonStyle(.bordered)
+                    }
+                }
+
+                ForEach(group.items) { item in
+                    itemRow(item, in: group)
+                }
+            }
+        }
+    }
+
+    private func itemRow(_ item: OrphanItem, in group: OrphanGroup) -> some View {
+        let selectable = library.canSelect(item, in: group)
+
+        return HStack(alignment: .top, spacing: 12) {
+            SelectionCircleButton(
+                isSelected: library.selection.contains(item.url),
+                accessibilityLabel: "Select \(item.url.lastPathComponent)"
+            ) {
+                library.toggle(item, in: group)
+            }
+            .disabled(!selectable)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.url.lastPathComponent).font(.headline)
+                Text(LeftoverText.kind(item.kind)).font(.caption).foregroundStyle(.secondary)
+                Text(item.url.path)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+
+                if let held = item.heldBack {
+                    Text(LeftoverText.heldBack(held)).font(.caption).foregroundStyle(AppPalette.amber)
+                } else if item.requiresPrivileges {
+                    Text(administratorAllowed
+                         ? "Needs administrator rights. You will be asked to approve it."
+                         : "Needs administrator rights, which are turned off in Settings.")
+                        .font(.caption)
+                        .foregroundStyle(AppPalette.amber)
+                }
             }
 
             Spacer()
 
-            ActionIconButton(symbol: "eye", label: "Reveal \(candidate.displayName)", action: onReveal)
-            ActionIconButton(
-                symbol: "trash",
-                label: "Move \(candidate.displayName) to Trash",
-                style: .prominent(AppPalette.amber),
-                action: onTrash
-            )
-            .disabled(isBusy)
+            Text(item.size.map { ByteFormatting.format(UInt64(max(0, $0))) } ?? "unknown")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            ActionIconButton(symbol: "eye", label: "Reveal \(item.url.lastPathComponent)") { model.reveal(item.url) }
         }
-        .padding(14)
+        .padding(12)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(isSelected ? AppPalette.amber.opacity(0.15) : AppPalette.secondaryCard.opacity(0.7))
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(library.selection.contains(item.url) ? AppPalette.accent.opacity(0.14) : AppPalette.secondaryCard.opacity(0.7))
         )
-        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    private func sizeText(_ total: SizeTotal) -> String {
+        "\(total.isComplete ? "" : "at least ")\(ByteFormatting.format(UInt64(max(0, total.known))))"
+    }
+
+    private func tint(for level: OrphanConfidence.Level) -> Color {
+        switch level {
+        case .certain: AppPalette.mint
+        case .likely: AppPalette.accent
+        case .unsure: AppPalette.amber
+        }
+    }
+
+    // MARK: Selection bar
+
+    @ViewBuilder
+    private var selectionBar: some View {
+        if !library.selection.isEmpty {
+            HStack {
+                let size = library.selectedSize
+                Text("\(library.selection.count) selected · \(size.isComplete ? "" : "at least ")\(ByteFormatting.format(UInt64(max(0, size.known))))")
+                    .font(.headline)
+
+                Spacer()
+
+                Button("Clear") { library.clearSelection() }.buttonStyle(.bordered)
+
+                Button {
+                    confirming = true
+                } label: {
+                    Label("Move to Trash", systemImage: "trash")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(library.isRemoving)
+
+                if library.isRemoving { ProgressView().controlSize(.small) }
+            }
+            .padding(16)
+            .background(.ultraThinMaterial)
+        }
     }
 }

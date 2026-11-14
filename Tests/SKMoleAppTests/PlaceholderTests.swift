@@ -94,24 +94,6 @@ import SKMoleShared
     #expect(StartupPreference.rememberLast.resolve(lastSelection: nil) == .dashboard)
 }
 
-@Test func orphanScannerNormalizesAndMatchesKnownTokens() async throws {
-    #expect(OrphanedFileScanner.matchToken(for: "group.com.example.app") == "com.example.app")
-    #expect(
-        OrphanedFileScanner.matchesInstalledApp(
-            token: "com.example.app.helper",
-            bundleIdentifiers: ["com.example.app"],
-            appNameTokens: []
-        )
-    )
-    #expect(
-        !OrphanedFileScanner.matchesInstalledApp(
-            token: "com.example.oldapp",
-            bundleIdentifiers: ["com.example.currentapp"],
-            appNameTokens: ["currentapp"]
-        )
-    )
-}
-
 @Test func orphanSidebarSlugResolves() async throws {
     #expect(SidebarSection(urlSlug: "updates") == .updates)
     #expect(SidebarSection(urlSlug: "orphans") == .orphans)
