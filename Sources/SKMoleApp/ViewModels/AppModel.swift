@@ -1002,6 +1002,16 @@ final class AppModel: ObservableObject {
 
     /// Refreshes what a removal can change elsewhere in Warren.
     private(set) lazy var historyLibrary: HistoryLibrary = makeHistoryLibrary()
+    private(set) lazy var duplicatesLibrary: DuplicatesLibrary = {
+        let library = DuplicatesLibrary(removal: guardService, exclusions: exclusionsLibrary, profile: { [weak self] in self?.cleanupSafetyProfile ?? .balanced })
+        library.onRemoved = { [weak self] in
+            guard let self else { return }
+            if self.hasLoadedCleanup { await self.loadCleanup(force: true) }
+            if self.hasLoadedStorage { await self.loadStorage(force: true) }
+            self.updateRecommendedActions()
+        }
+        return library
+    }()
     private(set) lazy var developerCleanupLibrary: DeveloperCleanupLibrary = {
         let library = DeveloperCleanupLibrary(removal: guardService, exclusions: exclusionsLibrary)
         library.onRemoved = { [weak self] in

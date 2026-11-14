@@ -450,3 +450,33 @@ private let sparkleFixture = """
     #expect(library.projectFolders.map(\.path) == ["/Users/test/Code"])
     #expect(library.selected.isEmpty)
 }
+
+// MARK: Duplicates
+
+@Test @MainActor func duplicatesAreFoundAndOneCopyAlwaysStays() async throws {
+    let home = FileManager.default.homeDirectoryForCurrentUser
+    let root = home.appending(path: "WarrenDuplicatesTest-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let payload = Data(repeating: 7, count: 300_000)
+    for name in ["a.bin", "b.bin"] {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try payload.write(to: root.appending(path: name))
+    }
+
+    let suite = "warren-dup-\(UUID().uuidString)"
+    let defaults = UserDefaults(suiteName: suite)!
+    defer { defaults.removePersistentDomain(forName: suite) }
+    defaults.set([root.path], forKey: "duplicates.folders")
+
+    let library = DuplicatesLibrary(removal: RemovalService(), exclusions: ExclusionsLibrary(), defaults: defaults, profile: { .cautious })
+    #expect(!library.canSuggest)
+    library.start()
+    for _ in 0..<100 where library.scan == nil { try await Task.sleep(for: .milliseconds(100)) }
+
+    let group = try #require(library.scan?.groups.first)
+    #expect(group.files.count == 2)
+
+    // Selecting every copy keeps the first one.
+    for file in group.files { library.toggle(file: file.url) }
+    #expect(library.selectedFiles.count == 1)
+}

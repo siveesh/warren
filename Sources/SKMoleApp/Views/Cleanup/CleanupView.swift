@@ -3,6 +3,7 @@ import SwiftUI
 struct CleanupView: View {
     @ObservedObject var model: AppModel
     @State private var selectedCandidateIDs: Set<String> = []
+    @State private var showingDuplicates = false
 
     var body: some View {
         ScrollView {
@@ -14,6 +15,8 @@ struct CleanupView: View {
                 }
 
                 homebrewNote
+
+                duplicatesNote
 
                 ForEach(model.cleanupCategories) { category in
                     CleanupCategoryCard(
@@ -45,6 +48,22 @@ struct CleanupView: View {
         .onChange(of: model.cleanupCategories.flatMap(\.candidates).map(\.id)) { _, ids in
             selectedCandidateIDs = selectedCandidateIDs.intersection(Set(ids))
         }
+        .sheet(isPresented: $showingDuplicates) { DuplicatesSheet(model: model) }
+    }
+
+    private var duplicatesNote: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "doc.on.doc").foregroundStyle(AppPalette.sky)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Duplicate folders and files").font(.subheadline.weight(.semibold))
+                Text("Find identical folders and files in the folders you choose. One copy of every group always stays, and nothing is selected for you in the Cautious profile.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Find Duplicates…") { showingDuplicates = true }.buttonStyle(.bordered)
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(AppPalette.secondaryCard.opacity(0.7)))
     }
 
     /// Homebrew's installation and cache are protected: only Homebrew itself cleans its cache.
