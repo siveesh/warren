@@ -11,6 +11,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
     case processes
     case quarantine
     case orphans
+    case intel
+    case packages
     case smartCare
     case cleanup
     case uninstall
@@ -31,6 +33,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .processes: "Processes"
         case .quarantine: "Quarantine"
         case .orphans: "Orphans"
+        case .intel: "Intel Software"
+        case .packages: "Package Receipts"
         case .smartCare: "Smart Care"
         case .cleanup: "Cleanup"
         case .uninstall: "Uninstaller"
@@ -51,6 +55,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .processes: "list.bullet.rectangle.portrait"
         case .quarantine: "shield.slash"
         case .orphans: "questionmark.folder"
+        case .intel: "cpu"
+        case .packages: "shippingbox"
         case .smartCare: "sparkles.rectangle.stack.fill"
         case .cleanup: "sparkles.rectangle.stack"
         case .uninstall: "xmark.app"
@@ -71,6 +77,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .processes: "Inspect active processes and safely terminate user-owned work"
         case .quarantine: "Review quarantined apps and clear com.apple.quarantine deliberately"
         case .orphans: "Find leftover app support files from apps that no longer appear installed"
+        case .intel: "Apps, plug-ins and tools that still contain Intel code"
+        case .packages: "Installer packages macOS remembers, and what they left on disk"
         case .smartCare: "Guided recommendations across cleanup, storage, and health"
         case .cleanup: "Preview reclaimable space before moving items to Trash"
         case .uninstall: "Remove apps and user-domain remnants safely"
@@ -91,6 +99,8 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
         case .processes: "p"
         case .quarantine: "4"
         case .orphans: "5"
+        case .intel: "i"
+        case .packages: "k"
         case .smartCare: "6"
         case .cleanup: "7"
         case .uninstall: "8"
@@ -121,6 +131,10 @@ enum SidebarSection: String, CaseIterable, Hashable, Identifiable {
             self = .quarantine
         case "orphans", "orphan-review", "leftovers":
             self = .orphans
+        case "intel", "rosetta":
+            self = .intel
+        case "packages", "receipts":
+            self = .packages
         case "smart-care", "smartcare":
             self = .smartCare
         case "cleanup":
@@ -161,7 +175,7 @@ enum SidebarGroup: String, CaseIterable, Hashable, Identifiable {
     var sections: [SidebarSection] {
         switch self {
         case .overview: [.dashboard, .smartCare, .updates]
-        case .apps: [.uninstall, .orphans, .quarantine]
+        case .apps: [.uninstall, .orphans, .intel, .packages, .quarantine]
         case .storage: [.cleanup, .storage, .fileIntelligence]
         case .developer: [.homebrew, .github, .relay]
         case .system: [.network, .processes, .optimize]

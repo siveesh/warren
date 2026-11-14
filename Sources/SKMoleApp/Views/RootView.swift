@@ -154,6 +154,10 @@ struct RootView: View {
             QuarantineView(model: model)
         case .orphans:
             OrphanedFilesView(model: model)
+        case .intel:
+            IntelView(model: model)
+        case .packages:
+            PackageReceiptsView(model: model)
         case .smartCare:
             SmartCareView(model: model)
         case .cleanup:

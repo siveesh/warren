@@ -11,6 +11,8 @@ enum StartupPreference: String, CaseIterable, Identifiable {
     case processes
     case quarantine
     case orphans
+    case intel
+    case packages
     case smartCare
     case cleanup
     case uninstall
@@ -31,6 +33,8 @@ enum StartupPreference: String, CaseIterable, Identifiable {
         case .processes: "Always open Processes"
         case .quarantine: "Always open Quarantine"
         case .orphans: "Always open Orphans"
+        case .intel: "Always open Intel Software"
+        case .packages: "Always open Package Receipts"
         case .smartCare: "Always open Smart Care"
         case .cleanup: "Always open Cleanup"
         case .uninstall: "Always open Uninstaller"
@@ -61,6 +65,10 @@ enum StartupPreference: String, CaseIterable, Identifiable {
             return .quarantine
         case .orphans:
             return .orphans
+        case .intel:
+            return .intel
+        case .packages:
+            return .packages
         case .smartCare:
             return .smartCare
         case .cleanup:

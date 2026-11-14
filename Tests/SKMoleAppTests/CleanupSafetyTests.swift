@@ -219,3 +219,12 @@ private let sparkleFixture = """
     #expect(OrphanText.level(.unsure) == "Unsure")
     #expect(OrphanText.reason(.nothingClaimsIt) == "No installed app claims it.")
 }
+
+@Test func intelAndPackageSectionsAreWiredIntoTheSidebar() {
+    #expect(SidebarSection(urlSlug: "intel") == .intel)
+    #expect(SidebarSection(urlSlug: "receipts") == .packages)
+    #expect(SidebarSection.intel.group == .apps)
+    #expect(SidebarSection.packages.group == .apps)
+    #expect(StartupPreference.intel.resolve(lastSelection: nil) == .intel)
+    #expect(IntelFinding.Kind.allCases.allSatisfy { !$0.title.isEmpty && !$0.symbol.isEmpty })
+}

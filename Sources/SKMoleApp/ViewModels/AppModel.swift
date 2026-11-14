@@ -985,6 +985,9 @@ final class AppModel: ObservableObject {
     }
 
     /// Refreshes what a removal can change elsewhere in Warren.
+    private(set) lazy var intelLibrary = IntelLibrary(apps: appLibrary)
+    private(set) lazy var packageLibrary = PackageLibrary(removal: guardService)
+
     private func makeOrphanLibrary() -> OrphanLibrary {
         let library = OrphanLibrary(apps: appLibrary, removal: guardService)
         library.onRemoved = { [weak self] in
@@ -2460,6 +2463,10 @@ final class AppModel: ObservableObject {
             await loadProcesses(force: force || !hasLoadedProcesses)
         case .quarantine:
             await loadQuarantinedApplications(force: force || !hasLoadedQuarantine)
+        case .intel:
+            await intelLibrary.rescanIfNeeded()
+        case .packages:
+            await packageLibrary.refreshIfNeeded()
         case .orphans:
             let shouldRefreshApplications = force || !hasLoadedApplications
             let shouldRefreshOrphans = force || !hasLoadedOrphanedFiles

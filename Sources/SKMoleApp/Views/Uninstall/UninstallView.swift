@@ -34,7 +34,7 @@ struct UninstallView: View {
     }
 
     var body: some View {
-        HStack(spacing: 22) {
+        HStack(alignment: .top, spacing: 22) {
             appsPane
             detailPane
         }
