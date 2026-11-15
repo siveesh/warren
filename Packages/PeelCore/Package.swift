@@ -1,4 +1,4 @@
-// swift-tools-version: 6.4
+// swift-tools-version: 6.3
 // Vendored from https://github.com/TuguiDragos/Peel (GPL-3.0-or-later), see UPSTREAM.md.
 import PackageDescription
 
