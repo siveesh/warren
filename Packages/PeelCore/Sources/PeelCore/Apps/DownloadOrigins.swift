@@ -1,4 +1,4 @@
-public import Foundation
+import Foundation
 import SQLite3
 
 /// Where an app or a file was downloaded from, as macOS recorded it: the address a browser writes on the file itself

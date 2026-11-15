@@ -719,14 +719,16 @@ public enum SpaceInventory {
         let containers = appContainers(in: home)
         let groups = groupContainers(in: home)
         let wanted = definitions.compactMap { definition -> (Definition, [URL])? in
-            let urls = definition.urls(home: home, root: root, userCache: userCache)
+            var urls = definition.urls(home: home, root: root, userCache: userCache)
                 .filter { FileManager.default.fileExists(atPath: PathPattern.comparablePath(of: $0)) }
-                + definition.containerFolders.flatMap { folder in
-                    containers.map { $0.appending(path: folder, directoryHint: .isDirectory) }.filter(\.isRealFolder)
-                }
-                + (definition.groupContainerFolder.map { folder in
-                    groups.map { $0.appending(path: folder, directoryHint: .isDirectory) }.filter(\.isRealFolder)
-                } ?? [])
+            for folder in definition.containerFolders {
+                let inContainers = containers.map { $0.appending(path: folder, directoryHint: .isDirectory) }
+                urls += inContainers.filter(\.isRealFolder)
+            }
+            if let folder = definition.groupContainerFolder {
+                let inGroups = groups.map { $0.appending(path: folder, directoryHint: .isDirectory) }
+                urls += inGroups.filter(\.isRealFolder)
+            }
             let kept = urls.filter { !exclusions.excludes($0) }
             return kept.isEmpty ? nil : (definition, kept)
         }

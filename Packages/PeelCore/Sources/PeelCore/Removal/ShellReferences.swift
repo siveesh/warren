@@ -19,7 +19,7 @@ public enum ShellReferences {
     @concurrent
     public static func find(naming moved: [URL], home: URL = .homeDirectory) async -> [Reference] {
         // Both sides in one form: a name a program made on disk is often decomposed, a line typed by hand composed.
-        let spellings = moved.flatMap { spellings(of: $0, home: home) }.map(comparable)
+        let spellings = moved.flatMap { Self.spellings(of: $0, home: home) }.map(comparable)
         guard !spellings.isEmpty else { return [] }
         var references: [Reference] = []
         for file in startupFiles(home: home) {

@@ -34,7 +34,7 @@ public enum HomebrewReceipt {
         through service: TrashService,
         environment: SearchEnvironment
     ) async -> TrashResult {
-        let items = casks.flatMap { items(of: $0, environment: environment) }
+        let items = casks.flatMap { Self.items(of: $0, environment: environment) }
         guard !items.isEmpty else { return TrashResult() }
         return await service.trash(items, usingHelperFor: Set(items.filter(FileAccess.requiresPrivilegesToRemove)))
     }
