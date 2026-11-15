@@ -1,0 +1,212 @@
+{
+  "features" : [
+    "refractivity",
+    "specular-location"
+  ],
+  "fill" : {
+    "linear-gradient" : [
+      "srgb:0.13981,0.52678,0.24000,1.00000",
+      "srgb:0.05217,0.19656,0.08956,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "blend-mode-specializations" : [
+        {
+          "value" : "multiply"
+        },
+        {
+          "appearance" : "dark",
+          "value" : "screen"
+        },
+        {
+          "appearance" : "tinted",
+          "value" : "hard-light"
+        }
+      ],
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "iMac.svg",
+          "name" : "iMac",
+          "position" : {
+            "scale" : 0.41,
+            "translation-in-points" : [
+              0,
+              43
+            ]
+          }
+        }
+      ],
+      "refractivity" : {
+        "depth" : 0.2258203125,
+        "enabled" : true,
+        "strength" : 0.0241796875
+      },
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.6
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.7
+      }
+    },
+    {
+      "blend-mode" : "hard-light",
+      "layers" : [
+        {
+          "image-name" : "Asset 16.svg",
+          "name" : "Asset 16",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              0,
+              -166
+            ]
+          }
+        }
+      ],
+      "position" : {
+        "scale" : 1,
+        "translation-in-points" : [
+          0,
+          -31
+        ]
+      },
+      "refractivity" : {
+        "depth" : 0.600546875,
+        "enabled" : true,
+        "strength" : 0.071484375
+      },
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.6
+      },
+      "specular" : "inside",
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.2
+      }
+    },
+    {
+      "blend-mode-specializations" : [
+        {
+          "value" : "hard-light"
+        },
+        {
+          "appearance" : "dark",
+          "value" : "hard-light"
+        },
+        {
+          "appearance" : "tinted",
+          "value" : "hard-light"
+        }
+      ],
+      "blur-material" : 0.5,
+      "layers" : [
+        {
+          "image-name" : "Asset 4.svg",
+          "name" : "Asset 4",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              0,
+              -149
+            ]
+          }
+        },
+        {
+          "image-name" : "Asset 5.svg",
+          "name" : "Asset 5",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              30,
+              64
+            ]
+          }
+        }
+      ],
+      "position" : {
+        "scale" : 1,
+        "translation-in-points" : [
+          0,
+          -31
+        ]
+      },
+      "refractivity" : {
+        "depth" : 0.0580859375,
+        "enabled" : true,
+        "strength" : 0.456875
+      },
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.6
+      },
+      "specular" : "outside",
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.6
+      }
+    },
+    {
+      "blend-mode-specializations" : [
+        {
+          "value" : "hard-light"
+        },
+        {
+          "appearance" : "tinted",
+          "value" : "hard-light"
+        }
+      ],
+      "blur-material" : 0.5,
+      "layers" : [
+        {
+          "image-name" : "Asset 3.svg",
+          "name" : "Asset 3",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              83,
+              -19
+            ]
+          }
+        },
+        {
+          "image-name" : "Asset 2.svg",
+          "name" : "Asset 2",
+          "position" : {
+            "scale" : 1,
+            "translation-in-points" : [
+              -93,
+              -25
+            ]
+          }
+        }
+      ],
+      "position" : {
+        "scale" : 1,
+        "translation-in-points" : [
+          0,
+          -31
+        ]
+      },
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.6
+      },
+      "specular" : "outside",
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
