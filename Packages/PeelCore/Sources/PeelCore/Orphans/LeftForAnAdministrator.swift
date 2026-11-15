@@ -22,10 +22,11 @@ public struct LeftForAnAdministrator: Sendable {
         /// when they are as sure.
         func followed(by later: Record) -> Record {
             guard later.confidence == confidence else { return later.confidence > confidence ? later : self }
-            let apps = apps + later.apps.filter { app in
-                !apps.contains { $0.reference.lowercased() == app.reference.lowercased() }
+            let known = self.apps
+            let combined = known + later.apps.filter { app in
+                !known.contains { $0.reference.lowercased() == app.reference.lowercased() }
             }
-            return Record(path: later.path, kind: later.kind, apps: apps, reason: later.reason, confidence: confidence)
+            return Record(path: later.path, kind: later.kind, apps: combined, reason: later.reason, confidence: confidence)
         }
 
         /// One record per item however its path is spelled, each from all of its records in their order.
